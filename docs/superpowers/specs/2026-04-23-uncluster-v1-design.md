@@ -121,24 +121,30 @@ SQLite schema for V1, portable to Postgres/MySQL/DynamoDB by way of the `Store` 
 -- a registered machine
 CREATE TABLE nodes (
   id              TEXT PRIMARY KEY,         -- uuid
-  name            TEXT NOT NULL UNIQUE,     -- user-chosen, e.g. "old-macbook"
-  token_hash      TEXT NOT NULL,            -- argon2id hash of long-lived agent token
+  name            TEXT NOT NULL UNIQUE,     -- user-chosen, e.g. "old-macbook".
+                                            -- on revoke, renamed to "<name>-revoked-<unix-ts>"
+                                            -- so the original name is free to reuse.
   created_at      INTEGER NOT NULL,         -- unix seconds
   last_seen_at    INTEGER,                  -- updated on each heartbeat
   status          TEXT NOT NULL,            -- 'online' | 'offline' | 'revoked'
   metadata_json   TEXT NOT NULL DEFAULT '{}' -- latest heartbeat payload (free-form)
 );
 
--- one-time join tokens and long-lived CLI tokens
+-- unified token table — holds join, cli, and agent tokens
 CREATE TABLE tokens (
-  id              TEXT PRIMARY KEY,         -- uuid
-  kind            TEXT NOT NULL,            -- 'join' | 'cli'
-  token_hash      TEXT NOT NULL,
+  id              TEXT PRIMARY KEY,         -- short ID (16 char base32). Also embedded in token string
+                                            -- as the public lookup key. Indexed lookup → O(1).
+  kind            TEXT NOT NULL,            -- 'join' | 'cli' | 'agent'
+  node_id         TEXT REFERENCES nodes(id),-- NOT NULL for kind='agent'; NULL otherwise
+  secret_hash     TEXT NOT NULL,            -- argon2id hash of the secret portion only
   label           TEXT,                     -- human note
   created_at      INTEGER NOT NULL,
   expires_at      INTEGER,                  -- nullable
-  used_at         INTEGER                   -- join tokens are single-use
+  used_at         INTEGER,                  -- join tokens: single-use marker
+  revoked_at      INTEGER                   -- any token can be revoked
 );
+
+CREATE INDEX idx_tokens_node ON tokens(node_id);
 
 -- a unit of work
 CREATE TABLE tasks (
@@ -150,17 +156,19 @@ CREATE TABLE tasks (
   created_at      INTEGER NOT NULL,
   started_at      INTEGER,
   finished_at     INTEGER,
+  output_bytes    INTEGER NOT NULL DEFAULT 0, -- running total for cap enforcement
+  output_truncated INTEGER NOT NULL DEFAULT 0, -- 0|1 — 1 once server hit the per-task cap
   created_by      TEXT                      -- cli token id, for audit
 );
 
--- streamed output, append-only
+-- streamed output, append-only. Stdout and stderr sequence independently.
 CREATE TABLE task_chunks (
   task_id         TEXT NOT NULL REFERENCES tasks(id),
-  seq             INTEGER NOT NULL,
   stream          TEXT NOT NULL,            -- 'stdout' | 'stderr'
+  seq             INTEGER NOT NULL,         -- per-(task_id, stream)
   data            BLOB NOT NULL,
   created_at      INTEGER NOT NULL,
-  PRIMARY KEY (task_id, seq)
+  PRIMARY KEY (task_id, stream, seq)
 );
 
 CREATE INDEX idx_tasks_node_status ON tasks(node_id, status);
@@ -169,10 +177,14 @@ CREATE INDEX idx_tasks_created ON tasks(created_at DESC);
 
 ### Notes
 
+- **Unified `tokens` table.** Agent, CLI, and join tokens all live here. Agent tokens carry a `node_id` foreign key. This eliminates the schema/revocation ambiguity from having agent tokens shadowed on the `nodes` row.
+- **`tokens.id` is the public lookup key.** It is embedded in the token string (see §6.6) so verification is an indexed single-row lookup followed by one argon2 compare — not O(N) over all tokens.
+- **Chunk primary key is `(task_id, stream, seq)`.** Stdout and stderr each have an independent sequence space so the agent's parallel goroutines never race on a shared counter.
+- **`output_bytes` / `output_truncated`** are maintained by the server on each chunk insert to enforce the per-task output cap (see §7.5).
 - **`metadata_json` is a free-form blob.** Adding fields (GPU info, Tailscale IP, etc.) does not require a migration.
-- **No separate task queue table.** Pending work is `tasks WHERE status='pending' AND node_id=?` ordered by `created_at`.
+- **No separate task queue table.** Pending work is `tasks WHERE status='pending' AND node_id=?` ordered by `created_at`. Claim is atomic (see §7.2).
 - **No retention policy in V1.** `uncluster tasks prune --older-than=7d` is a later command.
-- **Tokens at rest are argon2id hashes.** A leaked DB alone cannot impersonate an agent or CLI.
+- **Only argon2id hashes at rest.** A leaked DB alone cannot impersonate an agent or CLI.
 
 ---
 
@@ -202,8 +214,8 @@ The `api/openapi.yaml` file is the **source of truth** for the REST contract. Bo
 | POST | `/v1/tasks` | Create task `{ node, command }`. Returns task_id. |
 | GET | `/v1/tasks?node=&status=&limit=` | List recent tasks. |
 | GET | `/v1/tasks/{id}` | Task details (status, timings, exit code). |
-| GET | `/v1/tasks/{id}/output` | Full stdout/stderr batched — blocks until task is complete. |
-| GET | `/v1/tasks/{id}/stream` | SSE: live chunks + final status event. |
+| GET | `/v1/tasks/{id}/chunks?since_stdout=&since_stderr=` | Paginated fetch of already-stored chunks. Non-blocking; returns immediately with whatever is stored. Callers that need "full output after completion" poll `GET /v1/tasks/{id}` for `status ∈ {succeeded, failed, cancelled}`, then fetch `/chunks`. |
+| GET | `/v1/tasks/{id}/stream` | SSE: already-stored chunks replayed, then live chunks, then final status event. |
 | POST | `/v1/tasks/{id}/cancel` | Cancel pending or running task. |
 | POST | `/v1/tokens` | Create token `{ kind: "join"\|"cli", label?, expires_at? }`. Returns plaintext **once**. |
 | GET | `/v1/tokens` | List (metadata only; never plaintext). |
@@ -228,7 +240,7 @@ uncluster server token ls
 uncluster server token revoke <id>
 
 # agent-side (run on each node)
-uncluster agent join --server=URL --token=<join> --name=<node-name>
+uncluster agent join --server=URL --name=<node-name> --token-stdin     # token piped in (see §5.2.1)
 uncluster agent run                       # foreground, prints logs
 uncluster agent install                   # installs launchd/systemd user service
 uncluster agent uninstall
@@ -247,14 +259,22 @@ uncluster tasks tail <id>                 # SSE live-tail
 uncluster tasks cancel <id>
 
 uncluster config set server=URL
-uncluster config set token=<cli>
-uncluster config show
+uncluster config set token --stdin        # prompts or reads from pipe — never on argv
+uncluster config show                     # never prints the token
 ```
+
+### 5.2.1 Token input never on argv
+
+To avoid leaking credentials to shell history and `ps`, tokens are **never** passed as positional arguments or `--token=<value>` flags. Every command that accepts a token supports:
+
+- `--token-stdin` — read the token from stdin, one line.
+- `UNCLUSTER_TOKEN` environment variable — useful for scripts and systemd/launchd units.
+- No other channel is supported. `--token=foo` is rejected with a non-zero exit and a message explaining why.
 
 ### 5.3 V1 command priority
 
-- **Must ship in V1:** `server start`, `server token create`, `agent join`, `agent run`, `nodes ls`, `run <node> -- <cmd>`, `tasks tail`, `tasks show`, and the `/v1/tasks/{id}/stream` SSE endpoint (required by `run` and `tasks tail`).
-- **Nice to have in V1:** `agent install`, `tasks cancel`, `tasks ls`, `nodes rm`, token revocation.
+- **Must ship in V1:** `server start`, `server token create`, `agent join`, `agent run`, `nodes ls`, `nodes rm` (acceptance §11 #7 depends on it), `run <node> -- <cmd>`, `tasks tail`, `tasks show`, token revocation, and the `/v1/tasks/{id}/stream` SSE endpoint (required by `run` and `tasks tail`).
+- **Nice to have in V1:** `agent install`, `tasks cancel`, `tasks ls`.
 - **Later:** `tasks prune`, multi-node fan-out, TUI dashboard, MCP server.
 
 ---
@@ -270,12 +290,12 @@ listening on :7777
 
 # mint a CLI token
 $ uncluster server token create --kind=cli --label=my-laptop
-token: uct_cli_8f2a9b...(shown ONCE, copy it now)
-id:    tok_01H...
+token: uct_cli_k4m8j3x2_9f2a...(shown ONCE, copy it now)
+id:    tok_k4m8j3x2
 
 # on your laptop
 $ uncluster config set server=https://uncluster.home.example.com:7777
-$ uncluster config set token=uct_cli_8f2a9b...
+$ pbpaste | uncluster config set token --stdin     # paste from clipboard, not argv
 $ uncluster nodes ls
 (empty — no nodes yet)
 ```
@@ -285,15 +305,15 @@ $ uncluster nodes ls
 ```
 # on the server: mint a one-time join token
 $ uncluster server token create --kind=join --label=old-macbook
-token: uct_join_4c7e...(valid 15 min, single-use)
+token: uct_join_7p2k5s9a_4c7e...(valid 15 min, single-use)
 
 # on the new machine (the old MacBook)
-$ curl -L https://.../uncluster-agent-darwin-amd64 -o /usr/local/bin/uncluster
+$ curl -L https://.../uncluster-darwin-amd64 -o /usr/local/bin/uncluster
 $ chmod +x /usr/local/bin/uncluster
-$ uncluster agent join \
+$ pbpaste | uncluster agent join \
     --server=https://uncluster.home.example.com:7777 \
-    --token=uct_join_4c7e... \
-    --name=old-macbook
+    --name=old-macbook \
+    --token-stdin
 
 registered as node_01HX... (old-macbook)
 agent token saved to ~/.config/uncluster/agent.toml
@@ -304,14 +324,19 @@ $ launchctl start com.uncluster.agent
 ### 6.3 Under the hood on `agent join`
 
 1. Agent POSTs `/v1/agent/register` with `{ join_token, name, metadata }`.
-2. Server validates the join token (present, unused, not expired, hash matches), creates a node row, generates a fresh long-lived **agent token**, stores only its hash, and marks the join token `used_at = now`.
+2. Server (single transaction):
+   - Parses and validates the join token (see §6.6 verification steps).
+   - Checks `nodes.name` is free; if a revoked node previously held it, the name was already renamed to `<name>-revoked-<ts>` at revocation time (see §6.5) so the name is available.
+   - Inserts a new `nodes` row with `status='online'`.
+   - Generates a fresh `uct_agent_<id>_<secret>` token, inserts a `tokens` row with `kind='agent'`, `node_id=<new>`, `secret_hash=argon2id(secret)`.
+   - Sets `used_at = now` on the join token's `tokens` row.
 3. Server responds with `{ node_id, agent_token }` — plaintext agent token returned exactly once.
 4. Agent writes `~/.config/uncluster/agent.toml` (mode 0600):
    ```toml
    server      = "https://uncluster.home.example.com:7777"
    node_id     = "node_01HX..."
    node_name   = "old-macbook"
-   agent_token = "uct_agent_..."
+   agent_token = "uct_agent_k4m8j3x27p2k5s9a_..."
    ```
 5. Agent never sends the join token again.
 
@@ -323,20 +348,40 @@ $ launchctl start com.uncluster.agent
 
 ### 6.5 Revocation
 
-- `uncluster nodes rm <name>` → server sets node `status='revoked'`, deletes the token row. Any in-flight long-poll returns 401; the agent exits cleanly.
-- `uncluster server token revoke <id>` revokes a CLI token.
+- `uncluster nodes rm <name>` (transactional):
+  1. Set node `status='revoked'`.
+  2. Rename the node: `name = name || '-revoked-' || strftime('%s','now')`. This frees the original name for a future re-registration. Historical tasks keep their `node_id` foreign key so audit trails are preserved.
+  3. Set `revoked_at=now` on the agent token row (single `UPDATE tokens WHERE node_id=? AND kind='agent'`).
+  - Any in-flight long-poll from that agent returns 401 on the next request; the agent exits cleanly.
+- `uncluster server token revoke <id>` revokes a CLI or join token by setting `tokens.revoked_at=now`.
 
 ### 6.6 Token format & lifetime
 
-Prefixes so leaked tokens are greppable and distinguishable at a glance:
+Token string layout: `uct_<kind>_<id>_<secret>`
 
-| Prefix | Purpose | Expiry | Revocable |
+| Segment | Length | Role |
+|---|---|---|
+| `uct_<kind>_` | prefix | `uct_join_`, `uct_agent_`, or `uct_cli_` — greppable and distinguishable at a glance. |
+| `<id>` | 16 chars (80 bits) base32 | Public lookup key. Stored as `tokens.id`. Indexed → O(1) lookup. |
+| `<secret>` | 52 chars (256 bits) base32 | Stored only as `tokens.secret_hash = argon2id(secret)`. |
+
+Example: `uct_agent_k4m8j3x27p2k5s9a_9f2a...(52 chars)...`
+
+Verification on every authenticated request:
+
+1. Parse the bearer token → `(kind, id, secret)`. Reject if shape is wrong.
+2. `SELECT * FROM tokens WHERE id = ?` — indexed single-row lookup.
+3. Reject if `kind` in the token does not match the row, if `revoked_at IS NOT NULL`, if `used_at IS NOT NULL` (for `join`), or if `expires_at < now`.
+4. `argon2id_verify(secret, row.secret_hash)` — exactly one hash comparison.
+5. For `kind='agent'`: also re-check `nodes.status != 'revoked'` for defense in depth.
+
+**Why this layout matters:** without the public `id`, the server would have to argon2-compare every candidate hash per request. That's O(N) per verify, prohibitive at heartbeat cadence (every 10 s per node) and a DoS vector.
+
+| Kind | Expiry | Revocable | Notes |
 |---|---|---|---|
-| `uct_join_...` | One-time node registration | 15 minutes, single-use (whichever comes first) | N/A (consumed) |
-| `uct_agent_...` | Long-lived agent credential | None | Yes (via `nodes rm` or direct token revoke) |
-| `uct_cli_...` | CLI / automation credential | Optional `expires_at` at creation; default none | Yes |
-
-Each token body is 32 bytes of CSPRNG output, base32-encoded, with the prefix prepended. Server stores only an argon2id hash; verification is hash-compare against `tokens.token_hash` (for CLI/join) or `nodes.token_hash` (for agent).
+| `join` | 15 minutes, single-use (whichever is first) | Yes, via `server token revoke` | `used_at` marks consumption at registration time. |
+| `agent` | None | Yes, via `nodes rm` or `server token revoke` | One agent token per node. Rotation = revoke + re-join. |
+| `cli` | Optional `expires_at`; default none | Yes, via `server token revoke` | Every CLI token has full control-plane privileges in V1 (no RBAC). |
 
 ### 6.7 V1 simplifications (deliberate)
 
@@ -402,16 +447,16 @@ $ echo $?
      │ exit 0                        │                             │
 ```
 
-### 7.2 Server-side dispatcher (V1, in-process)
+### 7.2 Server-side dispatcher (V1, in-process) & atomic claim
 
 ```go
 type Dispatcher interface {
     // Called by the API handler when a new task is inserted.
     Notify(nodeID string)
 
-    // Called by the long-poll handler. Blocks up to `timeout` for a task on this node.
-    // Returns nil on timeout.
-    Wait(ctx context.Context, nodeID string, timeout time.Duration) *Task
+    // Called by the long-poll handler. Blocks up to `timeout` for a wake-up,
+    // then returns control. Task claim is performed via the Store, not here.
+    Wait(ctx context.Context, nodeID string, timeout time.Duration)
 
     // For SSE streaming — publishes a chunk to any active listeners on this task.
     PublishChunk(taskID string, chunk Chunk)
@@ -419,64 +464,176 @@ type Dispatcher interface {
 }
 ```
 
-V1 implementation: `map[nodeID]chan struct{}` for wake-ups + `map[taskID][]chan Event` for chunk subscribers, guarded by a mutex. Pending tasks are pulled from SQLite ordered by `created_at`.
+V1 implementation: `map[nodeID]chan struct{}` for wake-ups (buffered size 1, coalescing) + `map[taskID][]chan Event` for chunk subscribers, guarded by a mutex.
 
-Future Lambda/Workers variants replace `Notify`/`Wait` with queue semantics (SQS, Redis Streams, Durable Objects). `PublishChunk`/`Subscribe` become pub/sub on the same substrate. Handlers are unchanged.
-
-### 7.3 Agent-side execution
+**Long-poll handler (exact loop):**
 
 ```go
-// pseudocode
-for {
-    task, err := server.NextTask(ctx)      // long-poll, blocks
-    if err != nil { backoff(); continue }
-    if task == nil { continue }            // 204 timeout, immediate reconnect
+func handleNextTask(nodeID string) (*Task, error) {
+    ctx, cancel := context.WithTimeout(req.Context(), 30*time.Second)
+    defer cancel()
 
-    cmd := exec.CommandContext(taskCtx, "bash", "-lc", task.Command)
-    stdout, _ := cmd.StdoutPipe()
-    stderr, _ := cmd.StderrPipe()
-    cmd.Start()
+    for {
+        // 1. Atomic claim attempt via the Store (see below).
+        task, err := store.ClaimNextPending(ctx, nodeID)
+        if err != nil { return nil, err }
+        if task != nil { return task, nil }
 
-    go streamPipe(stdout, "stdout", task.ID)   // POST chunks as they come
-    go streamPipe(stderr, "stderr", task.ID)
+        // 2. No pending work. Wait for Notify or timeout.
+        dispatcher.Wait(ctx, nodeID, remaining(ctx))
+        if ctx.Err() != nil { return nil, nil /* 204 */ }
 
-    err = cmd.Wait()
-    exitCode := extractExitCode(err)
-    server.CompleteTask(task.ID, exitCode)
+        // 3. Loop and re-attempt the claim (wake-up could be spurious).
+    }
 }
 ```
 
-Chunk flushing:
+**Atomic claim SQL** (`Store.ClaimNextPending`), using SQLite's `UPDATE ... RETURNING`:
+
+```sql
+UPDATE tasks
+SET status = 'running', started_at = :now
+WHERE id = (
+    SELECT id FROM tasks
+    WHERE node_id = :node_id AND status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT 1
+)
+AND status = 'pending'           -- re-check guards against concurrent claim
+RETURNING id, command, created_at;
+```
+
+SQLite serializes writes, so two concurrent long-polls from the same node (shouldn't happen in practice, but possible during agent reconnect) both execute this statement; exactly one sees a `RETURNING` row. Postgres implementation uses `UPDATE ... RETURNING` with `WHERE ... FOR UPDATE SKIP LOCKED` in the sub-select.
+
+**Cancel-vs-claim race:** if `status` has already advanced past `pending` (e.g., the task was `cancelled` before any agent picked it up), the outer `WHERE status='pending'` prevents the claim; the dispatcher returns nil and keeps waiting. Cancelled-while-pending tasks never move to `running`.
+
+Future Lambda/Workers variants replace `Notify`/`Wait` with queue semantics (SQS, Redis Streams, Durable Objects) and replace the SQLite `UPDATE ... RETURNING` with the backing store's native atomic-dequeue primitive. `PublishChunk`/`Subscribe` become pub/sub on the same substrate. Handler shape is unchanged; the runtime semantics and the claim mechanism both migrate behind the interfaces.
+
+### 7.3 Agent-side concurrency model
+
+The agent runs **three concurrent goroutines** at all times, plus one transient pair per active task. This layout guarantees the heartbeat pulse continues regardless of what the current task is doing (or not doing) — which is what the cancellation path in §7.4 relies on.
+
+```
+agent process
+├── goroutine: heartbeatLoop        — always running, ticks every 10 s
+├── goroutine: pollLoop             — always running, serial task pickup
+├── goroutine: cancelDispatcher     — receives cancel signals, looks up active tasks
+│                                     map[taskID]context.CancelFunc, protected by a mutex
+└── per active task (transient):
+    ├── goroutine: stdoutStreamer   — reads stdout pipe, POSTs chunks
+    └── goroutine: stderrStreamer   — reads stderr pipe, POSTs chunks
+```
+
+**heartbeatLoop:**
+
+```go
+func heartbeatLoop(ctx context.Context) {
+    t := time.NewTicker(10 * time.Second)
+    defer t.Stop()
+    for {
+        select {
+        case <-ctx.Done(): return
+        case <-t.C:
+            resp, err := server.Heartbeat(ctx, collectMetrics())
+            if err != nil { continue } // network flap; next tick retries
+            // Cancel instructions ride on the heartbeat response.
+            for _, tid := range resp.CancelTaskIDs {
+                cancelDispatcher.Signal(tid)
+            }
+        }
+    }
+}
+```
+
+**pollLoop:**
+
+```go
+func pollLoop(ctx context.Context) {
+    for ctx.Err() == nil {
+        task, err := server.NextTask(ctx)   // 30 s long-poll
+        if err != nil { backoff(); continue }
+        if task == nil { continue }         // 204 — reconnect immediately
+        executeTask(ctx, task)              // blocks until task done
+    }
+}
+```
+
+**executeTask:**
+
+```go
+func executeTask(parent context.Context, task Task) {
+    taskCtx, cancel := context.WithCancel(parent)
+    cancelDispatcher.Register(task.ID, cancel)
+    defer cancelDispatcher.Unregister(task.ID)
+
+    cmd := exec.CommandContext(taskCtx, "bash", "-lc", task.Command)
+    cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // new process group for group-kill
+    stdout, _ := cmd.StdoutPipe()
+    stderr, _ := cmd.StderrPipe()
+    _ = cmd.Start()
+
+    go streamPipe(stdout, "stdout", task.ID)   // POST chunks; response may carry cancel signal
+    go streamPipe(stderr, "stderr", task.ID)
+
+    waitErr := cmd.Wait()
+
+    // If taskCtx was cancelled, send SIGTERM to the whole process group, then SIGKILL after 5 s.
+    // See §7.4 for the exact termination sequence.
+
+    exit := exitCodeFrom(waitErr, taskCtx)
+    _ = server.CompleteTask(task.ID, exit)
+}
+```
+
+Cancel signals can arrive via **either** heartbeat **or** chunk POST response — both paths funnel through `cancelDispatcher`, which calls the task's `context.CancelFunc`. Whichever arrives first wins; idempotent thereafter.
+
+Chunk flushing policy (unchanged):
 - when a single read fills a 4 KiB buffer, **or**
 - every 200 ms if there is pending data, **or**
 - immediately on process exit.
 
-This gives live-tail without one HTTP request per byte.
-
 ### 7.4 Cancellation
 
-The agent has no dedicated server→agent control channel (it only polls `next-task` and POSTs chunks/heartbeats). Cancellation rides on the two frequent agent→server calls.
+The agent has no dedicated server→agent control channel (it only polls `next-task` and POSTs chunks/heartbeats). Cancellation rides on the two frequent agent→server call responses.
 
-- **Client call:** `POST /v1/tasks/{id}/cancel` marks `status='cancelling'`.
-- **Signal delivery:** the next `POST /v1/agent/tasks/{id}/chunks` or `POST /v1/agent/heartbeat` from this node returns a response body with `{ cancel_task_ids: ["task_01HY..."] }`. Worst-case latency is therefore one heartbeat interval (10 s) even if the task produces no output. An idle agent mid-task still heartbeats.
-- **Agent on receipt:** `taskCtx.Cancel()` → `SIGTERM` the child process group → wait 5 s → `SIGKILL` if still alive.
+- **Client call:** `POST /v1/tasks/{id}/cancel` atomically advances the task: `pending→cancelled` (nothing to do server-side beyond the state flip) or `running→cancelling` (signal delivery below).
+- **Signal delivery, either path:**
+  - `POST /v1/agent/tasks/{id}/chunks` response body carries `{ cancel_task_ids: [...] }` — immediate for any task producing output.
+  - `POST /v1/agent/heartbeat` response body carries the same — fires every 10 s regardless of task output, which is the guaranteed path for silent long-running commands.
+- **Both paths feed the agent's `cancelDispatcher`** (§7.3). `cancelDispatcher.Signal(taskID)` invokes the registered `context.CancelFunc`, which cancels `taskCtx`. `exec.CommandContext` then sends `SIGTERM` to the child via the process group (set up with `Setpgid: true`). If the process is still alive after 5 s, the agent sends `SIGKILL` to the process group.
 - **Agent reports** final status via the usual `POST /v1/agent/tasks/{id}/complete` with whatever exit code arrived; the server maps `status='cancelling'` + completion into `status='cancelled'`.
 
-### 7.5 Failure modes handled in V1
+**Worst-case cancel latency for a silent task:** one heartbeat interval (10 s) from cancel request to agent receipt. Noisy tasks are typically cancelled within the next chunk flush (≤200 ms).
+
+### 7.5 Output cap (per task)
+
+Without a cap, one `cat /dev/urandom` fills the control-plane disk. V1 enforces a **10 MB per-task cap** server-side:
+
+- Server tracks `tasks.output_bytes` (running total) on every chunk insert.
+- Once `output_bytes + len(incoming) > 10 MiB`:
+  - Trim the incoming chunk to the remaining budget.
+  - Insert a final synthetic chunk on that stream: `data = "\n[uncluster: output truncated at 10 MiB]\n"`.
+  - Set `tasks.output_truncated = 1`.
+  - Return `{ truncated: true }` on the chunk POST response so the agent can short-circuit future flushes for this task.
+- Task still runs to completion; only its stored output is capped. Exit code is preserved.
+
+`uncluster tasks show` surfaces `output_truncated` prominently. V2 may expose the cap as a server-config knob.
+
+### 7.6 Failure modes handled in V1
 
 | Scenario | Behavior |
 |---|---|
-| Agent crashes mid-task | On restart, agent has no in-flight task. Server sees `status=running` with no heartbeat for 60 s → reaper marks `status='failed'`, exit_code=-1, appends a `[agent lost]` chunk. |
-| Server crashes mid-task | Agent keeps running. Chunk POSTs to a reaped task are rejected idempotently. |
+| Agent crashes mid-task | On restart, agent has no in-flight task. Server sees `status=running` with no heartbeat for 60 s → reaper marks `status='failed'`, `exit_code=-1`, appends a `[agent lost]` chunk. |
+| Server crashes mid-task | Agent keeps running. Chunk POSTs to a reaped task return 409 and the agent drops remaining chunks. |
 | Network flap | Exponential backoff on POSTs; long-poll just reconnects. |
 | Command not found / non-zero exit | Normal. `exit_code` carries it. |
-| Chunk POST fails | Agent buffers in-memory up to 1 MB per task, drops oldest with a `[truncated]` marker. |
+| Chunk POST fails | Agent buffers in-memory up to 1 MB per task, drops oldest with a `[truncated]` marker (separate from the server-side cap above). |
+| Task output hits server cap | See §7.5 — agent is told to stop flushing; command continues to completion. |
 
-### 7.6 Out-of-scope for V1
+### 7.7 Out-of-scope for V1
 
-- No scheduling / placement. If the named node is offline, the task sits `pending` until it returns (or is cancelled).
+- No scheduling / placement. If the named node is offline, `POST /v1/tasks` returns the task as `pending` and the CLI's `run` command surfaces `[waiting for <node>]` in its live output until the agent reconnects. `--timeout=<dur>` on `run` is a V2 flag; V1 users can Ctrl-C the `run` (which issues `tasks cancel` on exit).
 - No retry on failed tasks — caller concern.
-- No output size cap beyond the 1 MB in-memory buffer.
 - No stdin streaming to tasks.
 
 ---
@@ -510,10 +667,8 @@ Go stdlib does most of the work. External deps kept deliberately small and borin
 ```
 uncluster/
 ├── cmd/
-│   ├── uncluster/                  # the one binary, all subcommands
-│   │   └── main.go
-│   └── uncluster-agent/            # thin wrapper invoking `uncluster agent run`
-│       └── main.go                 # for users who want an agent-only binary
+│   └── uncluster/                  # the one binary, all subcommands
+│       └── main.go
 ├── internal/
 │   ├── api/
 │   │   ├── types.go                # generated from openapi.yaml
@@ -567,7 +722,7 @@ uncluster/
 
 ### 8.3 Build & distribution
 
-- **Single binary, multiple entry points.** `uncluster` + subcommand selects role. Target size under 25 MB.
+- **Single binary, multiple entry points.** `uncluster` + subcommand selects role (server / agent / client).
 - **Cross-compile matrix:** `darwin/amd64`, `darwin/arm64`, `linux/amd64`, `linux/arm64`. Windows deferred.
 - **Release artifacts:** tarballs with binary + example launchd/systemd unit + man page. GitHub Releases. `install.sh` nice-to-have.
 - **Version stamping:** `-ldflags "-X .../version.Version=v0.1.0"`.
@@ -595,9 +750,9 @@ These aren't features — they're V1 decisions that make future work cheap.
 
 1. **`Store` interface** → Postgres, MySQL, DynamoDB later without touching handlers.
 2. **`Dispatcher` interface** → queue-backed (SQS, Redis Streams) or polling variants for Lambda / serverless.
-3. **OpenAPI as the contract** → a TypeScript/Hono control plane for Cloudflare Workers is a port of handlers + `Store` + `Dispatcher`, not a rewrite of the protocol. Lives in `servers/workers-ts/` when built.
+3. **OpenAPI as the contract** → a TypeScript/Hono control plane for Cloudflare Workers keeps the **wire protocol** (URLs, methods, request/response shapes, auth scheme, token format) identical. The **runtime semantics** are not a trivial port: the in-memory `Dispatcher` maps do not translate — a Workers impl would need Durable Objects (for long-poll parking) or switch the agent to short-poll with a backing queue (KV / D1 / R2) and accept the latency trade-off. Budget a real design pass for this, not just a transliteration.
 4. **Agent → Server is always outbound HTTP** → agents never need public endpoints; overlay networks (Tailscale, Cloudflare Tunnel) just change the server URL.
-5. **Tokens are hashed and prefixed** → rotation and per-token scoping are future additive changes, not schema reshapes.
+5. **Tokens are hashed, prefixed, and carry a public ID** → rotation, per-token scoping, and multi-user RBAC are future additive changes, not schema reshapes or format breakage.
 
 ---
 
@@ -635,12 +790,15 @@ These aren't features — they're V1 decisions that make future work cheap.
 V1 is done when, on a fresh machine:
 
 1. Operator can run `uncluster server start` and see `:7777` listening.
-2. Operator can run `uncluster server token create --kind=cli` on the server, then `uncluster config set` + `uncluster nodes ls` on a laptop — returns empty list, 200 OK.
+2. Operator can run `uncluster server token create --kind=cli` on the server, then `uncluster config set server=` + `pbpaste | uncluster config set token --stdin` + `uncluster nodes ls` on a laptop — returns empty list, 200 OK. Token never appears in `ps` output or shell history.
 3. Operator can run `uncluster server token create --kind=join`, then `uncluster agent join …` on a second machine — node appears in `uncluster nodes ls` with live metadata.
 4. Agent, if killed and restarted, re-appears in `uncluster nodes ls` within one heartbeat interval (~10 s).
 5. `uncluster run <node> -- <cmd>` executes on the target and streams output live; exit code is propagated to the CLI.
 6. `uncluster tasks tail <id>` attaches to an already-running task and streams remaining output.
-7. `uncluster nodes rm <node>` revokes the node's token; the agent's next request returns 401 and it exits cleanly.
-8. End-to-end integration test covers #1–#5 in CI.
-9. Static binaries for `darwin/{amd64,arm64}` and `linux/{amd64,arm64}` build in CI, each ≤ 25 MB.
-10. `api/openapi.yaml` exists, `oapi-codegen` generates client/server stubs, and the Go server implements every path it lists.
+7. `uncluster nodes rm <node>` revokes the node's token; the agent's next request returns 401 and it exits cleanly. A subsequent `uncluster agent join --name=<same-name>` on any machine succeeds (original name was freed by the revoke-rename in §6.5).
+8. **Concurrency:** two simultaneous `GET /v1/agent/next-task` polls for the same node (simulating an agent reconnect race) result in exactly one claimed task; the other receives 204.
+9. **Silent-command cancellation:** `uncluster run <node> -- sleep 300` followed by `uncluster tasks cancel <id>` results in the command being killed and the task reaching `status='cancelled'` within one heartbeat interval (~10 s), even though the command produced no stdout.
+10. **Output cap:** `uncluster run <node> -- yes | head -c 100M` completes successfully with `tasks.output_truncated = 1`, stored output size ≤ 10 MiB, and a visible truncation marker at the end of the stored stdout.
+11. End-to-end integration test covers #1–#7 in CI.
+12. Static binaries for `darwin/{amd64,arm64}` and `linux/{amd64,arm64}` build in CI.
+13. `api/openapi.yaml` exists, is committed, and documents every endpoint the Go server exposes (manually maintained in V1; codegen optional). A doc-drift test asserts every handler route is represented in the YAML.
