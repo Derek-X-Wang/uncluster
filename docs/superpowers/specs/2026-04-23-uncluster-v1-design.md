@@ -87,7 +87,7 @@ Three components, all Go, all single static binaries:
      │   agent     │  │   agent     │  │   agent     │
      │ old-macbook │  │  home-srv   │  │  work-mbp   │
      └─────────────┘  └─────────────┘  └─────────────┘
-       uncluster-agent, running as a user service (launchd/systemd)
+       `uncluster agent run` (same binary), running as a user service (launchd/systemd)
 ```
 
 ### Transport
@@ -422,9 +422,9 @@ $ echo $?
      │ ◄──── 201 {task_id}           │                             │
      │                               │                             │
      │                               │  ◄─── GET /v1/agent/next-task (long-poll, already waiting)
-     │                               │  SELECT pending WHERE       │
-     │                               │         node_id=... LIMIT 1 │
-     │                               │  UPDATE status=running      │
+     │                               │  UPDATE tasks ... RETURNING │
+     │                               │  (atomic claim — see §7.2)  │
+     │                               │  status=running,            │
      │                               │  started_at=now             │
      │                               │ 200 {task_id, command} ───► │
      │                               │                             │
