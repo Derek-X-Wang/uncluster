@@ -194,6 +194,51 @@ paths:
               schema: { $ref: "#/components/schemas/NextTaskResponse" }
         "204": { description: no task within timeout }
 
+  /v1/agent/tasks/{id}/chunks:
+    post:
+      summary: Upload a chunk of task output (stdout or stderr)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+          description: Task ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChunkUploadRequest" }
+      responses:
+        "200":
+          description: Chunk accepted; returns truncation flag and any pending cancels
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChunkUploadResponse" }
+        "403": { description: Task not assigned to this node }
+        "404": { description: Task not found }
+
+  /v1/agent/tasks/{id}/complete:
+    post:
+      summary: Mark a task as complete with its exit code
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+          description: Task ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CompleteRequest" }
+      responses:
+        "204": { description: Task marked complete }
+        "403": { description: Task not assigned to this node }
+        "404": { description: Task not found }
+        "409": { description: Task already completed }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -288,6 +333,35 @@ components:
         finished_at: { type: integer, format: int64, nullable: true }
         output_bytes: { type: integer, format: int64 }
         output_truncated: { type: boolean }
+    ChunkUploadRequest:
+      type: object
+      required: [stream, data]
+      properties:
+        stream:
+          type: string
+          enum: [stdout, stderr]
+          description: Output stream identifier
+        data:
+          type: string
+          format: byte
+          description: Base64-encoded chunk bytes
+    ChunkUploadResponse:
+      type: object
+      properties:
+        truncated:
+          type: boolean
+          description: True if the per-task output cap has been reached; agent should stop sending
+        cancel_task_ids:
+          type: array
+          items: { type: string }
+          description: Task IDs pending cancellation on this node (piggyback delivery)
+    CompleteRequest:
+      type: object
+      required: [exit_code]
+      properties:
+        exit_code:
+          type: integer
+          description: Process exit code (0 = success)
 
 security:
   - bearerAuth: []

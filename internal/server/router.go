@@ -48,6 +48,8 @@ func (s *Server) buildRouter() http.Handler {
 		v1.Group(func(agent chi.Router) {
 			agent.Use(s.requireAuth(store.TokenAgent))
 			agent.Get("/agent/next-task", s.handleAgentNextTask)
+			agent.Post("/agent/tasks/{id}/chunks", s.handleAgentChunks)
+			agent.Post("/agent/tasks/{id}/complete", s.handleAgentComplete)
 		})
 	})
 
