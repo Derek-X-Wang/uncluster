@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -59,7 +62,18 @@ Example:
 				return nil
 			}
 
-			return tailTask(cmd.Context(), client, taskID)
+			runCtx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+			defer cancel()
+
+			go func() {
+				<-runCtx.Done()
+				// Best-effort: cancel the remote task with a short timeout so the CLI doesn't hang.
+				ctxCancel, cancelCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancelCancel()
+				_ = client.Do(ctxCancel, "POST", "/v1/tasks/"+taskID+"/cancel", nil, nil)
+			}()
+
+			return tailTask(runCtx, client, taskID)
 
 		},
 	}
