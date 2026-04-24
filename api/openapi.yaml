@@ -183,6 +183,24 @@ paths:
               schema: { $ref: "#/components/schemas/TaskDetail" }
         "404": { description: not found }
 
+  /v1/tasks/{id}/chunks:
+    get:
+      summary: List stored output chunks for a task
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+        - in: query
+          name: stream
+          schema: { type: string, enum: [stdout, stderr] }
+          description: Filter to a specific stream; omit for all streams
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChunksResponse" }
+        "404": { description: task not found }
+
   /v1/tasks/{id}/stream:
     get:
       summary: Stream task output as Server-Sent Events
@@ -394,6 +412,20 @@ components:
           type: array
           items: { type: string }
           description: Task IDs pending cancellation on this node (piggyback delivery)
+    ChunkOut:
+      type: object
+      properties:
+        stream: { type: string, enum: [stdout, stderr] }
+        seq: { type: integer, format: int64 }
+        data: { type: string, format: byte, description: Base64-encoded chunk bytes }
+        created_at: { type: integer, format: int64 }
+    ChunksResponse:
+      type: object
+      required: [chunks]
+      properties:
+        chunks:
+          type: array
+          items: { $ref: "#/components/schemas/ChunkOut" }
     CompleteRequest:
       type: object
       required: [exit_code]

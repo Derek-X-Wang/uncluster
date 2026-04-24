@@ -221,6 +221,36 @@ func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleTaskChunks returns the stored output chunks for a task.
+// Optional ?stream= query parameter filters to a specific stream (stdout|stderr).
+func (s *Server) handleTaskChunks(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "id")
+	stream := r.URL.Query().Get("stream")
+
+	// Validate that the task exists.
+	if _, err := s.cfg.Store.GetTask(r.Context(), taskID); err != nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+
+	chunks, err := s.cfg.Store.ListChunks(r.Context(), taskID, stream, 0, 0)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make([]api.ChunkOut, 0, len(chunks))
+	for _, c := range chunks {
+		out = append(out, api.ChunkOut{
+			Stream:    c.Stream,
+			Seq:       c.Seq,
+			Data:      c.Data,
+			CreatedAt: c.CreatedAt.Unix(),
+		})
+	}
+	writeJSON(w, http.StatusOK, api.ChunksResponse{Chunks: out})
+}
+
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	task, err := s.cfg.Store.GetTask(r.Context(), id)
