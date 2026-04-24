@@ -3,7 +3,9 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 
+	"github.com/kardianos/service"
 	"github.com/spf13/cobra"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
@@ -44,6 +46,22 @@ func newAgentCmd() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(run)
+
+	install := &cobra.Command{
+		Use:   "install",
+		Short: "Install the agent as a user service (launchd on macOS, systemd user on Linux)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return svcAction("install")
+		},
+	}
+	uninstall := &cobra.Command{
+		Use:   "uninstall",
+		Short: "Uninstall the agent service",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return svcAction("uninstall")
+		},
+	}
+	cmd.AddCommand(install, uninstall)
 
 	return cmd
 }
@@ -109,3 +127,29 @@ Never pass the token as a command-line argument.`,
 
 	return join
 }
+
+func svcAction(action string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	svcCfg := &service.Config{
+		Name:        "com.uncluster.agent",
+		DisplayName: "Uncluster Agent",
+		Description: "Uncluster node agent",
+		Executable:  exe,
+		Arguments:   []string{"agent", "run"},
+		Option:      map[string]interface{}{"UserService": true},
+	}
+	prg := &agentService{}
+	s, err := service.New(prg, svcCfg)
+	if err != nil {
+		return err
+	}
+	return service.Control(s, action)
+}
+
+type agentService struct{}
+
+func (a *agentService) Start(service.Service) error { return nil }
+func (a *agentService) Stop(service.Service) error  { return nil }
