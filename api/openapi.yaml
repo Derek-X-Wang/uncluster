@@ -211,6 +211,17 @@ paths:
         "404": { description: task not found }
         "500": { description: server does not support streaming }
 
+  /v1/tasks/{id}/cancel:
+    post:
+      summary: Cancel a pending or running task
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "202": { description: cancellation requested }
+        "404": { description: not found }
+        "409": { description: not cancellable in current state }
+
   /v1/agent/next-task:
     get:
       summary: Long-poll for the next task assigned to this agent (30s)

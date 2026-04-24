@@ -221,6 +221,35 @@ func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	task, err := s.cfg.Store.GetTask(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	switch task.Status {
+	case store.TaskPending:
+		if err := s.cfg.Store.MarkTaskCancelled(r.Context(), id, time.Now()); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		s.dispatcher.PublishChunk(id, DispatcherEvent{
+			Kind: "done", Payload: map[string]any{"exit_code": nil, "status": "cancelled"},
+		})
+	case store.TaskRunning:
+		if err := s.cfg.Store.MarkTaskCancelling(r.Context(), id); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		s.dispatcher.Notify(task.NodeID)
+	default:
+		writeError(w, http.StatusConflict, "task is not cancellable in its current state")
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
 // deadline returns the context deadline, or now+30s if the context has no deadline.
 func deadline(ctx context.Context) time.Time {
 	if d, ok := ctx.Deadline(); ok {

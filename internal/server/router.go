@@ -45,6 +45,7 @@ func (s *Server) buildRouter() http.Handler {
 			cli.Get("/tasks", s.handleListTasks)
 			cli.Get("/tasks/{id}", s.handleGetTask)
 			cli.Get("/tasks/{id}/stream", s.handleTaskStream)
+			cli.Post("/tasks/{id}/cancel", s.handleCancelTask)
 		})
 		v1.Group(func(agent chi.Router) {
 			agent.Use(s.requireAuth(store.TokenAgent))

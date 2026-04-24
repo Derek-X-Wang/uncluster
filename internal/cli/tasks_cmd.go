@@ -17,6 +17,16 @@ func newTasksCmd() *cobra.Command {
 	cmd.AddCommand(newTasksTailCmd())
 	cmd.AddCommand(newTasksShowCmd())
 	cmd.AddCommand(newTasksLsCmd())
+	cmd.AddCommand(&cobra.Command{
+		Use:   "cancel <id>",
+		Short: "Cancel a pending or running task",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			cfg, _ := LoadCLIConfig()
+			client := NewClient(cfg.Server, cfg.Token)
+			return client.Do(c.Context(), "POST", "/v1/tasks/"+args[0]+"/cancel", nil, nil)
+		},
+	})
 	return cmd
 }
 
