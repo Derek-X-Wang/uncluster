@@ -1,0 +1,22 @@
+# binaries
+/uncluster
+/dist/
+*.exe
+
+# Go
+vendor/
+*.test
+coverage.out
+coverage.html
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# local state
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/.local/
