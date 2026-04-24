@@ -77,6 +77,12 @@ func Parse(s string) (Token, error) {
 	if len(parts[2]) != secretLen {
 		return Token{}, fmt.Errorf("token: secret length %d want %d", len(parts[2]), secretLen)
 	}
+	if _, err := b32.DecodeString(parts[1]); err != nil {
+		return Token{}, fmt.Errorf("token: id contains non-base32 characters")
+	}
+	if _, err := b32.DecodeString(parts[2]); err != nil {
+		return Token{}, fmt.Errorf("token: secret contains non-base32 characters")
+	}
 	return Token{Kind: kind, ID: parts[1], Secret: parts[2]}, nil
 }
 
@@ -97,20 +103,20 @@ func HashSecret(secret string) (string, error) {
 // VerifySecret compares a plaintext secret against a stored argon2id hash.
 func VerifySecret(secret, stored string) (bool, error) {
 	parts := strings.Split(stored, "$")
-	if len(parts) != 6 || parts[1] != "argon2id" {
-		return false, fmt.Errorf("verify: malformed hash")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" {
+		return false, fmt.Errorf("token: verify malformed hash")
 	}
 	var m, t, p int
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &m, &t, &p); err != nil {
-		return false, fmt.Errorf("verify params: %w", err)
+		return false, fmt.Errorf("token: verify params: %w", err)
 	}
 	salt, err := b32.DecodeString(parts[4])
 	if err != nil {
-		return false, fmt.Errorf("verify salt: %w", err)
+		return false, fmt.Errorf("token: verify salt: %w", err)
 	}
 	want, err := b32.DecodeString(parts[5])
 	if err != nil {
-		return false, fmt.Errorf("verify key: %w", err)
+		return false, fmt.Errorf("token: verify key: %w", err)
 	}
 	got := argon2.IDKey([]byte(secret), salt, uint32(t), uint32(m), uint8(p), uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1, nil

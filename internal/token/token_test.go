@@ -82,3 +82,34 @@ func TestIDLength(t *testing.T) {
 		t.Fatalf("ID length: got %d want 16 (%q)", len(tok.ID), tok.ID)
 	}
 }
+
+func TestGenerateRejectsInvalidKind(t *testing.T) {
+	if _, err := token.Generate(token.Kind("bogus")); err == nil {
+		t.Fatal("Generate(bogus) should fail")
+	}
+}
+
+func TestParseRejectsBadCharset(t *testing.T) {
+	// id field contains '_' which isn't in base32's alphabet.
+	bad := "uct_cli_aaaaaaaaaaaaaaaa_bb__bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if _, err := token.Parse(bad); err == nil {
+		t.Fatal("Parse should reject non-base32 chars in id/secret")
+	}
+}
+
+func TestVerifySecretRejectsMalformedHash(t *testing.T) {
+	cases := []string{
+		"",
+		"not-a-hash",
+		"$argon2id$bad",
+		"$argon2i$v=19$m=65536,t=3,p=2$AAAA$BBBB",          // wrong kind
+		"$argon2id$v=16$m=65536,t=3,p=2$AAAA$BBBB",         // wrong version
+		"PREFIX$argon2id$v=19$m=65536,t=3,p=2$AAAA$BBBB",   // parts[0] != ""
+	}
+	for _, c := range cases {
+		_, err := token.VerifySecret("whatever", c)
+		if err == nil {
+			t.Errorf("VerifySecret(%q) should return an error", c)
+		}
+	}
+}
