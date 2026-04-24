@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -32,7 +33,14 @@ func newAgentCmd() *cobra.Command {
 				return fmt.Errorf("agent not joined; run `uncluster agent join` first")
 			}
 			a := agent.New(cfg, nil)
-			return a.Run(cmd.Context())
+			if err := a.Run(cmd.Context()); err != nil {
+				if errors.Is(err, agent.ErrUnauthorized) {
+					fmt.Fprintln(cmd.ErrOrStderr(), "agent: revoked by server; exiting")
+					return nil
+				}
+				return err
+			}
+			return nil
 		},
 	}
 	cmd.AddCommand(run)
