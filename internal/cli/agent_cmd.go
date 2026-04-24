@@ -15,6 +15,28 @@ func newAgentCmd() *cobra.Command {
 		Short: "Manage the Uncluster agent on this machine",
 	}
 	cmd.AddCommand(newAgentJoinCmd())
+
+	run := &cobra.Command{
+		Use:   "run",
+		Short: "Run the agent in the foreground (used by service units)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			p, err := agent.DefaultConfigPath()
+			if err != nil {
+				return err
+			}
+			cfg, err := agent.LoadConfig(p)
+			if err != nil {
+				return fmt.Errorf("load agent config: %w", err)
+			}
+			if cfg.Server == "" || cfg.AgentToken == "" {
+				return fmt.Errorf("agent not joined; run `uncluster agent join` first")
+			}
+			a := agent.New(cfg, nil)
+			return a.Run(cmd.Context())
+		},
+	}
+	cmd.AddCommand(run)
+
 	return cmd
 }
 
