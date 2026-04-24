@@ -18,5 +18,7 @@ func NewRoot() *cobra.Command {
 	root.AddCommand(newServerCmd())
 	root.AddCommand(newConfigCmd())
 	root.AddCommand(newAgentCmd())
+	root.AddCommand(newRunCmd())
+	root.AddCommand(newTasksCmd())
 	return root
 }
