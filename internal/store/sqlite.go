@@ -340,46 +340,249 @@ func containsAny(s string, subs ...string) bool {
 	return false
 }
 
-// ------------- stubs for unimplemented Store methods (future tasks) -------------
+// ------------- tasks -------------
 
 func (s *sqliteStore) CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error) {
-	return Task{}, fmt.Errorf("not implemented")
+	id := "task_" + shortID(24)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO tasks(id, node_id, command, status, created_at, created_by)
+		 VALUES(?, ?, ?, 'pending', ?, ?)`,
+		id, nodeID, command, at.Unix(), nullString(createdBy))
+	if err != nil {
+		return Task{}, fmt.Errorf("insert task: %w", err)
+	}
+	return s.GetTask(ctx, id)
 }
 
 func (s *sqliteStore) GetTask(ctx context.Context, id string) (Task, error) {
-	return Task{}, fmt.Errorf("not implemented")
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, node_id, command, status, exit_code, created_at, started_at, finished_at,
+		        output_bytes, output_truncated, created_by
+		 FROM tasks WHERE id = ?`, id)
+	return scanTask(row)
 }
 
 func (s *sqliteStore) ListTasks(ctx context.Context, nodeID string, status TaskStatus, limit int) ([]Task, error) {
-	return nil, fmt.Errorf("not implemented")
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	args := []any{}
+	where := ""
+	if nodeID != "" {
+		where += " AND node_id = ?"
+		args = append(args, nodeID)
+	}
+	if status != "" {
+		where += " AND status = ?"
+		args = append(args, string(status))
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, node_id, command, status, exit_code, created_at, started_at, finished_at,
+		        output_bytes, output_truncated, created_by
+		 FROM tasks WHERE 1=1`+where+` ORDER BY created_at DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 func (s *sqliteStore) ClaimNextPending(ctx context.Context, nodeID string, at time.Time) (*Task, error) {
-	return nil, fmt.Errorf("not implemented")
+	// SQLite 3.35+ supports UPDATE ... RETURNING (modernc.org/sqlite bundles 3.45+).
+	row := s.db.QueryRowContext(ctx,
+		`UPDATE tasks
+		 SET status = 'running', started_at = ?
+		 WHERE id = (
+		     SELECT id FROM tasks
+		     WHERE node_id = ? AND status = 'pending'
+		     ORDER BY created_at ASC
+		     LIMIT 1
+		 )
+		 AND status = 'pending'
+		 RETURNING id, node_id, command, status, exit_code, created_at, started_at, finished_at,
+		           output_bytes, output_truncated, created_by`,
+		at.Unix(), nodeID)
+	t, err := scanTask(row)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil // no pending task
+		}
+		return nil, err
+	}
+	return &t, nil
 }
 
 func (s *sqliteStore) CompleteTask(ctx context.Context, id string, exitCode int, at time.Time) error {
-	return fmt.Errorf("not implemented")
+	// Transition rules:
+	//   running    -> succeeded (exit==0) or failed (exit!=0)
+	//   cancelling -> cancelled (regardless of exit)
+	//   anything else -> ErrTaskCompleted
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, id).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	var newStatus TaskStatus
+	switch TaskStatus(status) {
+	case TaskRunning:
+		if exitCode == 0 {
+			newStatus = TaskSucceeded
+		} else {
+			newStatus = TaskFailed
+		}
+	case TaskCancelling:
+		newStatus = TaskCancelled
+	default:
+		return ErrTaskCompleted
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET status = ?, exit_code = ?, finished_at = ? WHERE id = ?`,
+		string(newStatus), exitCode, at.Unix(), id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *sqliteStore) MarkTaskCancelling(ctx context.Context, id string) error {
-	return fmt.Errorf("not implemented")
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET status = 'cancelling' WHERE id = ? AND status = 'running'`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotClaimable
+	}
+	return nil
 }
 
 func (s *sqliteStore) MarkTaskCancelled(ctx context.Context, id string, at time.Time) error {
-	return fmt.Errorf("not implemented")
+	// Used when a pending task is cancelled before ever being claimed.
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET status = 'cancelled', finished_at = ?
+		 WHERE id = ? AND status = 'pending'`,
+		at.Unix(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotClaimable
+	}
+	return nil
 }
 
 func (s *sqliteStore) MarkTaskFailedLost(ctx context.Context, id string, at time.Time) error {
-	return fmt.Errorf("not implemented")
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET status = 'failed', exit_code = -1, finished_at = ?
+		 WHERE id = ? AND status IN ('running','cancelling')`,
+		at.Unix(), id)
+	return err
 }
 
 func (s *sqliteStore) PendingCancelsForNode(ctx context.Context, nodeID string) ([]string, error) {
-	return nil, fmt.Errorf("not implemented")
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM tasks WHERE node_id = ? AND status = 'cancelling'`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (s *sqliteStore) FindStaleRunning(ctx context.Context, olderThan time.Time) ([]Task, error) {
-	return nil, fmt.Errorf("not implemented")
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT t.id, t.node_id, t.command, t.status, t.exit_code, t.created_at, t.started_at,
+		        t.finished_at, t.output_bytes, t.output_truncated, t.created_by
+		 FROM tasks t
+		 JOIN nodes n ON n.id = t.node_id
+		 WHERE t.status IN ('running','cancelling')
+		   AND (n.last_seen_at IS NULL OR n.last_seen_at < ?)`,
+		olderThan.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func scanTask(r rowScanner) (Task, error) {
+	var (
+		t          Task
+		exitCode   sql.NullInt64
+		startedAt  sql.NullInt64
+		finishedAt sql.NullInt64
+		createdBy  sql.NullString
+		createdAt  int64
+		truncated  int
+	)
+	if err := r.Scan(&t.ID, &t.NodeID, &t.Command, &t.Status, &exitCode, &createdAt,
+		&startedAt, &finishedAt, &t.OutputBytes, &truncated, &createdBy); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Task{}, ErrNotFound
+		}
+		return Task{}, err
+	}
+	t.CreatedAt = time.Unix(createdAt, 0)
+	if exitCode.Valid {
+		v := int(exitCode.Int64)
+		t.ExitCode = &v
+	}
+	if startedAt.Valid {
+		v := time.Unix(startedAt.Int64, 0)
+		t.StartedAt = &v
+	}
+	if finishedAt.Valid {
+		v := time.Unix(finishedAt.Int64, 0)
+		t.FinishedAt = &v
+	}
+	t.OutputTruncated = truncated != 0
+	if createdBy.Valid {
+		v := createdBy.String
+		t.CreatedBy = &v
+	}
+	return t, nil
+}
+
+func nullString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func (s *sqliteStore) AppendChunk(ctx context.Context, taskID, stream string, data []byte, at time.Time, maxBytes int64) (ChunkAppendResult, error) {

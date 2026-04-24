@@ -127,3 +127,104 @@ func TestRevokeNodeRenamesAndFreesName(t *testing.T) {
 		t.Fatalf("name should be free: %v", err)
 	}
 }
+
+func TestAtomicClaim_NoDoubleAssignment(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "n1"})
+	task, _ := s.CreateTask(ctx, n.ID, "echo hi", "cli", time.Now())
+
+	// Two concurrent claim attempts: exactly one wins.
+	type result struct {
+		task *store.Task
+		err  error
+	}
+	ch := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			got, err := s.ClaimNextPending(ctx, n.ID, time.Now())
+			ch <- result{got, err}
+		}()
+	}
+	var winners int
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.task != nil {
+			if r.task.ID != task.ID {
+				t.Fatalf("claimed wrong task: %q", r.task.ID)
+			}
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("expected exactly 1 winner, got %d", winners)
+	}
+}
+
+func TestClaimSkipsCancelled(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "n1"})
+	task, _ := s.CreateTask(ctx, n.ID, "nope", "cli", time.Now())
+	_ = s.MarkTaskCancelled(ctx, task.ID, time.Now())
+
+	got, err := s.ClaimNextPending(ctx, n.ID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil (cancelled task not claimable), got: %+v", got)
+	}
+}
+
+func TestCompleteTask(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "n1"})
+	task, _ := s.CreateTask(ctx, n.ID, "echo hi", "cli", time.Now())
+	_, _ = s.ClaimNextPending(ctx, n.ID, time.Now())
+	if err := s.CompleteTask(ctx, task.ID, 0, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetTask(ctx, task.ID)
+	if got.Status != store.TaskSucceeded {
+		t.Fatalf("status: got %s want succeeded", got.Status)
+	}
+	if got.ExitCode == nil || *got.ExitCode != 0 {
+		t.Fatalf("exit_code: got %v want 0", got.ExitCode)
+	}
+}
+
+func TestCompleteAfterCancellingBecomesCancelled(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "n1"})
+	task, _ := s.CreateTask(ctx, n.ID, "sleep", "cli", time.Now())
+	_, _ = s.ClaimNextPending(ctx, n.ID, time.Now())
+	_ = s.MarkTaskCancelling(ctx, task.ID)
+	_ = s.CompleteTask(ctx, task.ID, -1, time.Now())
+
+	got, _ := s.GetTask(ctx, task.ID)
+	if got.Status != store.TaskCancelled {
+		t.Fatalf("status: got %s want cancelled", got.Status)
+	}
+}
+
+func TestFindStaleRunning(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "n1"})
+	_, _ = s.CreateTask(ctx, n.ID, "stuck", "cli", time.Now().Add(-10*time.Minute))
+	_, _ = s.ClaimNextPending(ctx, n.ID, time.Now().Add(-10*time.Minute))
+	// No heartbeat has been recorded.
+	got, err := s.FindStaleRunning(ctx, time.Now().Add(-60*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 stale, got %d", len(got))
+	}
+}
