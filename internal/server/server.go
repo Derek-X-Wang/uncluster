@@ -28,7 +28,7 @@ type Config struct {
 
 type Server struct {
 	cfg        Config
-	dispatcher *inProcessDispatcher
+	dispatcher Dispatcher
 	handler    http.Handler
 }
 

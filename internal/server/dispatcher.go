@@ -13,6 +13,21 @@ type DispatcherEvent struct {
 	Payload any
 }
 
+// Dispatcher is the interface that decouples the Server from a specific
+// dispatcher implementation (spec §9 future-extensibility seam).
+// inProcessDispatcher is the default in-process implementation.
+type Dispatcher interface {
+	// Notify wakes up any Wait blocked on nodeID (coalesced, non-blocking).
+	Notify(nodeID string)
+	// Wait blocks until Notify fires for nodeID, timeout elapses, or ctx is cancelled.
+	Wait(ctx context.Context, nodeID string, timeout time.Duration) error
+	// Subscribe registers a listener for fan-out events on taskID.
+	// The caller must invoke the returned unsubscribe func exactly once.
+	Subscribe(taskID string) (<-chan DispatcherEvent, func())
+	// PublishChunk fans ev out to all current subscribers of taskID.
+	PublishChunk(taskID string, ev DispatcherEvent)
+}
+
 // inProcessDispatcher routes two kinds of signals:
 //
 //  1. Wakeup signals (Notify / Wait) — used by long-polling node-task pickup.

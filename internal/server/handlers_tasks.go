@@ -69,10 +69,10 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toDetail(task))
 }
 
-// handleListTasks returns tasks, optionally filtered by node_id, status, and limit query params.
+// handleListTasks returns tasks, optionally filtered by node, status, and limit query params.
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	nodeID := q.Get("node_id")
+	nodeID := q.Get("node")
 	status := store.TaskStatus(q.Get("status"))
 	limit := 0
 	if l := q.Get("limit"); l != "" {
