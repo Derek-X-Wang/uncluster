@@ -585,10 +585,126 @@ func nullString(s string) any {
 	return s
 }
 
+// ------------- chunks -------------
+
+const truncationMarker = "\n[uncluster: output truncated at cap]\n"
+
 func (s *sqliteStore) AppendChunk(ctx context.Context, taskID, stream string, data []byte, at time.Time, maxBytes int64) (ChunkAppendResult, error) {
-	return ChunkAppendResult{}, fmt.Errorf("not implemented")
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ChunkAppendResult{}, err
+	}
+	defer tx.Rollback()
+
+	var currentBytes int64
+	var alreadyTruncated int
+	var status string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT output_bytes, output_truncated, status FROM tasks WHERE id = ?`, taskID).
+		Scan(&currentBytes, &alreadyTruncated, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ChunkAppendResult{}, ErrNotFound
+		}
+		return ChunkAppendResult{}, err
+	}
+	if TaskStatus(status) != TaskRunning && TaskStatus(status) != TaskCancelling {
+		// Task is already terminal; drop the chunk silently but tell agent to stop.
+		return ChunkAppendResult{Truncated: true}, nil
+	}
+	if alreadyTruncated != 0 {
+		return ChunkAppendResult{Truncated: true}, nil
+	}
+
+	toInsert := data
+	truncated := false
+	remaining := maxBytes - currentBytes
+	if remaining <= 0 {
+		truncated = true
+		toInsert = nil
+	} else if int64(len(data)) > remaining {
+		truncated = true
+		toInsert = append([]byte(nil), data[:remaining]...)
+	}
+
+	// Determine next seq for this (task, stream).
+	var nextSeq int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(seq), -1) + 1 FROM task_chunks WHERE task_id = ? AND stream = ?`,
+		taskID, stream).Scan(&nextSeq); err != nil {
+		return ChunkAppendResult{}, err
+	}
+
+	if len(toInsert) > 0 {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO task_chunks(task_id, stream, seq, data, created_at)
+			 VALUES(?, ?, ?, ?, ?)`,
+			taskID, stream, nextSeq, toInsert, at.Unix()); err != nil {
+			return ChunkAppendResult{}, err
+		}
+		nextSeq++
+	}
+
+	if truncated {
+		markerBytes := []byte(truncationMarker)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO task_chunks(task_id, stream, seq, data, created_at)
+			 VALUES(?, ?, ?, ?, ?)`,
+			taskID, stream, nextSeq, markerBytes, at.Unix()); err != nil {
+			return ChunkAppendResult{}, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE tasks
+			 SET output_bytes = output_bytes + ?,
+			     output_truncated = 1
+			 WHERE id = ?`,
+			int64(len(toInsert))+int64(len(markerBytes)), taskID); err != nil {
+			return ChunkAppendResult{}, err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE tasks SET output_bytes = output_bytes + ? WHERE id = ?`,
+			int64(len(toInsert)), taskID); err != nil {
+			return ChunkAppendResult{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ChunkAppendResult{}, err
+	}
+	return ChunkAppendResult{Truncated: truncated}, nil
 }
 
 func (s *sqliteStore) ListChunks(ctx context.Context, taskID, stream string, sinceSeq int64, limit int) ([]Chunk, error) {
-	return nil, fmt.Errorf("not implemented")
+	if limit <= 0 || limit > 10000 {
+		limit = 1000
+	}
+	args := []any{taskID}
+	where := `task_id = ?`
+	if stream != "" {
+		where += ` AND stream = ?`
+		args = append(args, stream)
+	}
+	if sinceSeq > 0 {
+		where += ` AND seq >= ?`
+		args = append(args, sinceSeq)
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT task_id, stream, seq, data, created_at
+		 FROM task_chunks WHERE `+where+`
+		 ORDER BY created_at ASC, seq ASC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Chunk
+	for rows.Next() {
+		var c Chunk
+		var createdAt int64
+		if err := rows.Scan(&c.TaskID, &c.Stream, &c.Seq, &c.Data, &createdAt); err != nil {
+			return nil, err
+		}
+		c.CreatedAt = time.Unix(createdAt, 0)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }

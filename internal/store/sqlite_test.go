@@ -228,3 +228,82 @@ func TestFindStaleRunning(t *testing.T) {
 		t.Fatalf("want 1 stale, got %d", len(got))
 	}
 }
+
+func TestAppendChunk(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "n1"})
+	tk, _ := s.CreateTask(ctx, n.ID, "echo hi", "cli", time.Now())
+	_, _ = s.ClaimNextPending(ctx, n.ID, time.Now())
+
+	res, err := s.AppendChunk(ctx, tk.ID, "stdout", []byte("hello\n"), time.Now(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Truncated {
+		t.Fatal("unexpected truncation on small chunk")
+	}
+
+	chunks, err := s.ListChunks(ctx, tk.ID, "", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 || string(chunks[0].Data) != "hello\n" {
+		t.Fatalf("unexpected chunks: %+v", chunks)
+	}
+}
+
+func TestAppendChunk_OutputCap(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "n1"})
+	tk, _ := s.CreateTask(ctx, n.ID, "yes", "cli", time.Now())
+	_, _ = s.ClaimNextPending(ctx, n.ID, time.Now())
+
+	cap := int64(16)
+	// First chunk of 10 bytes: fits under the 16-byte cap.
+	r1, _ := s.AppendChunk(ctx, tk.ID, "stdout", []byte("0123456789"), time.Now(), cap)
+	if r1.Truncated {
+		t.Fatal("chunk 1 should not be truncated")
+	}
+	// Second chunk of 10 bytes: only 6 bytes fit; trimmed; truncation marker appended.
+	r2, _ := s.AppendChunk(ctx, tk.ID, "stdout", []byte("abcdefghij"), time.Now(), cap)
+	if !r2.Truncated {
+		t.Fatal("chunk 2 should have been truncated")
+	}
+
+	got, _ := s.GetTask(ctx, tk.ID)
+	if !got.OutputTruncated {
+		t.Fatal("task.OutputTruncated must be set")
+	}
+	if got.OutputBytes > cap+256 {
+		// 256 is a generous envelope for the truncation marker.
+		t.Fatalf("output_bytes exceeds cap+marker: %d", got.OutputBytes)
+	}
+
+	// Subsequent writes should report truncated without inserting more.
+	r3, _ := s.AppendChunk(ctx, tk.ID, "stdout", []byte("more"), time.Now(), cap)
+	if !r3.Truncated {
+		t.Fatal("chunk 3 should see truncated")
+	}
+}
+
+func TestListChunks_PerStream(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "n1"})
+	tk, _ := s.CreateTask(ctx, n.ID, "echo", "cli", time.Now())
+	_, _ = s.ClaimNextPending(ctx, n.ID, time.Now())
+
+	_, _ = s.AppendChunk(ctx, tk.ID, "stdout", []byte("OUT"), time.Now(), 1<<20)
+	_, _ = s.AppendChunk(ctx, tk.ID, "stderr", []byte("ERR"), time.Now(), 1<<20)
+
+	out, _ := s.ListChunks(ctx, tk.ID, "stdout", 0, 100)
+	if len(out) != 1 || string(out[0].Data) != "OUT" {
+		t.Fatalf("stdout: %+v", out)
+	}
+	errc, _ := s.ListChunks(ctx, tk.ID, "stderr", 0, 100)
+	if len(errc) != 1 || string(errc[0].Data) != "ERR" {
+		t.Fatalf("stderr: %+v", errc)
+	}
+}
