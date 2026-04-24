@@ -63,6 +63,7 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 		defer cancel()
 		_ = hs.Shutdown(shutdownCtx)
 	}()
+	go s.runReaper(ctx)
 	s.cfg.Logger.Info("server listening", "addr", addr)
 	if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
