@@ -26,6 +26,46 @@ paths:
                   ok: { type: boolean }
                   version: { type: string }
 
+  /v1/tokens:
+    post:
+      summary: Create a token (join or cli)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTokenRequest" }
+      responses:
+        "200":
+          description: Token created (plaintext returned exactly once)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateTokenResponse" }
+    get:
+      summary: List tokens (metadata only; never plaintext)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TokenSummary" }
+
+  /v1/tokens/{id}:
+    delete:
+      summary: Revoke a token
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Revoked }
+        "404": { description: Not found }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -33,7 +73,34 @@ components:
       scheme: bearer
       bearerFormat: uct_<kind>_<id>_<secret>
 
-  schemas: {}
+  schemas:
+    CreateTokenRequest:
+      type: object
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [join, cli] }
+        label: { type: string }
+        expires_at:
+          type: integer
+          format: int64
+          description: Unix seconds; omitted for CLI tokens means "no expiry"; omitted for join tokens defaults to now+15m.
+    CreateTokenResponse:
+      type: object
+      required: [id, token]
+      properties:
+        id: { type: string }
+        token: { type: string }
+    TokenSummary:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        label: { type: string }
+        node_id: { type: string, nullable: true }
+        created_at: { type: integer, format: int64 }
+        expires_at: { type: integer, format: int64, nullable: true }
+        used_at: { type: integer, format: int64, nullable: true }
+        revoked_at: { type: integer, format: int64, nullable: true }
 
 security:
   - bearerAuth: []
