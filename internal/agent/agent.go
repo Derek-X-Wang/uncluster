@@ -78,8 +78,36 @@ func (a *Agent) heartbeatOnce(ctx context.Context) error {
 	return nil
 }
 
-// pollLoop is completed in Task 6.5 (needs execute.go).
 func (a *Agent) pollLoop(ctx context.Context) error {
-	<-ctx.Done()
+	backoff := time.Second
+	for ctx.Err() == nil {
+		task, err := a.client.NextTask(ctx)
+		if err == ErrUnauthorized {
+			return err
+		}
+		if err != nil {
+			a.logger.Warn("next-task error", "err", err)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second
+		if task == nil {
+			continue // 204 → reconnect
+		}
+		exitCode := a.executeTask(ctx, task.TaskID, task.Command)
+		if err := a.client.Complete(ctx, task.TaskID, exitCode); err != nil {
+			if err == ErrUnauthorized {
+				return err
+			}
+			a.logger.Warn("complete failed", "err", err)
+		}
+	}
 	return nil
 }
