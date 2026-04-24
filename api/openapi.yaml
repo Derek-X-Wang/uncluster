@@ -66,6 +66,81 @@ paths:
         "204": { description: Revoked }
         "404": { description: Not found }
 
+  /v1/agent/register:
+    post:
+      summary: Exchange a one-time join token for a long-lived agent token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AgentRegisterRequest" }
+      responses:
+        "200":
+          description: Registered
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentRegisterResponse" }
+        "401": { description: invalid/used/expired join token }
+        "409": { description: node name already in use }
+
+  /v1/agent/heartbeat:
+    post:
+      summary: Report node liveness and metadata; receive cancel instructions
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HeartbeatRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HeartbeatResponse" }
+
+  /v1/nodes:
+    get:
+      summary: List registered nodes
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/NodeSummary" }
+
+  /v1/nodes/{id}:
+    get:
+      summary: Get a single node by id or name
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeSummary" }
+        "404": { description: not found }
+    delete:
+      summary: Revoke (remove) a node; frees its name for reuse
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: revoked }
+        "404": { description: not found }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -101,6 +176,38 @@ components:
         expires_at: { type: integer, format: int64, nullable: true }
         used_at: { type: integer, format: int64, nullable: true }
         revoked_at: { type: integer, format: int64, nullable: true }
+    AgentRegisterRequest:
+      type: object
+      required: [join_token, name]
+      properties:
+        join_token: { type: string }
+        name: { type: string }
+        metadata: { type: object, additionalProperties: true }
+    AgentRegisterResponse:
+      type: object
+      required: [node_id, agent_token]
+      properties:
+        node_id: { type: string }
+        agent_token: { type: string }
+    HeartbeatRequest:
+      type: object
+      properties:
+        metadata: { type: object, additionalProperties: true }
+    HeartbeatResponse:
+      type: object
+      properties:
+        cancel_task_ids:
+          type: array
+          items: { type: string }
+    NodeSummary:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        status: { type: string, enum: [online, offline, revoked] }
+        created_at: { type: integer, format: int64 }
+        last_seen_at: { type: integer, format: int64, nullable: true }
+        metadata: { type: object, additionalProperties: true }
 
 security:
   - bearerAuth: []

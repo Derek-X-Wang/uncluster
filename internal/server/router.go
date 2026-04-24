@@ -25,6 +25,20 @@ func (s *Server) buildRouter() http.Handler {
 			cli.Get("/tokens", s.handleListTokens)
 			cli.Delete("/tokens/{id}", s.handleRevokeToken)
 		})
+		v1.Group(func(agent chi.Router) {
+			// /v1/agent/register is unauthenticated but validates the join token in-handler.
+			agent.Post("/agent/register", s.handleAgentRegister)
+		})
+		v1.Group(func(agent chi.Router) {
+			agent.Use(s.requireAuth(store.TokenAgent))
+			agent.Post("/agent/heartbeat", s.handleAgentHeartbeat)
+		})
+		v1.Group(func(cli chi.Router) {
+			cli.Use(s.requireAuth(store.TokenCLI))
+			cli.Get("/nodes", s.handleListNodes)
+			cli.Get("/nodes/{id}", s.handleGetNode)
+			cli.Delete("/nodes/{id}", s.handleDeleteNode)
+		})
 	})
 
 	return r
