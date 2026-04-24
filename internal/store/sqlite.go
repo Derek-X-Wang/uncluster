@@ -72,7 +72,10 @@ func (s *sqliteStore) migrate() error {
 // ------------- tokens -------------
 
 func (s *sqliteStore) CreateToken(ctx context.Context, p NewTokenParams) (Token, error) {
-	id := shortID(16)
+	id := p.ID
+	if id == "" {
+		id = shortID(16)
+	}
 	now := time.Now()
 	var expiresAt *int64
 	if p.ExpiresAt != nil {

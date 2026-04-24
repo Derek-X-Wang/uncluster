@@ -90,6 +90,7 @@ type Chunk struct {
 }
 
 type NewTokenParams struct {
+	ID         string // if empty, the store generates one
 	Kind       TokenKind
 	NodeID     *string
 	SecretHash string
