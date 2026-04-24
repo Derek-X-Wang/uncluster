@@ -148,6 +148,79 @@ func toDetail(t store.Task) api.TaskDetail {
 	}
 }
 
+// handleTaskStream streams task output via Server-Sent Events.
+//
+// Protocol:
+//   - event: chunk  data: ChunkOut  (replayed from store, then live)
+//   - event: done   data: {exit_code, status}  (terminal signal; stream ends)
+//
+// The handler subscribes to live events BEFORE replaying stored chunks so that
+// no chunk emitted during replay can be missed.
+func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "id")
+
+	task, err := s.cfg.Store.GetTask(r.Context(), taskID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+
+	sse, ok := newSSE(w)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	// Subscribe BEFORE replay to avoid missing events fired during replay.
+	ch, unsub := s.dispatcher.Subscribe(taskID)
+	defer unsub()
+
+	// Replay stored chunks in sequence order.
+	for _, stream := range []string{"stdout", "stderr"} {
+		chunks, err := s.cfg.Store.ListChunks(r.Context(), taskID, stream, 0, 10000)
+		if err != nil {
+			// Non-fatal: stream what we have.
+			break
+		}
+		for _, c := range chunks {
+			_ = sse.Send("chunk", api.ChunkOut{
+				Stream:    c.Stream,
+				Seq:       c.Seq,
+				Data:      c.Data,
+				CreatedAt: c.CreatedAt.Unix(),
+			})
+		}
+	}
+
+	// If the task is already terminal, send done and close.
+	isTerminal := task.Status == store.TaskSucceeded ||
+		task.Status == store.TaskFailed ||
+		task.Status == store.TaskCancelled
+	if isTerminal {
+		_ = sse.Send("done", map[string]any{
+			"exit_code": task.ExitCode,
+			"status":    string(task.Status),
+		})
+		return
+	}
+
+	// Live loop: forward events until done or client disconnects.
+	for {
+		select {
+		case ev, open := <-ch:
+			if !open {
+				return
+			}
+			_ = sse.Send(ev.Kind, ev.Payload)
+			if ev.Kind == "done" {
+				return
+			}
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
 // deadline returns the context deadline, or now+30s if the context has no deadline.
 func deadline(ctx context.Context) time.Time {
 	if d, ok := ctx.Deadline(); ok {

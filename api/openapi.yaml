@@ -183,6 +183,34 @@ paths:
               schema: { $ref: "#/components/schemas/TaskDetail" }
         "404": { description: not found }
 
+  /v1/tasks/{id}/stream:
+    get:
+      summary: Stream task output as Server-Sent Events
+      description: |
+        Replays all stored stdout/stderr chunks, then streams live chunks as
+        they arrive.  Sends a final `done` event when the task reaches a
+        terminal state, then closes the stream.
+
+        Event types:
+        - `chunk`: a ChunkOut payload (stream, seq, data, created_at)
+        - `done`: `{exit_code, status}` — signals task completion
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: SSE stream of task events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Newline-delimited SSE frames.  Each frame is one of:
+                    event: chunk\ndata: <ChunkOut JSON>\n\n
+                    event: done\ndata: {"exit_code":<int>,"status":"<string>"}\n\n
+        "404": { description: task not found }
+        "500": { description: server does not support streaming }
+
   /v1/agent/next-task:
     get:
       summary: Long-poll for the next task assigned to this agent (30s)
