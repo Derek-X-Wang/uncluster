@@ -39,6 +39,16 @@ func (s *Server) buildRouter() http.Handler {
 			cli.Get("/nodes/{id}", s.handleGetNode)
 			cli.Delete("/nodes/{id}", s.handleDeleteNode)
 		})
+		v1.Group(func(cli chi.Router) {
+			cli.Use(s.requireAuth(store.TokenCLI))
+			cli.Post("/tasks", s.handleCreateTask)
+			cli.Get("/tasks", s.handleListTasks)
+			cli.Get("/tasks/{id}", s.handleGetTask)
+		})
+		v1.Group(func(agent chi.Router) {
+			agent.Use(s.requireAuth(store.TokenAgent))
+			agent.Get("/agent/next-task", s.handleAgentNextTask)
+		})
 	})
 
 	return r
