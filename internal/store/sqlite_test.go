@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -68,5 +69,61 @@ func TestMarkJoinTokenUsed(t *testing.T) {
 	// Using twice should fail.
 	if err := s.MarkJoinTokenUsed(ctx, tok.ID, time.Now()); err == nil {
 		t.Fatal("expected ErrTokenUsed on second use")
+	}
+}
+
+func TestCreateAndListNodes(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, err := s.CreateNode(ctx, store.NewNodeParams{Name: "old-macbook", Metadata: `{"os":"darwin"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetNodeByName(ctx, "old-macbook")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != n.ID || got.Status != store.NodeOnline {
+		t.Fatalf("unexpected node: %+v", got)
+	}
+	list, _ := s.ListNodes(ctx)
+	if len(list) != 1 {
+		t.Fatalf("ListNodes len: got %d want 1", len(list))
+	}
+}
+
+func TestCreateNodeRejectsDuplicateName(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateNode(ctx, store.NewNodeParams{Name: "dup"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.CreateNode(ctx, store.NewNodeParams{Name: "dup"})
+	if err == nil || !errors.Is(err, store.ErrNameTaken) {
+		t.Fatalf("expected ErrNameTaken, got: %v", err)
+	}
+}
+
+func TestRevokeNodeRenamesAndFreesName(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n, _ := s.CreateNode(ctx, store.NewNodeParams{Name: "laptop"})
+	// Create an agent token for this node.
+	_, _ = s.CreateToken(ctx, store.NewTokenParams{
+		Kind: store.TokenAgent, NodeID: &n.ID, SecretHash: "h",
+	})
+	if err := s.RevokeNode(ctx, n.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	revoked, _ := s.GetNode(ctx, n.ID)
+	if revoked.Status != store.NodeRevoked {
+		t.Fatal("status not revoked")
+	}
+	if revoked.Name == "laptop" {
+		t.Fatalf("name should have been renamed, got: %q", revoked.Name)
+	}
+	// Same name must be available for a fresh node.
+	if _, err := s.CreateNode(ctx, store.NewNodeParams{Name: "laptop"}); err != nil {
+		t.Fatalf("name should be free: %v", err)
 	}
 }

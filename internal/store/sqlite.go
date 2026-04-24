@@ -206,31 +206,141 @@ func shortID(nchar int) string {
 	return u[:nchar]
 }
 
-// ------------- stubs for unimplemented Store methods (future tasks) -------------
+// ------------- nodes -------------
 
 func (s *sqliteStore) CreateNode(ctx context.Context, p NewNodeParams) (Node, error) {
-	return Node{}, fmt.Errorf("not implemented")
+	id := "node_" + shortID(24)
+	now := time.Now()
+	meta := p.Metadata
+	if meta == "" {
+		meta = "{}"
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO nodes(id, name, created_at, status, metadata_json)
+		 VALUES(?, ?, ?, ?, ?)`,
+		id, p.Name, now.Unix(), string(NodeOnline), meta)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return Node{}, ErrNameTaken
+		}
+		return Node{}, fmt.Errorf("insert node: %w", err)
+	}
+	return s.GetNode(ctx, id)
 }
 
 func (s *sqliteStore) GetNode(ctx context.Context, id string) (Node, error) {
-	return Node{}, fmt.Errorf("not implemented")
+	return s.queryNode(ctx, `WHERE id = ?`, id)
 }
 
 func (s *sqliteStore) GetNodeByName(ctx context.Context, name string) (Node, error) {
-	return Node{}, fmt.Errorf("not implemented")
+	return s.queryNode(ctx, `WHERE name = ?`, name)
 }
 
 func (s *sqliteStore) ListNodes(ctx context.Context) ([]Node, error) {
-	return nil, fmt.Errorf("not implemented")
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, created_at, last_seen_at, status, metadata_json
+		 FROM nodes ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Node
+	for rows.Next() {
+		n, err := scanNode(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 func (s *sqliteStore) UpdateNodeHeartbeat(ctx context.Context, id, metadata string, at time.Time) error {
-	return fmt.Errorf("not implemented")
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE nodes SET last_seen_at = ?, metadata_json = ?, status = 'online'
+		 WHERE id = ? AND status != 'revoked'`,
+		at.Unix(), metadata, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *sqliteStore) RevokeNode(ctx context.Context, id string, at time.Time) error {
-	return fmt.Errorf("not implemented")
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var currentName string
+	if err := tx.QueryRowContext(ctx, `SELECT name FROM nodes WHERE id = ?`, id).Scan(&currentName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	newName := fmt.Sprintf("%s-revoked-%d", currentName, at.Unix())
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE nodes SET status = 'revoked', name = ? WHERE id = ?`, newName, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE tokens SET revoked_at = ?
+		 WHERE node_id = ? AND kind = 'agent' AND revoked_at IS NULL`,
+		at.Unix(), id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
+
+func (s *sqliteStore) queryNode(ctx context.Context, where string, arg any) (Node, error) {
+	q := `SELECT id, name, created_at, last_seen_at, status, metadata_json FROM nodes ` + where
+	return scanNode(s.db.QueryRowContext(ctx, q, arg))
+}
+
+func scanNode(r rowScanner) (Node, error) {
+	var (
+		n         Node
+		lastSeen  sql.NullInt64
+		createdAt int64
+	)
+	if err := r.Scan(&n.ID, &n.Name, &createdAt, &lastSeen, &n.Status, &n.Metadata); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Node{}, ErrNotFound
+		}
+		return Node{}, err
+	}
+	n.CreatedAt = time.Unix(createdAt, 0)
+	if lastSeen.Valid {
+		v := time.Unix(lastSeen.Int64, 0)
+		n.LastSeenAt = &v
+	}
+	return n, nil
+}
+
+func isUniqueViolation(err error) bool {
+	// modernc.org/sqlite returns errors whose message contains "UNIQUE constraint failed".
+	return err != nil && containsAny(err.Error(), "UNIQUE constraint failed", "constraint failed: UNIQUE")
+}
+
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if len(sub) > 0 && len(s) >= len(sub) {
+			for i := 0; i+len(sub) <= len(s); i++ {
+				if s[i:i+len(sub)] == sub {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// ------------- stubs for unimplemented Store methods (future tasks) -------------
 
 func (s *sqliteStore) CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error) {
 	return Task{}, fmt.Errorf("not implemented")
