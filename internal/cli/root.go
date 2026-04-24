@@ -15,6 +15,7 @@ func NewRoot() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	// Subcommands are attached in later phases.
+	root.AddCommand(newServerCmd())
+	root.AddCommand(newConfigCmd())
 	return root
 }
