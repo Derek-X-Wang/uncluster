@@ -13,6 +13,7 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/server"
 	"github.com/derek-x-wang/uncluster/internal/store"
+	"github.com/derek-x-wang/uncluster/internal/token"
 )
 
 func newServerCmd() *cobra.Command {
@@ -118,5 +119,51 @@ func newServerCmd() *cobra.Command {
 	tok.AddCommand(revoke)
 
 	cmd.AddCommand(tok)
+
+	var bsLabel string
+	bootstrap := &cobra.Command{
+		Use:   "bootstrap",
+		Short: "Mint the first CLI token by writing directly to the DB. Use only once per install.",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path := dbPath
+			if path == "" {
+				dir := os.Getenv("XDG_DATA_HOME")
+				if dir == "" {
+					home, _ := os.UserHomeDir()
+					dir = filepath.Join(home, ".local", "share")
+				}
+				_ = os.MkdirAll(filepath.Join(dir, "uncluster"), 0o700)
+				path = filepath.Join(dir, "uncluster", "uncluster.db")
+			}
+			st, err := store.OpenSQLite(path)
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			tkn, err := token.Generate(token.KindCLI)
+			if err != nil {
+				return err
+			}
+			hash, err := token.HashSecret(tkn.Secret)
+			if err != nil {
+				return err
+			}
+			row, err := st.CreateToken(cmd.Context(), store.NewTokenParams{
+				ID: tkn.ID, Kind: store.TokenCLI, SecretHash: hash, Label: bsLabel,
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "token: %s\n", tkn.String())
+			fmt.Fprintf(cmd.OutOrStdout(), "id:    %s\n", row.ID)
+			fmt.Fprintln(cmd.OutOrStdout(), "(shown ONCE — copy it now)")
+			return nil
+		},
+	}
+	bootstrap.Flags().StringVar(&dbPath, "db", "", "sqlite db path (default: $XDG_DATA_HOME/uncluster/uncluster.db)")
+	bootstrap.Flags().StringVar(&bsLabel, "label", "bootstrap", "label for the minted token")
+	cmd.AddCommand(bootstrap)
+
 	return cmd
 }
