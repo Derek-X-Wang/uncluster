@@ -10,6 +10,15 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/store"
 )
 
+// MountProbeRoute is a test-only helper: returns a handler with a route
+// "/__probe" that requires a CLI bearer token. Used by middleware tests.
+func MountProbeRoute(s *Server) http.Handler {
+	r := http.NewServeMux()
+	r.Handle("/__probe", s.requireAuth(store.TokenCLI)(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })))
+	return r
+}
+
 type Config struct {
 	Store  store.Store
 	Logger *slog.Logger

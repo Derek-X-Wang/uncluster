@@ -673,6 +673,26 @@ func (s *sqliteStore) AppendChunk(ctx context.Context, taskID, stream string, da
 	return ChunkAppendResult{Truncated: truncated}, nil
 }
 
+// ------------- test hooks -------------
+
+// TestInsertHook is a test-only seam for fixtures. Not exported in the
+// Store interface; tests type-assert against the concrete SQLite impl.
+type TestInsertHook interface {
+	InsertTokenWithID(ctx context.Context, id string, kind TokenKind, nodeID *string, secretHash, label string) (Token, error)
+}
+
+func (s *sqliteStore) InsertTokenWithID(ctx context.Context, id string, kind TokenKind, nodeID *string, secretHash, label string) (Token, error) {
+	now := time.Now()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO tokens(id, kind, node_id, secret_hash, label, created_at)
+		 VALUES(?, ?, ?, ?, ?, ?)`,
+		id, string(kind), nodeID, secretHash, label, now.Unix())
+	if err != nil {
+		return Token{}, err
+	}
+	return s.GetTokenByID(ctx, id)
+}
+
 func (s *sqliteStore) ListChunks(ctx context.Context, taskID, stream string, sinceSeq int64, limit int) ([]Chunk, error) {
 	if limit <= 0 || limit > 10000 {
 		limit = 1000
