@@ -141,6 +141,59 @@ paths:
         "204": { description: revoked }
         "404": { description: not found }
 
+  /v1/tasks:
+    post:
+      summary: Create a task for a node
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTaskRequest" }
+      responses:
+        "201":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateTaskResponse" }
+    get:
+      summary: List recent tasks
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: node, schema: { type: string } }
+        - { in: query, name: status, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer } }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TaskDetail" }
+
+  /v1/tasks/{id}:
+    get:
+      summary: Get task details
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TaskDetail" }
+        "404": { description: not found }
+
+  /v1/agent/next-task:
+    get:
+      summary: Long-poll for the next task assigned to this agent (30s)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NextTaskResponse" }
+        "204": { description: no task within timeout }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -208,6 +261,33 @@ components:
         created_at: { type: integer, format: int64 }
         last_seen_at: { type: integer, format: int64, nullable: true }
         metadata: { type: object, additionalProperties: true }
+    CreateTaskRequest:
+      type: object
+      required: [node, command]
+      properties:
+        node: { type: string, description: "node id or name" }
+        command: { type: string }
+    CreateTaskResponse:
+      type: object
+      properties: { task_id: { type: string } }
+    NextTaskResponse:
+      type: object
+      properties:
+        task_id: { type: string }
+        command: { type: string }
+    TaskDetail:
+      type: object
+      properties:
+        id: { type: string }
+        node_id: { type: string }
+        command: { type: string }
+        status: { type: string }
+        exit_code: { type: integer, nullable: true }
+        created_at: { type: integer, format: int64 }
+        started_at: { type: integer, format: int64, nullable: true }
+        finished_at: { type: integer, format: int64, nullable: true }
+        output_bytes: { type: integer, format: int64 }
+        output_truncated: { type: boolean }
 
 security:
   - bearerAuth: []
