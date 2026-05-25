@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
@@ -150,5 +151,134 @@ func TestAgentRegister_CAPubkeyMatchesServer(t *testing.T) {
 
 	if reg.CAPubkey != caLine {
 		t.Errorf("ca_pubkey mismatch: got %q want %q", reg.CAPubkey, caLine)
+	}
+}
+
+// --- V2 heartbeat tests ---
+
+// mintAgentAndToken registers a V2 agent via the register endpoint and returns
+// the agent_id and plaintext agent token.
+func mintAgentAndToken(t *testing.T, st store.Store, ts *httptest.Server, name string) (agentID, agentTok string) {
+	t.Helper()
+	jt := mintJoinToken(t, st)
+	body, _ := json.Marshal(api.AgentRegisterRequest{JoinToken: jt, Name: name})
+	resp, err := http.Post(ts.URL+"/v1/agent/register", "application/json", bytes.NewReader(body))
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("register: %v status=%d", err, resp.StatusCode)
+	}
+	var reg api.AgentRegisterResponse
+	_ = json.NewDecoder(resp.Body).Decode(&reg)
+	resp.Body.Close()
+	return reg.AgentID, reg.AgentToken
+}
+
+// TestV2Heartbeat_RoundTrip verifies that a V2 heartbeat request returns ack_ts
+// and server_time, and updates agents.last_seen_at in the store.
+func TestV2Heartbeat_RoundTrip(t *testing.T) {
+	st, _ := store.OpenSQLite(filepath.Join(t.TempDir(), "hb.db"))
+	defer st.Close()
+	srv := server.New(server.Config{Store: st})
+	ts := httpTestServer(t, srv.Handler())
+
+	agentID, agentTok := mintAgentAndToken(t, st, ts, "hb-agent")
+
+	observedAt := int64(1735689600)
+	hbBody, _ := json.Marshal(api.V2HeartbeatRequest{
+		AgentID:      agentID,
+		AgentVersion: "v2.0.0",
+		ObservedAt:   observedAt,
+		Endpoints: []api.AgentEndpoint{
+			{Subnet: "home-lan", Address: "192.168.1.42"},
+		},
+		PolicyState: api.AgentPolicyState{
+			AppliedVersion:  0,
+			AppliedHash:     "",
+			LastApplyStatus: "ok",
+			LastApplyAt:     observedAt - 60,
+		},
+		Health: []api.AgentHealthCheck{
+			{Component: "sshd", Check: "running", State: "ok"},
+		},
+	})
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/agent/heartbeat", bytes.NewReader(hbBody))
+	req.Header.Set("Authorization", "Bearer "+agentTok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("heartbeat POST: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat status=%d", resp.StatusCode)
+	}
+	var hbResp api.V2HeartbeatResponse
+	_ = json.NewDecoder(resp.Body).Decode(&hbResp)
+	resp.Body.Close()
+
+	if hbResp.AckTS != observedAt {
+		t.Errorf("ack_ts = %d, want %d", hbResp.AckTS, observedAt)
+	}
+	if hbResp.ServerTime == 0 {
+		t.Error("server_time should be non-zero")
+	}
+	if hbResp.Policy != nil {
+		t.Errorf("policy should be null (S3b not yet implemented): %v", hbResp.Policy)
+	}
+
+	// Verify last_seen_at updated in store.
+	ag, err := st.GetAgent(context.Background(), agentID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if ag.LastSeenAt == nil {
+		t.Error("last_seen_at not updated after heartbeat")
+	}
+}
+
+// TestV2Heartbeat_PolicyStatePersisted verifies that the server stores the
+// agent's reported policy state.
+func TestV2Heartbeat_PolicyStatePersisted(t *testing.T) {
+	st, _ := store.OpenSQLite(filepath.Join(t.TempDir(), "ps.db"))
+	defer st.Close()
+	srv := server.New(server.Config{Store: st})
+	ts := httpTestServer(t, srv.Handler())
+
+	agentID, agentTok := mintAgentAndToken(t, st, ts, "ps-agent")
+
+	errMsg := "apply failed: bad principal"
+	desiredV := int64(5)
+	hbBody, _ := json.Marshal(api.V2HeartbeatRequest{
+		AgentID:      agentID,
+		AgentVersion: "v2.0.0",
+		ObservedAt:   1735689600,
+		PolicyState: api.AgentPolicyState{
+			DesiredVersion:  &desiredV,
+			AppliedVersion:  4,
+			AppliedHash:     "blake3:deadbeef",
+			LastApplyStatus: "failed",
+			LastApplyError:  &errMsg,
+			LastApplyAt:     1735689500,
+		},
+	})
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/agent/heartbeat", bytes.NewReader(hbBody))
+	req.Header.Set("Authorization", "Bearer "+agentTok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("heartbeat status=%d", resp.StatusCode)
+	}
+
+	ps, err := st.GetAgentPolicyState(context.Background(), agentID)
+	if err != nil {
+		t.Fatalf("GetAgentPolicyState: %v", err)
+	}
+	if ps.AppliedVersion != 4 {
+		t.Errorf("AppliedVersion = %d, want 4", ps.AppliedVersion)
+	}
+	if ps.LastApplyStatus != "failed" {
+		t.Errorf("LastApplyStatus = %q, want failed", ps.LastApplyStatus)
+	}
+	if ps.LastApplyError == nil || *ps.LastApplyError != errMsg {
+		t.Errorf("LastApplyError = %v, want %q", ps.LastApplyError, errMsg)
 	}
 }

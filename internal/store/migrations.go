@@ -143,4 +143,9 @@ var migrations = []string{
 	// instead; node_id is left NULL for those rows.
 	`ALTER TABLE tokens ADD COLUMN agent_id TEXT REFERENCES agents(id)`,
 	`CREATE INDEX idx_tokens_agent ON tokens(agent_id)`,
+
+	// ---- V2 (S3a) ----
+
+	// 13: add updated_at to agent_policy_state for heartbeat timestamp tracking.
+	`ALTER TABLE agent_policy_state ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`,
 }

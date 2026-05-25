@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -34,7 +35,25 @@ func newAgentCmd() *cobra.Command {
 			if cfg.Server == "" || cfg.AgentToken == "" {
 				return fmt.Errorf("agent not joined; run `uncluster agent join` first")
 			}
-			a := agent.New(cfg, nil)
+			a := agent.New(cfg, nil).WithHealthProvider(
+				func(ctx context.Context) []api.AgentHealthCheck {
+					results := gatekeeper.Doctor(ctx, cfg)
+					checks := make([]api.AgentHealthCheck, 0, len(results))
+					for _, r := range results {
+						hc := api.AgentHealthCheck{
+							Component: gatekeeperComponent(r.Name),
+							Check:     gatekeeperCheck(r.Name),
+							State:     gatekeeperState(r.Status),
+						}
+						if r.Message != "" && r.Status != gatekeeper.CheckOK {
+							msg := r.Message
+							hc.Message = &msg
+						}
+						checks = append(checks, hc)
+					}
+					return checks
+				},
+			)
 			if err := a.Run(cmd.Context()); err != nil {
 				if errors.Is(err, agent.ErrUnauthorized) {
 					fmt.Fprintln(cmd.ErrOrStderr(), "agent: revoked by server; exiting")
@@ -209,6 +228,63 @@ is self-healing.`,
 	join.Flags().BoolVar(&tokenStdin, "token-stdin", false, "read join token from stdin (first line); alternatively set UNCLUSTER_TOKEN")
 
 	return join
+}
+
+// gatekeeperComponent maps a doctor check name to the component field for
+// the V2 heartbeat health shape.
+func gatekeeperComponent(name string) string {
+	switch name {
+	case "sshd-binary", "sshd-running", "sshd-drop-in", "sshd-effective-config", "macos-include":
+		return "sshd"
+	case "ca-pubkey":
+		return "ca_pubkey"
+	case "principals-dir":
+		return "principals"
+	case "service-account":
+		return "service_account"
+	case "service-running":
+		return "service"
+	default:
+		return name
+	}
+}
+
+// gatekeeperCheck maps a doctor check name to the check field.
+func gatekeeperCheck(name string) string {
+	switch name {
+	case "sshd-binary":
+		return "installed"
+	case "sshd-running", "service-running":
+		return "running"
+	case "sshd-drop-in":
+		return "config_drop_in"
+	case "sshd-effective-config":
+		return "effective_config"
+	case "ca-pubkey":
+		return "present"
+	case "principals-dir":
+		return "dir_writable"
+	case "service-account":
+		return "exists"
+	case "macos-include":
+		return "include_directive"
+	default:
+		return name
+	}
+}
+
+// gatekeeperState maps a doctor CheckStatus to the state string.
+func gatekeeperState(s gatekeeper.CheckStatus) string {
+	switch s {
+	case gatekeeper.CheckOK:
+		return "ok"
+	case gatekeeper.CheckWarn:
+		return "warn"
+	case gatekeeper.CheckFail:
+		return "fail"
+	default:
+		return "unknown"
+	}
 }
 
 // exitCodeError is a sentinel that carries a non-zero exit code without

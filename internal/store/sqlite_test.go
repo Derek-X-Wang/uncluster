@@ -377,3 +377,107 @@ func TestListChunks_PerStream(t *testing.T) {
 		t.Fatalf("stderr: %+v", errc)
 	}
 }
+
+// ---- V2 agent heartbeat + policy state ----
+
+func TestUpdateAgentHeartbeat(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "hb-box"})
+
+	now := time.Now().Truncate(time.Second)
+	if err := s.UpdateAgentHeartbeat(ctx, ag.ID, "v2.0.1", now); err != nil {
+		t.Fatalf("UpdateAgentHeartbeat: %v", err)
+	}
+	updated, err := s.GetAgent(ctx, ag.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AgentVersion != "v2.0.1" {
+		t.Errorf("AgentVersion = %q, want v2.0.1", updated.AgentVersion)
+	}
+	if updated.LastSeenAt == nil {
+		t.Fatal("LastSeenAt should be set after heartbeat")
+	}
+	if !updated.LastSeenAt.Equal(now) {
+		t.Errorf("LastSeenAt = %v, want %v", updated.LastSeenAt, now)
+	}
+}
+
+func TestUpsertAndGetAgentPolicyState(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "ps-box"})
+
+	// Initial upsert.
+	lastApplyAt := time.Now().Truncate(time.Second).Add(-1 * time.Minute)
+	if err := s.UpsertAgentPolicyState(ctx, store.UpsertAgentPolicyStateParams{
+		AgentID:         ag.ID,
+		DesiredVersion:  nil,
+		AppliedVersion:  0,
+		AppliedHash:     "",
+		LastApplyStatus: "ok",
+		LastApplyError:  nil,
+		LastApplyAt:     lastApplyAt,
+	}); err != nil {
+		t.Fatalf("UpsertAgentPolicyState (initial): %v", err)
+	}
+
+	ps, err := s.GetAgentPolicyState(ctx, ag.ID)
+	if err != nil {
+		t.Fatalf("GetAgentPolicyState: %v", err)
+	}
+	if ps.AgentID != ag.ID {
+		t.Errorf("AgentID mismatch: %s", ps.AgentID)
+	}
+	if ps.DesiredVersion != nil {
+		t.Errorf("DesiredVersion should be nil initially")
+	}
+	if ps.LastApplyStatus != "ok" {
+		t.Errorf("LastApplyStatus = %q, want ok", ps.LastApplyStatus)
+	}
+
+	// Second upsert — update values.
+	desiredV := int64(3)
+	errMsg := "policy parse error"
+	if err := s.UpsertAgentPolicyState(ctx, store.UpsertAgentPolicyStateParams{
+		AgentID:         ag.ID,
+		DesiredVersion:  &desiredV,
+		AppliedVersion:  2,
+		AppliedHash:     "blake3:abc123",
+		LastApplyStatus: "failed",
+		LastApplyError:  &errMsg,
+		LastApplyAt:     lastApplyAt,
+	}); err != nil {
+		t.Fatalf("UpsertAgentPolicyState (update): %v", err)
+	}
+
+	ps2, err := s.GetAgentPolicyState(ctx, ag.ID)
+	if err != nil {
+		t.Fatalf("GetAgentPolicyState after update: %v", err)
+	}
+	if ps2.DesiredVersion == nil || *ps2.DesiredVersion != 3 {
+		t.Errorf("DesiredVersion = %v, want 3", ps2.DesiredVersion)
+	}
+	if ps2.AppliedVersion != 2 {
+		t.Errorf("AppliedVersion = %d, want 2", ps2.AppliedVersion)
+	}
+	if ps2.AppliedHash != "blake3:abc123" {
+		t.Errorf("AppliedHash = %q", ps2.AppliedHash)
+	}
+	if ps2.LastApplyStatus != "failed" {
+		t.Errorf("LastApplyStatus = %q, want failed", ps2.LastApplyStatus)
+	}
+	if ps2.LastApplyError == nil || *ps2.LastApplyError != errMsg {
+		t.Errorf("LastApplyError = %v, want %q", ps2.LastApplyError, errMsg)
+	}
+}
+
+func TestGetAgentPolicyState_NotFound(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	_, err := s.GetAgentPolicyState(ctx, "ag_nonexistent")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got: %v", err)
+	}
+}

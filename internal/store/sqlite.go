@@ -407,6 +407,75 @@ func scanAgent(r rowScanner) (Agent, error) {
 	return a, nil
 }
 
+func (s *sqliteStore) UpdateAgentHeartbeat(ctx context.Context, id, agentVersion string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET last_seen_at = ?, agent_version = ?, status = ? WHERE id = ?`,
+		at.Unix(), agentVersion, string(AgentOnline), id)
+	return err
+}
+
+func (s *sqliteStore) UpsertAgentPolicyState(ctx context.Context, p UpsertAgentPolicyStateParams) error {
+	now := time.Now().Unix()
+	// desired_version column is NOT NULL (migration 11). Represent "no desired
+	// version" as 0; translate back to nil on read.
+	desiredVer := int64(0)
+	if p.DesiredVersion != nil {
+		desiredVer = *p.DesiredVersion
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO agent_policy_state
+		   (agent_id, desired_version, applied_version, applied_hash,
+		    last_apply_status, last_apply_error, last_apply_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(agent_id) DO UPDATE SET
+		   desired_version   = excluded.desired_version,
+		   applied_version   = excluded.applied_version,
+		   applied_hash      = excluded.applied_hash,
+		   last_apply_status = excluded.last_apply_status,
+		   last_apply_error  = excluded.last_apply_error,
+		   last_apply_at     = excluded.last_apply_at,
+		   updated_at        = excluded.updated_at`,
+		p.AgentID, desiredVer, p.AppliedVersion, p.AppliedHash,
+		p.LastApplyStatus, p.LastApplyError, p.LastApplyAt.Unix(), now)
+	return err
+}
+
+func (s *sqliteStore) GetAgentPolicyState(ctx context.Context, agentID string) (AgentPolicyState, error) {
+	var (
+		ps             AgentPolicyState
+		desiredVersion int64 // NOT NULL in schema; 0 = "no desired version"
+		lastApplyError sql.NullString
+		lastApplyAt    sql.NullInt64
+		updatedAt      sql.NullInt64
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT agent_id, desired_version, applied_version, applied_hash,
+		        last_apply_status, last_apply_error, last_apply_at, updated_at
+		 FROM agent_policy_state WHERE agent_id = ?`, agentID).
+		Scan(&ps.AgentID, &desiredVersion, &ps.AppliedVersion, &ps.AppliedHash,
+			&ps.LastApplyStatus, &lastApplyError, &lastApplyAt, &updatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AgentPolicyState{}, ErrNotFound
+		}
+		return AgentPolicyState{}, err
+	}
+	// 0 = sentinel for "no desired version pushed yet".
+	if desiredVersion != 0 {
+		ps.DesiredVersion = &desiredVersion
+	}
+	if lastApplyError.Valid {
+		ps.LastApplyError = &lastApplyError.String
+	}
+	if lastApplyAt.Valid {
+		ps.LastApplyAt = time.Unix(lastApplyAt.Int64, 0)
+	}
+	if updatedAt.Valid {
+		ps.UpdatedAt = time.Unix(updatedAt.Int64, 0)
+	}
+	return ps, nil
+}
+
 // ------------- tasks -------------
 
 func (s *sqliteStore) CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error) {
