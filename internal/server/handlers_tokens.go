@@ -24,8 +24,10 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		kind = store.TokenJoin
 	case "cli":
 		kind = store.TokenCLI
+	case "caller":
+		kind = store.TokenCaller
 	default:
-		writeError(w, http.StatusBadRequest, "kind must be join or cli")
+		writeError(w, http.StatusBadRequest, "kind must be join, cli, or caller")
 		return
 	}
 

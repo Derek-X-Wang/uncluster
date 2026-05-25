@@ -35,15 +35,19 @@ func OpenSQLite(path string) (Store, error) {
 func (s *sqliteStore) Close() error { return s.db.Close() }
 
 func (s *sqliteStore) migrate() error {
-	// Ensure schema_version row exists.
+	// Ensure schema_version row exists. Note: PRIMARY KEY is `version` itself,
+	// so naive `INSERT OR IGNORE VALUES (0)` adds a second row once version has
+	// been bumped (since e.g. (0) doesn't conflict with an existing (19) row).
+	// We instead insert (0) only when the table is empty, and read via MAX()
+	// so any legacy multi-row state is healed transparently on next start.
 	if _, err := s.db.Exec(migrations[1]); err != nil {
 		return fmt.Errorf("create schema_version: %w", err)
 	}
-	if _, err := s.db.Exec(`INSERT OR IGNORE INTO schema_version(version) VALUES (0)`); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO schema_version(version) SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version)`); err != nil {
 		return fmt.Errorf("seed schema_version: %w", err)
 	}
 	var current int
-	if err := s.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&current); err != nil {
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&current); err != nil {
 		return fmt.Errorf("read schema_version: %w", err)
 	}
 	for i := current + 1; i < len(migrations); i++ {

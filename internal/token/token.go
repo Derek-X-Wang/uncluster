@@ -1,9 +1,12 @@
 // Package token defines Uncluster's token format and verification primitives.
 //
 // Token string: uct_<kind>_<id>_<secret>
-//   - kind:   "join" | "agent" | "cli"
+//   - kind:   "join" | "agent" | "cli" | "caller"
 //   - id:     16 base32 chars (80 bits). Public lookup key.
 //   - secret: 52 base32 chars (~256 bits). Only argon2id(secret) is stored.
+//
+// V2 uses "caller" for the Caller-token kind. "cli" is retained until
+// the V1 cleanup slice (S11) removes it; new mints should prefer "caller".
 package token
 
 import (
@@ -20,9 +23,10 @@ import (
 type Kind string
 
 const (
-	KindJoin  Kind = "join"
-	KindAgent Kind = "agent"
-	KindCLI   Kind = "cli"
+	KindJoin   Kind = "join"
+	KindAgent  Kind = "agent"
+	KindCLI    Kind = "cli"
+	KindCaller Kind = "caller"
 
 	idLen     = 16 // base32 chars
 	secretLen = 52 // base32 chars
@@ -132,7 +136,7 @@ func randBase32(nBytes int) (string, error) {
 
 func validKind(k Kind) bool {
 	switch k {
-	case KindJoin, KindAgent, KindCLI:
+	case KindJoin, KindAgent, KindCLI, KindCaller:
 		return true
 	}
 	return false

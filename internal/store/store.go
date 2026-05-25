@@ -41,9 +41,10 @@ const (
 type TokenKind string
 
 const (
-	TokenJoin  TokenKind = "join"
-	TokenAgent TokenKind = "agent"
-	TokenCLI   TokenKind = "cli"
+	TokenJoin   TokenKind = "join"
+	TokenAgent  TokenKind = "agent"
+	TokenCLI    TokenKind = "cli"    // V1; retained until S11
+	TokenCaller TokenKind = "caller" // V2 — Caller token (replaces CLI)
 )
 
 type Node struct {

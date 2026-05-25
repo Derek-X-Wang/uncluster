@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/derek-x-wang/uncluster/internal/api"
+	"github.com/derek-x-wang/uncluster/internal/ca"
 	"github.com/derek-x-wang/uncluster/internal/server"
 	"github.com/derek-x-wang/uncluster/internal/store"
 	"github.com/derek-x-wang/uncluster/internal/token"
@@ -19,20 +21,27 @@ import (
 func newServerCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "server", Short: "Run and manage the Uncluster control plane"}
 
-	var addr, dbPath string
+	var addr, dbPath, caPath string
 	start := &cobra.Command{
 		Use:   "start",
 		Short: "Start the control plane",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if dbPath == "" {
-				dir := os.Getenv("XDG_DATA_HOME")
-				if dir == "" {
-					home, _ := os.UserHomeDir()
-					dir = filepath.Join(home, ".local", "share")
+			dbPath = resolveDBPath(dbPath)
+			caPath = resolveCAPath(caPath)
+
+			// If a CA file exists, verify mode before we accept any traffic.
+			// Absent CA = warn but allow start (cert signing simply won't work).
+			if _, err := os.Stat(caPath); err == nil {
+				if _, err := ca.LoadPrivateFromDisk(caPath); err != nil {
+					return fmt.Errorf("ca check: %w", err)
 				}
-				_ = os.MkdirAll(filepath.Join(dir, "uncluster"), 0o700)
-				dbPath = filepath.Join(dir, "uncluster", "uncluster.db")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("ca stat: %w", err)
+			} else {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"warning: no CA key at %s — run `uncluster server bootstrap` before issuing certs\n", caPath)
 			}
+
 			st, err := store.OpenSQLite(dbPath)
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
@@ -47,6 +56,7 @@ func newServerCmd() *cobra.Command {
 	}
 	start.Flags().StringVar(&addr, "addr", ":7777", "listen address")
 	start.Flags().StringVar(&dbPath, "db", "", "sqlite db path (default: $XDG_DATA_HOME/uncluster/uncluster.db)")
+	start.Flags().StringVar(&caPath, "ca", "", "CA private key path (default: $XDG_DATA_HOME/uncluster/ca)")
 	cmd.AddCommand(start)
 
 	// token subcommands — uses the HTTP API; needs server+cli-token config.
@@ -55,7 +65,7 @@ func newServerCmd() *cobra.Command {
 	var kind, label string
 	create := &cobra.Command{
 		Use:   "create",
-		Short: "Create a token (join or cli). Prints plaintext ONCE.",
+		Short: "Create a token (join, cli, or caller). Prints plaintext ONCE.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := LoadCLIConfig()
 			if err != nil {
@@ -75,7 +85,7 @@ func newServerCmd() *cobra.Command {
 			return nil
 		},
 	}
-	create.Flags().StringVar(&kind, "kind", "", "join | cli (required)")
+	create.Flags().StringVar(&kind, "kind", "", "join | cli | caller (required)")
 	create.Flags().StringVar(&label, "label", "", "human-readable note")
 	_ = create.MarkFlagRequired("kind")
 	tok.AddCommand(create)
@@ -90,7 +100,7 @@ func newServerCmd() *cobra.Command {
 			if err := client.Do(cmd.Context(), "GET", "/v1/tokens", nil, &out); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%-18s %-6s %-20s %-10s\n", "ID", "KIND", "LABEL", "STATE")
+			fmt.Fprintf(cmd.OutOrStdout(), "%-18s %-7s %-20s %-10s\n", "ID", "KIND", "LABEL", "STATE")
 			for _, t := range out {
 				state := "active"
 				switch {
@@ -99,7 +109,7 @@ func newServerCmd() *cobra.Command {
 				case t.UsedAt != nil:
 					state = "used"
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%-18s %-6s %-20s %-10s\n", t.ID, t.Kind, t.Label, state)
+				fmt.Fprintf(cmd.OutOrStdout(), "%-18s %-7s %-20s %-10s\n", t.ID, t.Kind, t.Label, state)
 			}
 			return nil
 		},
@@ -120,28 +130,57 @@ func newServerCmd() *cobra.Command {
 
 	cmd.AddCommand(tok)
 
-	var bsLabel string
+	// bootstrap — generates CA if missing + mints a fresh caller token.
+	// Re-runnable: never overwrites the existing CA; each run mints a new token.
+	var bsLabel, bsDBPath, bsCAPath string
 	bootstrap := &cobra.Command{
 		Use:   "bootstrap",
-		Short: "Mint the first CLI token by writing directly to the DB. Use only once per install.",
+		Short: "Generate CA (if missing) and mint a caller token. Re-runnable; never overwrites CA.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			path := dbPath
-			if path == "" {
-				dir := os.Getenv("XDG_DATA_HOME")
-				if dir == "" {
-					home, _ := os.UserHomeDir()
-					dir = filepath.Join(home, ".local", "share")
+			bsDBPath = resolveDBPath(bsDBPath)
+			bsCAPath = resolveCAPath(bsCAPath)
+			bsCAPubPath := bsCAPath + ".pub"
+
+			// 1. CA: load existing or generate fresh.
+			var caStatus string
+			if _, err := os.Stat(bsCAPath); err == nil {
+				if _, err := ca.LoadPrivateFromDisk(bsCAPath); err != nil {
+					return fmt.Errorf("existing ca: %w", err)
 				}
-				_ = os.MkdirAll(filepath.Join(dir, "uncluster"), 0o700)
-				path = filepath.Join(dir, "uncluster", "uncluster.db")
+				caStatus = "kept existing"
+			} else if errors.Is(err, os.ErrNotExist) {
+				priv, pub, err := ca.Generate()
+				if err != nil {
+					return err
+				}
+				privBytes, err := ca.MarshalPrivate(priv)
+				if err != nil {
+					return err
+				}
+				pubBytes, err := ca.MarshalPublic(pub)
+				if err != nil {
+					return err
+				}
+				if err := ca.WritePrivateToDisk(bsCAPath, privBytes); err != nil {
+					return err
+				}
+				if err := ca.WritePublicToDisk(bsCAPubPath, pubBytes); err != nil {
+					return err
+				}
+				caStatus = "generated"
+			} else {
+				return fmt.Errorf("ca stat: %w", err)
 			}
-			st, err := store.OpenSQLite(path)
+
+			// 2. DB: open (runs migrations).
+			st, err := store.OpenSQLite(bsDBPath)
 			if err != nil {
 				return err
 			}
 			defer st.Close()
 
-			tkn, err := token.Generate(token.KindCLI)
+			// 3. Mint a caller token.
+			tkn, err := token.Generate(token.KindCaller)
 			if err != nil {
 				return err
 			}
@@ -150,20 +189,61 @@ func newServerCmd() *cobra.Command {
 				return err
 			}
 			row, err := st.CreateToken(cmd.Context(), store.NewTokenParams{
-				ID: tkn.ID, Kind: store.TokenCLI, SecretHash: hash, Label: bsLabel,
+				ID:         tkn.ID,
+				Kind:       store.TokenCaller,
+				SecretHash: hash,
+				Label:      bsLabel,
 			})
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "token: %s\n", tkn.String())
-			fmt.Fprintf(cmd.OutOrStdout(), "id:    %s\n", row.ID)
-			fmt.Fprintln(cmd.OutOrStdout(), "(shown ONCE — copy it now)")
+
+			// 4. Report.
+			pubBytes, _ := os.ReadFile(bsCAPubPath)
+			fmt.Fprintln(cmd.OutOrStdout(), "[1/3] CA keypair                                 "+caStatus)
+			fmt.Fprintln(cmd.OutOrStdout(), "[2/3] DB schema (migrations applied)            ok")
+			fmt.Fprintln(cmd.OutOrStdout(), "[3/3] Minted caller token                        ok")
+			fmt.Fprintln(cmd.OutOrStdout(), "")
+			fmt.Fprintln(cmd.OutOrStdout(), "ca pubkey:")
+			fmt.Fprintln(cmd.OutOrStdout(), "  "+string(pubBytes))
+			fmt.Fprintf(cmd.OutOrStdout(), "caller token (shown ONCE — copy it now):\n  %s\n", tkn.String())
+			fmt.Fprintf(cmd.OutOrStdout(), "id: %s\n", row.ID)
 			return nil
 		},
 	}
-	bootstrap.Flags().StringVar(&dbPath, "db", "", "sqlite db path (default: $XDG_DATA_HOME/uncluster/uncluster.db)")
-	bootstrap.Flags().StringVar(&bsLabel, "label", "bootstrap", "label for the minted token")
+	bootstrap.Flags().StringVar(&bsDBPath, "db", "", "sqlite db path (default: $XDG_DATA_HOME/uncluster/uncluster.db)")
+	bootstrap.Flags().StringVar(&bsCAPath, "ca", "", "CA private key path (default: $XDG_DATA_HOME/uncluster/ca)")
+	bootstrap.Flags().StringVar(&bsLabel, "label", "bootstrap", "label for the minted caller token")
 	cmd.AddCommand(bootstrap)
 
 	return cmd
+}
+
+// resolveDBPath returns the supplied path, or the XDG default if empty.
+// Creates the parent directory.
+func resolveDBPath(path string) string {
+	if path != "" {
+		return path
+	}
+	dir := os.Getenv("XDG_DATA_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".local", "share")
+	}
+	_ = os.MkdirAll(filepath.Join(dir, "uncluster"), 0o700)
+	return filepath.Join(dir, "uncluster", "uncluster.db")
+}
+
+// resolveCAPath returns the supplied path, or the XDG default if empty.
+// Does not create the parent (ca.WritePrivateToDisk handles that with 0700 mode).
+func resolveCAPath(path string) string {
+	if path != "" {
+		return path
+	}
+	dir := os.Getenv("XDG_DATA_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(dir, "uncluster", "ca")
 }

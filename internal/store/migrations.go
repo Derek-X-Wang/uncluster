@@ -62,4 +62,77 @@ var migrations = []string{
 		created_at INTEGER NOT NULL,
 		PRIMARY KEY (task_id, stream, seq)
 	)`,
+
+	// ---- V2 (S1) ----
+	// agents coexist with V1 nodes during transition. S11 drops nodes/tasks/chunks
+	// and renames callsites. V2 code references agents only.
+
+	// 6: agents
+	`CREATE TABLE agents (
+		id                TEXT PRIMARY KEY,
+		name              TEXT NOT NULL UNIQUE,
+		created_at        INTEGER NOT NULL,
+		last_seen_at      INTEGER,
+		status            TEXT NOT NULL,
+		agent_version     TEXT NOT NULL DEFAULT '',
+		fail_closed_after INTEGER
+	)`,
+
+	// 7: agent_subnets
+	`CREATE TABLE agent_subnets (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		subnet   TEXT NOT NULL,
+		PRIMARY KEY (agent_id, subnet)
+	)`,
+	`CREATE INDEX idx_agent_subnets_subnet ON agent_subnets(subnet)`,
+
+	// 8: agent_endpoints
+	`CREATE TABLE agent_endpoints (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		subnet   TEXT NOT NULL,
+		address  TEXT NOT NULL,
+		PRIMARY KEY (agent_id, subnet)
+	)`,
+
+	// 9: acl
+	`CREATE TABLE acl (
+		id              TEXT PRIMARY KEY,
+		caller_token_id TEXT NOT NULL,
+		agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		username        TEXT NOT NULL,
+		created_at      INTEGER NOT NULL,
+		created_by      TEXT,
+		UNIQUE (caller_token_id, agent_id, username)
+	)`,
+	`CREATE INDEX idx_acl_caller ON acl(caller_token_id)`,
+	`CREATE INDEX idx_acl_agent ON acl(agent_id)`,
+
+	// 10: cert_issuance_events (writes start in S6; schema lands here)
+	`CREATE TABLE cert_issuance_events (
+		request_id      TEXT PRIMARY KEY,
+		ts              INTEGER NOT NULL,
+		caller_token_id TEXT NOT NULL,
+		target_agent_id TEXT,
+		username        TEXT,
+		cert_principal  TEXT,
+		pubkey_fp       TEXT,
+		ttl_seconds     INTEGER,
+		serial          INTEGER,
+		key_id          TEXT,
+		outcome         TEXT NOT NULL,
+		denial_reason   TEXT
+	)`,
+	`CREATE INDEX idx_cert_events_caller ON cert_issuance_events(caller_token_id, ts DESC)`,
+	`CREATE INDEX idx_cert_events_agent ON cert_issuance_events(target_agent_id, ts DESC)`,
+
+	// 11: agent_policy_state
+	`CREATE TABLE agent_policy_state (
+		agent_id          TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+		desired_version   INTEGER NOT NULL DEFAULT 0,
+		applied_version   INTEGER NOT NULL DEFAULT 0,
+		applied_hash      TEXT NOT NULL DEFAULT '',
+		last_apply_status TEXT,
+		last_apply_error  TEXT,
+		last_apply_at     INTEGER
+	)`,
 }
