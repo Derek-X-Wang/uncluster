@@ -126,10 +126,48 @@ type V2HeartbeatRequest struct {
 
 // V2HeartbeatResponse is the server's response to a V2 heartbeat.
 type V2HeartbeatResponse struct {
-	AckTS      int64 `json:"ack_ts"`      // server's unix timestamp acknowledging the beat
-	ServerTime int64 `json:"server_time"` // server wall-clock unix seconds
-	Policy     *any  `json:"policy"`      // null until S3b; will carry policy payload
-	Commands   []any `json:"commands"`    // empty until S8b
+	AckTS      int64            `json:"ack_ts"`      // server's unix timestamp acknowledging the beat
+	ServerTime int64            `json:"server_time"` // server wall-clock unix seconds
+	Policy     *PolicyPayload   `json:"policy"`      // null when policy matches applied_hash
+	Commands   []any            `json:"commands"`    // empty until S8b
+}
+
+// --- ACL ---
+
+// PolicyPrincipal is one user + set of caller_token_ids permitted to SSH as that user.
+type PolicyPrincipal struct {
+	Username       string   `json:"username"`
+	CallerTokenIDs []string `json:"caller_token_ids"`
+}
+
+// PolicyPayload is the full policy snapshot sent in a heartbeat response
+// when the agent's applied_hash does not match the server's current hash.
+type PolicyPayload struct {
+	Version    int64             `json:"version"`
+	Hash       string            `json:"hash"`     // "blake3:<hex>" or ""
+	Principals []PolicyPrincipal `json:"principals"`
+}
+
+// ACLEntrySummary is a single ACL row as returned by the API.
+type ACLEntrySummary struct {
+	ID            string `json:"id"`
+	CallerTokenID string `json:"caller_token_id"`
+	AgentID       string `json:"agent_id"`
+	Username      string `json:"username"`
+	CreatedAt     int64  `json:"created_at"`
+	CreatedBy     *string `json:"created_by,omitempty"`
+}
+
+// CreateACLRequest is the body for POST /v1/acl.
+type CreateACLRequest struct {
+	Caller   string `json:"caller"`   // caller token id or name
+	Agent    string `json:"agent"`    // agent id or name
+	Username string `json:"username"` // SSH username
+}
+
+// CreateACLResponse is the body returned by POST /v1/acl.
+type CreateACLResponse struct {
+	ACLEntrySummary
 }
 
 // --- agent: next-task ---

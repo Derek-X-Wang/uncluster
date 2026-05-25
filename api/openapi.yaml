@@ -144,6 +144,52 @@ paths:
         "204": { description: revoked }
         "404": { description: not found }
 
+  /v1/acl:
+    post:
+      summary: Grant a caller access to an agent for a given SSH username
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateACLRequest" }
+      responses:
+        "201":
+          description: ACL entry created (or returned if already exists)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ACLEntrySummary" }
+        "400": { description: missing required fields }
+        "401": { description: unauthorized }
+        "404": { description: caller or agent not found }
+    get:
+      summary: List ACL entries, optionally filtered by caller or agent
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: caller, schema: { type: string }, description: "Caller token id filter" }
+        - { in: query, name: agent, schema: { type: string }, description: "Agent id filter" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ACLEntrySummary" }
+
+  /v1/acl/{id}:
+    delete:
+      summary: Revoke an ACL entry by id
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: deleted }
+        "404": { description: not found }
+
   /v1/tasks:
     post:
       summary: Create a task for a node
@@ -450,6 +496,22 @@ components:
         exit_code:
           type: integer
           description: Process exit code (0 = success)
+    CreateACLRequest:
+      type: object
+      required: [caller, agent, username]
+      properties:
+        caller: { type: string, description: "Caller token id" }
+        agent: { type: string, description: "Agent id or name" }
+        username: { type: string, description: "SSH username" }
+    ACLEntrySummary:
+      type: object
+      properties:
+        id: { type: string }
+        caller_token_id: { type: string }
+        agent_id: { type: string }
+        username: { type: string }
+        created_at: { type: integer, format: int64 }
+        created_by: { type: string, nullable: true }
 
 security:
   - bearerAuth: []
