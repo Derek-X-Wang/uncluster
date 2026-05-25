@@ -274,6 +274,24 @@ type ChunksResponse struct {
 	Chunks []ChunkOut `json:"chunks"`
 }
 
+// --- cert audit ---
+
+// CertEventSummary is one row from GET /v1/audit/certs.
+type CertEventSummary struct {
+	RequestID     string `json:"request_id"`
+	TS            int64  `json:"ts"`            // unix seconds
+	CallerTokenID string `json:"caller_token_id"`
+	TargetAgentID string `json:"target_agent_id,omitempty"`
+	Username      string `json:"username,omitempty"`
+	CertPrincipal string `json:"cert_principal,omitempty"`
+	PubkeyFP      string `json:"pubkey_fp,omitempty"`
+	TTLSeconds    int    `json:"ttl_seconds,omitempty"`
+	Serial        uint64 `json:"serial,omitempty"`
+	KeyID         string `json:"key_id,omitempty"`
+	Outcome       string `json:"outcome"` // "signed" | "denied"
+	DenialReason  string `json:"denial_reason,omitempty"`
+}
+
 // --- errors ---
 
 type ErrorResponse struct {

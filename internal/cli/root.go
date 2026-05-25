@@ -24,5 +24,6 @@ func NewRoot() *cobra.Command {
 	root.AddCommand(newTasksCmd())
 	root.AddCommand(newNodesCmd())
 	root.AddCommand(newAgentsCmd())
+	root.AddCommand(newAuditCmd())
 	return root
 }

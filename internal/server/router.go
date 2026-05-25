@@ -54,6 +54,11 @@ func (s *Server) buildRouter() http.Handler {
 			op.Delete("/agents/{id}", s.handleDeleteAgent)
 			op.Patch("/agents/{id}", s.handleSetAgent)
 		})
+		// Audit log — operator CLI token.
+		v1.Group(func(op chi.Router) {
+			op.Use(s.requireAuth(store.TokenCLI))
+			op.Get("/audit/certs", s.handleListCertEvents)
+		})
 		// Cert issuance — caller token.
 		v1.Group(func(caller chi.Router) {
 			caller.Use(s.requireAuth(store.TokenCaller))
