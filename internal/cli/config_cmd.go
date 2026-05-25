@@ -15,6 +15,11 @@ import (
 type CLIConfig struct {
 	Server string `toml:"server"`
 	Token  string `toml:"token"`
+
+	// V2 SSH config fields (S4).
+	SSHKeyPath      string   `toml:"ssh_key_path,omitempty"`
+	SSHPrincipal    string   `toml:"ssh_principal_default,omitempty"`
+	Subnets         []string `toml:"subnets,omitempty"`
 }
 
 func cliConfigPath() (string, error) {

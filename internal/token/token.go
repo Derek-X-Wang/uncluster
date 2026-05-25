@@ -141,3 +141,19 @@ func validKind(k Kind) bool {
 	}
 	return false
 }
+
+// NewRequestID returns a random 128-bit hex string suitable for use as a
+// cert request_id (unique within a server lifetime).
+func NewRequestID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		panic("token: rand.Read: " + err.Error())
+	}
+	const hex = "0123456789abcdef"
+	out := make([]byte, 32)
+	for i, b := range buf {
+		out[2*i] = hex[b>>4]
+		out[2*i+1] = hex[b&0xf]
+	}
+	return string(out)
+}
