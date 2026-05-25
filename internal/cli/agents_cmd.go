@@ -24,7 +24,11 @@ func newAgentsCmd() *cobra.Command {
 }
 
 func newAgentsLsCmd() *cobra.Command {
-	var jsonOut bool
+	var (
+		jsonOut      bool
+		subnetFilter string
+		statusFilter string
+	)
 	cmd := &cobra.Command{
 		Use:   "ls",
 		Short: "List registered agents",
@@ -34,7 +38,7 @@ func newAgentsLsCmd() *cobra.Command {
 				return err
 			}
 			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config set server=URL` and `uncluster config set token --stdin`")
+				return fmt.Errorf("CLI not configured; run `uncluster config init`")
 			}
 			client := NewClient(cfg.Server, cfg.Token)
 
@@ -43,27 +47,107 @@ func newAgentsLsCmd() *cobra.Command {
 				return err
 			}
 
+			// Compute staleness and filter.
+			now := time.Now()
+			type row struct {
+				ag      api.AgentDetail
+				seen    time.Duration // negative means never
+				status  string        // computed: online|stale|offline
+				bestEP  string        // best endpoint address for caller's subnets
+				subnets string        // comma-sep subnet names
+			}
+			var rows []row
+			for _, ag := range agents {
+				var seen time.Duration
+				var computedStatus string
+				if ag.LastSeenAt == nil {
+					computedStatus = "offline"
+				} else {
+					seen = now.Sub(time.Unix(*ag.LastSeenAt, 0))
+					switch {
+					case seen < 30*time.Second:
+						computedStatus = "online"
+					case seen < time.Hour:
+						computedStatus = "stale"
+					default:
+						computedStatus = "offline"
+					}
+				}
+
+				// Filter by status.
+				if statusFilter != "" && computedStatus != statusFilter {
+					continue
+				}
+
+				// Build subnet list and best endpoint.
+				var subnetNames []string
+				for _, ep := range ag.Endpoints {
+					subnetNames = append(subnetNames, ep.Subnet)
+				}
+
+				// Filter by subnet.
+				if subnetFilter != "" {
+					found := false
+					for _, sn := range subnetNames {
+						if sn == subnetFilter {
+							found = true
+							break
+						}
+					}
+					if !found {
+						continue
+					}
+				}
+
+				// Pick best endpoint: first overlap with caller's subnets, then first.
+				bestEP := ""
+				if len(ag.Endpoints) > 0 {
+					bestEP = ag.Endpoints[0].Address
+					if len(cfg.Subnets) > 0 {
+						callerSet := map[string]bool{}
+						for _, s := range cfg.Subnets {
+							callerSet[s] = true
+						}
+						for _, ep := range ag.Endpoints {
+							if callerSet[ep.Subnet] {
+								bestEP = ep.Address
+								break
+							}
+						}
+					}
+				}
+
+				rows = append(rows, row{
+					ag:      ag,
+					seen:    seen,
+					status:  computedStatus,
+					bestEP:  bestEP,
+					subnets: strings.Join(subnetNames, ","),
+				})
+			}
+
 			if jsonOut {
 				b, _ := json.MarshalIndent(agents, "", "  ")
 				fmt.Fprintln(cmd.OutOrStdout(), string(b))
 				return nil
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "%-22s %-20s %-10s %-10s %s\n",
-				"ID", "NAME", "STATUS", "SEEN", "VERSION")
-			for _, ag := range agents {
-				seen := "never"
-				if ag.LastSeenAt != nil {
-					ago := time.Since(time.Unix(*ag.LastSeenAt, 0)).Round(time.Second)
-					seen = relTime(ago)
+			fmt.Fprintf(cmd.OutOrStdout(), "%-20s %-20s %-8s %-20s %-12s %s\n",
+				"NAME", "ID", "STATUS", "ENDPOINT", "SEEN", "VERSION")
+			for _, r := range rows {
+				seenStr := "never"
+				if r.ag.LastSeenAt != nil {
+					seenStr = relTime(r.seen)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%-22s %-20s %-10s %-10s %s\n",
-					ag.ID, ag.Name, ag.Status, seen, ag.AgentVersion)
+				fmt.Fprintf(cmd.OutOrStdout(), "%-20s %-20s %-8s %-20s %-12s %s\n",
+					r.ag.Name, r.ag.ID, r.status, r.bestEP, seenStr, r.ag.AgentVersion)
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "JSON output")
+	cmd.Flags().StringVar(&subnetFilter, "subnet", "", "Filter to agents on subnet X")
+	cmd.Flags().StringVar(&statusFilter, "status", "", "Filter by computed status: online|stale|offline")
 	return cmd
 }
 
@@ -158,6 +242,7 @@ func relTime(ago time.Duration) string {
 	case ago < time.Hour:
 		return fmt.Sprintf("%dm ago", int(ago.Minutes()))
 	default:
-		return fmt.Sprintf("%dh ago", int(ago.Hours()))
+		// ISO timestamp for >1h — caller can reconstruct exact time.
+		return time.Now().Add(-ago).Format(time.RFC3339)
 	}
 }
