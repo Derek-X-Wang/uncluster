@@ -210,6 +210,31 @@ type CertEventSummary struct {
 	DenialReason  string `json:"denial_reason,omitempty"`
 }
 
+// --- self-update (S8b) ---
+
+// UpdatePlanResponse is returned by GET /v1/agent/update-plan.
+// Empty ExpectedVersion means "no update mandated".
+type UpdatePlanResponse struct {
+	ExpectedVersion   string `json:"expected_version"`
+	AssetURLTemplate  string `json:"asset_url_template,omitempty"`
+	SHA256URLTemplate string `json:"sha256_url_template,omitempty"`
+	Force             bool   `json:"force,omitempty"`
+}
+
+// CheckUpdateCommand is sent in Commands when the agent's agent_version ≠ expected_version.
+type CheckUpdateCommand struct {
+	Type    string `json:"type"`    // "check_update"
+	Version string `json:"version"` // the expected version
+}
+
+// SetUpdatePolicyRequest is the body for POST /v1/server/update.
+type SetUpdatePolicyRequest struct {
+	ExpectedVersion   string `json:"expected_version"`
+	AssetURLTemplate  string `json:"asset_url_template,omitempty"`
+	SHA256URLTemplate string `json:"sha256_url_template,omitempty"`
+	Force             bool   `json:"force,omitempty"`
+}
+
 // --- errors ---
 
 type ErrorResponse struct {

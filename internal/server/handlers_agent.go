@@ -195,11 +195,14 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 	// Re-read agent to get latest fail_closed_after setting.
 	latestAg, _ := s.cfg.Store.GetAgent(ctx, ag.ID)
 
+	// Build commands. Inject check_update if agent_version ≠ expected_version.
+	commands := buildUpdateCommands(ctx, s, req.AgentVersion)
+
 	writeJSON(w, http.StatusOK, api.V2HeartbeatResponse{
 		AckTS:           req.ObservedAt,
 		ServerTime:      now.Unix(),
 		Policy:          policy,
-		Commands:        []any{},
+		Commands:        commands,
 		FailClosedAfter: latestAg.FailClosedAfter,
 	})
 }

@@ -190,4 +190,17 @@ var migrations = []string{
 	`ALTER TABLE tokens_v2 RENAME TO tokens`,
 	`CREATE INDEX idx_tokens_agent ON tokens(agent_id)`,
 	`DROP TABLE IF EXISTS nodes`,
+
+	// ---- V2 (S8b) ----
+
+	// 17: update_policy — server-side expected version + asset URL template.
+	// Single-row table (id=1); upserted by operator CLI.
+	`CREATE TABLE update_policy (
+		id                   INTEGER PRIMARY KEY CHECK (id = 1),
+		expected_version      TEXT NOT NULL DEFAULT '',
+		asset_url_template    TEXT NOT NULL DEFAULT '',
+		sha256_url_template   TEXT NOT NULL DEFAULT '',
+		force                 INTEGER NOT NULL DEFAULT 0,
+		updated_at            INTEGER NOT NULL
+	)`,
 }

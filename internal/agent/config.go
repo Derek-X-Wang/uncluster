@@ -25,6 +25,9 @@ type Config struct {
 	CAPubkey       string        `toml:"ca_pubkey"`
 	ServerHTTPSPin string        `toml:"server_https_pin,omitempty"`
 	ExpectedPaths  ExpectedPaths `toml:"expected_paths"`
+	// PinnedVersion overrides the server's expected_version. Set by
+	// `uncluster agent update --pin`. Empty = follow server's expected.
+	PinnedVersion  string `toml:"pinned_version,omitempty"`
 }
 
 func DefaultConfigPath() (string, error) {

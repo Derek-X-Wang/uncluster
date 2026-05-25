@@ -780,6 +780,48 @@ func (s *sqliteStore) ListCertEvents(ctx context.Context, f CertEventFilter) ([]
 	return out, rows.Err()
 }
 
+// ------------- update policy (S8b) -------------
+
+// GetUpdatePolicy returns the current update policy. Returns ErrNotFound when
+// no policy has been set yet (table is empty).
+func (s *sqliteStore) GetUpdatePolicy(ctx context.Context) (UpdatePolicy, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT expected_version, asset_url_template, sha256_url_template, force, updated_at
+		 FROM update_policy WHERE id = 1`)
+	var p UpdatePolicy
+	var updatedAt int64
+	var force int
+	if err := row.Scan(&p.ExpectedVersion, &p.AssetURLTemplate, &p.SHA256URLTemplate, &force, &updatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return UpdatePolicy{}, ErrNotFound
+		}
+		return UpdatePolicy{}, err
+	}
+	p.Force = force != 0
+	p.UpdatedAt = time.Unix(updatedAt, 0)
+	return p, nil
+}
+
+// SetUpdatePolicy upserts the single update_policy row.
+func (s *sqliteStore) SetUpdatePolicy(ctx context.Context, p SetUpdatePolicyParams) error {
+	now := time.Now().Unix()
+	force := 0
+	if p.Force {
+		force = 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO update_policy(id, expected_version, asset_url_template, sha256_url_template, force, updated_at)
+		 VALUES(1, ?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+			expected_version    = excluded.expected_version,
+			asset_url_template  = excluded.asset_url_template,
+			sha256_url_template = excluded.sha256_url_template,
+			force               = excluded.force,
+			updated_at          = excluded.updated_at`,
+		p.ExpectedVersion, p.AssetURLTemplate, p.SHA256URLTemplate, force, now)
+	return err
+}
+
 // nullString converts an empty Go string to SQL NULL; non-empty strings are returned as-is.
 func nullString(s string) any {
 	if s == "" {
