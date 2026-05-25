@@ -63,7 +63,7 @@ func ResolveTemplate(tmpl, goos, goarch, ver string) string {
 // Apply downloads the binary at assetURL, verifies its SHA256 against sha256URL,
 // and atomically swaps it into place at BinaryPath. It does NOT restart the service.
 //
-// On success: BinaryPath.prev contains the old binary (for rollback).
+// On success: BinaryPath+prevSuffix (.prev on Unix, .old on Windows) contains the old binary for rollback.
 // On failure: no mutation; returns an error.
 //
 // Returns ErrPinned if PinnedVersion is set and does not match expectedVersion.
@@ -86,7 +86,7 @@ func (u *Updater) Apply(ctx context.Context, expectedVersion, assetURL, sha256UR
 	}
 
 	newPath := binaryPath + ".new"
-	prevPath := binaryPath + ".prev"
+	prevPath := binaryPath + prevSuffix
 
 	// 1. Download new binary to .new
 	u.Logger.Info("selfupdate: downloading", "url", assetURL, "version", expectedVersion)
@@ -112,7 +112,7 @@ func (u *Updater) Apply(ctx context.Context, expectedVersion, assetURL, sha256UR
 	// 4. Atomic swap: current → .prev, .new → current
 	if err := os.Rename(binaryPath, prevPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		_ = os.Remove(newPath)
-		return fmt.Errorf("selfupdate: rename to .prev: %w", err)
+		return fmt.Errorf("selfupdate: rename to %s: %w", prevSuffix, err)
 	}
 	if err := os.Rename(newPath, binaryPath); err != nil {
 		// Attempt rollback of the prev rename.
@@ -124,7 +124,7 @@ func (u *Updater) Apply(ctx context.Context, expectedVersion, assetURL, sha256UR
 	return nil
 }
 
-// Rollback swaps BinaryPath.prev back to BinaryPath.
+// Rollback swaps BinaryPath+prevSuffix (.prev on Unix, .old on Windows) back to BinaryPath.
 func (u *Updater) Rollback() error {
 	binaryPath := u.BinaryPath
 	if binaryPath == "" {
@@ -134,16 +134,16 @@ func (u *Updater) Rollback() error {
 			return fmt.Errorf("selfupdate: resolve executable: %w", err)
 		}
 	}
-	prevPath := binaryPath + ".prev"
+	prevPath := binaryPath + prevSuffix
 	failedPath := binaryPath + ".failed"
 	if _, err := os.Stat(prevPath); errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("selfupdate: no .prev binary to rollback to")
+		return fmt.Errorf("selfupdate: no %s binary to rollback to", prevSuffix)
 	}
 	if err := os.Rename(binaryPath, failedPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("selfupdate: rename to .failed: %w", err)
+		return fmt.Errorf("selfupdate: rename current to .failed: %w", err)
 	}
 	if err := os.Rename(prevPath, binaryPath); err != nil {
-		return fmt.Errorf("selfupdate: rename .prev to binary: %w", err)
+		return fmt.Errorf("selfupdate: rename %s to binary: %w", prevSuffix, err)
 	}
 	return nil
 }

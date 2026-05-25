@@ -100,13 +100,13 @@ func TestUpdater_Apply_DownloadAndSwap(t *testing.T) {
 		t.Errorf("binary content = %q, want %q", got, content)
 	}
 
-	// .prev should hold the old binary.
-	prev, err := os.ReadFile(binaryPath + ".prev")
+	// prevSuffix binary (.prev on Unix, .old on Windows) should hold the old binary.
+	prev, err := os.ReadFile(binaryPath + prevSuffix)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(prev) != "old binary" {
-		t.Errorf(".prev content = %q, want 'old binary'", prev)
+		t.Errorf("%s content = %q, want 'old binary'", prevSuffix, prev)
 	}
 }
 
@@ -196,7 +196,8 @@ func TestUpdater_Rollback(t *testing.T) {
 	dir := t.TempDir()
 	binaryPath := filepath.Join(dir, "agent")
 	_ = os.WriteFile(binaryPath, []byte("bad new binary"), 0o755)
-	_ = os.WriteFile(binaryPath+".prev", []byte("good old binary"), 0o755)
+	// Use platform-specific prevSuffix (.prev on Unix, .old on Windows).
+	_ = os.WriteFile(binaryPath+prevSuffix, []byte("good old binary"), 0o755)
 
 	updater := &Updater{BinaryPath: binaryPath, Logger: slog.Default()}
 	if err := updater.Rollback(); err != nil {
