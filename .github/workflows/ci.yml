@@ -7,7 +7,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest,  race: "-race" }
+          - { os: windows-latest, race: ""       }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -17,7 +22,7 @@ jobs:
       - name: go vet
         run: go vet ./...
       - name: go test
-        run: go test ./... -race -count=1
+        run: go test ./... ${{ matrix.race }} -count=1
 
   build:
     runs-on: ubuntu-latest
@@ -25,10 +30,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - { goos: darwin, goarch: amd64 }
-          - { goos: darwin, goarch: arm64 }
-          - { goos: linux,  goarch: amd64 }
-          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin,  goarch: amd64, ext: ""     }
+          - { goos: darwin,  goarch: arm64, ext: ""     }
+          - { goos: linux,   goarch: amd64, ext: ""     }
+          - { goos: linux,   goarch: arm64, ext: ""     }
+          - { goos: windows, goarch: amd64, ext: ".exe" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -41,8 +47,8 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          go build -trimpath -ldflags "-s -w" -o uncluster-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/uncluster
+          go build -trimpath -ldflags "-s -w" -o uncluster-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/uncluster
       - uses: actions/upload-artifact@v4
         with:
           name: uncluster-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: uncluster-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: uncluster-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
