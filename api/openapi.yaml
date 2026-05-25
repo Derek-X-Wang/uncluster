@@ -173,6 +173,39 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/AgentDetail" }
         "404": { description: not found }
+    delete:
+      summary: Revoke and deprovision a V2 agent
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: agent revoked }
+        "404": { description: not found }
+    patch:
+      summary: Update agent settings (e.g. fail_closed_after)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                fail_closed_after:
+                  type: integer
+                  nullable: true
+                  description: Seconds after last heartbeat before principals are wiped; null to clear
+      responses:
+        "204": { description: updated }
+        "404": { description: not found }
 
   /v1/certs:
     post:
@@ -561,9 +594,14 @@ components:
         agent_version: { type: string }
         created_at: { type: integer, format: int64 }
         last_seen_at: { type: integer, format: int64, nullable: true }
+        fail_closed_after: { type: integer, format: int64, nullable: true, description: "Seconds after last heartbeat before principals are wiped; null = disabled" }
         endpoints:
           type: array
           items: { $ref: "#/components/schemas/AgentEndpointSummary" }
+    RevokedResponse:
+      type: object
+      properties:
+        reason: { type: string, enum: [node_revoked], description: "Reason for 410 Gone response" }
     CertRequest:
       type: object
       required: [agent, username, pubkey]

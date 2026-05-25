@@ -670,3 +670,92 @@ func TestGetPolicySnapshot_Deterministic(t *testing.T) {
 		t.Errorf("hash not deterministic: %s vs %s", snap1.Hash, snap2.Hash)
 	}
 }
+
+// ---- S5: agent revocation ----
+
+func TestRevokeAgent_SetsStatusAndRevokesToken(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "rev-agent"})
+	tok, _ := s.CreateToken(ctx, store.NewTokenParams{
+		Kind:       store.TokenAgent,
+		AgentID:    &ag.ID,
+		SecretHash: "h",
+		Label:      "agent:rev-agent",
+	})
+
+	if err := s.RevokeAgent(ctx, ag.ID, time.Now()); err != nil {
+		t.Fatalf("RevokeAgent: %v", err)
+	}
+
+	revoked, err := s.GetAgent(ctx, ag.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked.Status != store.AgentRevoked {
+		t.Errorf("status = %s, want revoked", revoked.Status)
+	}
+	if revoked.Name == "rev-agent" {
+		t.Errorf("name should have been renamed, got: %q", revoked.Name)
+	}
+
+	// Agent token should be revoked.
+	gotTok, _ := s.GetTokenByID(ctx, tok.ID)
+	if gotTok.RevokedAt == nil {
+		t.Error("agent token should have revoked_at set")
+	}
+}
+
+func TestRevokeAgent_NotFound(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	err := s.RevokeAgent(ctx, "ag_nonexistent", time.Now())
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got: %v", err)
+	}
+}
+
+func TestListAgents_ExcludesRevoked(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	_, _ = s.CreateAgent(ctx, store.NewAgentParams{Name: "active-1"})
+	ag2, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "active-2"})
+	_ = s.RevokeAgent(ctx, ag2.ID, time.Now())
+
+	list, err := s.ListAgents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Errorf("want 1 active agent, got %d", len(list))
+	}
+	if list[0].Name != "active-1" {
+		t.Errorf("unexpected agent name: %s", list[0].Name)
+	}
+}
+
+func TestSetAgentFailClosedAfter(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "fca-agent"})
+
+	secs := int64(3600)
+	if err := s.SetAgentFailClosedAfter(ctx, ag.ID, &secs); err != nil {
+		t.Fatalf("SetAgentFailClosedAfter: %v", err)
+	}
+	got, _ := s.GetAgent(ctx, ag.ID)
+	if got.FailClosedAfter == nil || *got.FailClosedAfter != secs {
+		t.Errorf("FailClosedAfter = %v, want %d", got.FailClosedAfter, secs)
+	}
+
+	// Clear it.
+	if err := s.SetAgentFailClosedAfter(ctx, ag.ID, nil); err != nil {
+		t.Fatalf("SetAgentFailClosedAfter (clear): %v", err)
+	}
+	got2, _ := s.GetAgent(ctx, ag.ID)
+	if got2.FailClosedAfter != nil {
+		t.Errorf("FailClosedAfter should be nil after clear, got %v", got2.FailClosedAfter)
+	}
+}

@@ -2,7 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -10,6 +13,10 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/version"
 )
+
+// ErrDeprovisioned is returned by Run() when the agent is explicitly revoked
+// by the control plane (410 Gone). The service supervisor should NOT restart.
+var ErrDeprovisioned = errors.New("agent: deprovisioned by control plane")
 
 // HealthProvider is an optional hook for collecting structured health checks
 // to include in V2 heartbeat payloads. It is injected by the CLI layer (which
@@ -30,8 +37,13 @@ type Agent struct {
 	endpointProvider EndpointProvider // optional; injected by CLI or tests
 
 	policyMu       sync.Mutex
-	policyStateVal policyState    // last-applied policy state; guarded by policyMu
+	policyStateVal policyState      // last-applied policy state; guarded by policyMu
 	applyCh        chan applyRequest // serialised policy-apply channel; set in Run; nil until Run called
+
+	// Fail-closed-after: wipe principals if no successful heartbeat for this long.
+	fcaMu             sync.Mutex
+	failClosedAfterSec *int64    // nil = disabled; updated from heartbeat response
+	lastHeartbeatOK   time.Time // last time a heartbeat succeeded
 }
 
 func New(cfg Config, logger *slog.Logger) *Agent {
@@ -90,23 +102,98 @@ func (a *Agent) heartbeatLoop(ctx context.Context) error {
 	defer t.Stop()
 	// fire one immediately so registration status is fresh
 	if err := a.heartbeatOnce(ctx); err != nil {
-		if err == ErrUnauthorized {
+		switch {
+		case errors.Is(err, ErrUnauthorized):
+			a.logger.Error("auth_failed: heartbeat unauthorized; operator intervention required; principals preserved")
 			return err
+		case errors.Is(err, ErrRevoked):
+			a.logger.Error("deprovisioned: control plane revoked this agent; wiping principals")
+			return a.onRevoked()
 		}
 	}
+	// Check for fail-closed every 30 seconds.
+	fcTicker := time.NewTicker(30 * time.Second)
+	defer fcTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
 			if err := a.heartbeatOnce(ctx); err != nil {
-				if err == ErrUnauthorized {
+				switch {
+				case errors.Is(err, ErrUnauthorized):
+					a.logger.Error("auth_failed: heartbeat unauthorized; operator intervention required; principals preserved")
 					return err
+				case errors.Is(err, ErrRevoked):
+					a.logger.Error("deprovisioned: control plane revoked this agent; wiping principals")
+					return a.onRevoked()
+				default:
+					a.logger.Warn("heartbeat error", "err", err)
 				}
-				a.logger.Warn("heartbeat error", "err", err)
+			}
+		case <-fcTicker.C:
+			a.checkFailClosed()
+		}
+	}
+}
+
+// checkFailClosed wipes principals if fail_closed_after has elapsed since last
+// successful heartbeat. Safe to call concurrently; no-op if fail-closed not set.
+func (a *Agent) checkFailClosed() {
+	a.fcaMu.Lock()
+	fca := a.failClosedAfterSec
+	lastOK := a.lastHeartbeatOK
+	a.fcaMu.Unlock()
+
+	if fca == nil || *fca <= 0 {
+		return
+	}
+	if lastOK.IsZero() {
+		return // no heartbeat yet; don't wipe
+	}
+	if time.Since(lastOK) >= time.Duration(*fca)*time.Second {
+		a.logger.Warn("fail_closed: wiping principals due to heartbeat timeout",
+			"fail_closed_after_sec", *fca,
+			"last_heartbeat_ok", lastOK)
+		// Apply empty policy to wipe all principals.
+		a.runApplyPolicy(api.PolicyPayload{
+			Version:    0,
+			Hash:       "",
+			Principals: nil,
+		})
+	}
+}
+
+// onRevoked handles explicit deprovision (410 Gone). Wipes principals,
+// writes .deprovisioned marker, returns ErrDeprovisioned so Run() exits
+// with an error that supervisors can distinguish.
+func (a *Agent) onRevoked() error {
+	principalsDir := a.cfg.ExpectedPaths.PrincipalsDir
+	if principalsDir != "" {
+		// Remove all principal files in the dir.
+		entries, err := os.ReadDir(principalsDir)
+		if err == nil {
+			for _, e := range entries {
+				if !e.IsDir() {
+					_ = os.Remove(filepath.Join(principalsDir, e.Name()))
+				}
 			}
 		}
 	}
+	// Write .deprovisioned marker next to agent.toml so the supervisor sees it.
+	configDir := a.cfg.ExpectedPaths.CAPubkey // best proxy for config dir; fall back
+	if configDir == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			configDir = filepath.Join(h, ".config", "uncluster")
+		}
+	} else {
+		configDir = filepath.Dir(configDir)
+	}
+	if configDir != "" {
+		marker := filepath.Join(configDir, ".deprovisioned")
+		_ = os.WriteFile(marker, []byte("deprovisioned\n"), 0o600)
+	}
+	return ErrDeprovisioned
 }
 
 func (a *Agent) heartbeatOnce(ctx context.Context) error {
@@ -174,6 +261,12 @@ func (a *Agent) heartbeatOnceV2(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// Track successful heartbeat time and update fail-closed-after from response.
+	a.fcaMu.Lock()
+	a.lastHeartbeatOK = time.Now()
+	a.failClosedAfterSec = resp.FailClosedAfter
+	a.fcaMu.Unlock()
 
 	// If the server sent a policy snapshot, dispatch it for application.
 	if resp.Policy != nil && a.applyCh != nil {

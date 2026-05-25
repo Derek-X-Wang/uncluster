@@ -211,11 +211,15 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 		}
 	}
 
+	// Re-read agent to get latest fail_closed_after setting.
+	latestAg, _ := s.cfg.Store.GetAgent(ctx, ag.ID)
+
 	writeJSON(w, http.StatusOK, api.V2HeartbeatResponse{
-		AckTS:      req.ObservedAt,
-		ServerTime: now.Unix(),
-		Policy:     policy,
-		Commands:   []any{},
+		AckTS:           req.ObservedAt,
+		ServerTime:      now.Unix(),
+		Policy:          policy,
+		Commands:        []any{},
+		FailClosedAfter: latestAg.FailClosedAfter,
 	})
 }
 
