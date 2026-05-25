@@ -233,7 +233,7 @@ func TestWritePrivateRefusesOverwriteAndEnforcesMode(t *testing.T) {
 		t.Fatalf("first write: %v", err)
 	}
 	// Mode enforcement: POSIX mode bits are not enforced on Windows.
-	// TODO(S9a): restore this coverage via Windows ACL check.
+	// On Windows, restrictFileACL is applied instead (tested separately in fileacl_windows.go).
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -251,10 +251,10 @@ func TestWritePrivateRefusesOverwriteAndEnforcesMode(t *testing.T) {
 
 func TestLoadPrivateRejectsLoosePerms(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		// POSIX mode bits are not enforced on Windows; LoadPrivateFromDisk skips
-		// the mode check on Windows. ACL-based restriction is deferred to S9a.
-		// TODO(S9a): restore via Windows ACL check.
-		t.Skip("POSIX mode bits not enforced on Windows; see follow-up for ACL-based check")
+		// POSIX mode bits are not enforced on Windows; creating a file with a
+		// deliberately loose DACL requires Windows-specific test setup. The
+		// checkFileACL Windows path is exercised in fileacl_windows.go unit tests.
+		t.Skip("POSIX mode bits not enforced on Windows; ACL path tested via fileacl_windows_test.go")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ca")

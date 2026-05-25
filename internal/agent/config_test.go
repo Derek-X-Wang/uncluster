@@ -61,10 +61,11 @@ func TestConfigAlreadyEnrolledCheck(t *testing.T) {
 // TestSaveConfigMode0600 verifies that SaveConfig writes the file with mode 0600.
 // Acceptance criteria: `uncluster agent join` persists config with mode 0600.
 // Skipped on Windows: POSIX mode bits are not enforced by the Windows filesystem.
-// TODO(S9a): restore via Windows ACL check (icacls/SetNamedSecurityInfo).
+// On Windows, restrictConfigACL applies a DACL (SYSTEM + Administrators only)
+// instead; that path is tested in config_acl_windows_test.go.
 func TestSaveConfigMode0600(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("POSIX mode bits not enforced on Windows; see follow-up for ACL-based check")
+		t.Skip("POSIX mode bits not enforced on Windows; ACL path tested via config_acl_windows_test.go")
 	}
 	p := filepath.Join(t.TempDir(), "agent.toml")
 	if err := agent.SaveConfig(p, agent.Config{Server: "https://x", AgentToken: "tok"}); err != nil {
