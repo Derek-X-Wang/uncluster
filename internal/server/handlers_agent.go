@@ -133,19 +133,63 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
-	node := r.Context().Value(ctxAuthedNode).(store.Node)
+	ctx := r.Context()
+
+	// Dispatch: V2 agent token → new heartbeat path; V1 node token → legacy path.
+	if ag, ok := ctx.Value(ctxAuthedAgent).(store.Agent); ok {
+		s.handleV2Heartbeat(w, r, ag)
+		return
+	}
+
+	// V1 legacy path.
+	node := ctx.Value(ctxAuthedNode).(store.Node)
 	var req api.HeartbeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
 	metaJSON, _ := json.Marshal(req.Metadata)
-	if err := s.cfg.Store.UpdateNodeHeartbeat(r.Context(), node.ID, string(metaJSON), time.Now()); err != nil {
+	if err := s.cfg.Store.UpdateNodeHeartbeat(ctx, node.ID, string(metaJSON), time.Now()); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	cancels, _ := s.cfg.Store.PendingCancelsForNode(r.Context(), node.ID)
+	cancels, _ := s.cfg.Store.PendingCancelsForNode(ctx, node.ID)
 	writeJSON(w, http.StatusOK, api.HeartbeatResponse{CancelTaskIDs: cancels})
+}
+
+func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag store.Agent) {
+	ctx := r.Context()
+	var req api.V2HeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+
+	now := time.Now()
+
+	// Update agents.last_seen_at + agent_version.
+	if err := s.cfg.Store.UpdateAgentHeartbeat(ctx, ag.ID, req.AgentVersion, now); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Persist policy state (best-effort).
+	_ = s.cfg.Store.UpsertAgentPolicyState(ctx, store.UpsertAgentPolicyStateParams{
+		AgentID:         ag.ID,
+		DesiredVersion:  req.PolicyState.DesiredVersion,
+		AppliedVersion:  req.PolicyState.AppliedVersion,
+		AppliedHash:     req.PolicyState.AppliedHash,
+		LastApplyStatus: req.PolicyState.LastApplyStatus,
+		LastApplyError:  req.PolicyState.LastApplyError,
+		LastApplyAt:     time.Unix(req.PolicyState.LastApplyAt, 0),
+	})
+
+	writeJSON(w, http.StatusOK, api.V2HeartbeatResponse{
+		AckTS:      req.ObservedAt,
+		ServerTime: now.Unix(),
+		Policy:     nil,
+		Commands:   []any{},
+	})
 }
 
 func (s *Server) handleAgentChunks(w http.ResponseWriter, r *http.Request) {

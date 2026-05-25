@@ -83,6 +83,12 @@ func (c *ServerClient) Heartbeat(ctx context.Context, metadata map[string]any) (
 	return out, err
 }
 
+func (c *ServerClient) HeartbeatV2(ctx context.Context, req api.V2HeartbeatRequest) (api.V2HeartbeatResponse, error) {
+	var out api.V2HeartbeatResponse
+	_, err := c.do(ctx, "POST", "/v1/agent/heartbeat", req, &out)
+	return out, err
+}
+
 func (c *ServerClient) NextTask(ctx context.Context) (*api.NextTaskResponse, error) {
 	// Uses a separate HTTP client with longer timeout for long-poll.
 	req, err := http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/v1/agent/next-task", nil)

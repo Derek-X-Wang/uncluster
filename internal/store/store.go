@@ -77,6 +77,30 @@ type Agent struct {
 	AgentVersion string
 }
 
+// AgentPolicyState is the last observed policy synchronisation state reported
+// by the agent via V2 heartbeat. One row per agent (upserted on each beat).
+type AgentPolicyState struct {
+	AgentID         string
+	DesiredVersion  *int64
+	AppliedVersion  int64
+	AppliedHash     string
+	LastApplyStatus string
+	LastApplyError  *string
+	LastApplyAt     time.Time
+	UpdatedAt       time.Time
+}
+
+// UpsertAgentPolicyStateParams holds values for upserting an agent's policy state.
+type UpsertAgentPolicyStateParams struct {
+	AgentID         string
+	DesiredVersion  *int64
+	AppliedVersion  int64
+	AppliedHash     string
+	LastApplyStatus string
+	LastApplyError  *string
+	LastApplyAt     time.Time
+}
+
 type Token struct {
 	ID         string
 	Kind       TokenKind
@@ -159,6 +183,9 @@ type Store interface {
 	CreateAgent(ctx context.Context, p NewAgentParams) (Agent, error)
 	GetAgent(ctx context.Context, id string) (Agent, error)
 	GetAgentByName(ctx context.Context, name string) (Agent, error)
+	UpdateAgentHeartbeat(ctx context.Context, id, agentVersion string, at time.Time) error
+	UpsertAgentPolicyState(ctx context.Context, p UpsertAgentPolicyStateParams) error
+	GetAgentPolicyState(ctx context.Context, agentID string) (AgentPolicyState, error)
 
 	// tasks
 	CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error)

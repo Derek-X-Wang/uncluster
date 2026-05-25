@@ -76,12 +76,60 @@ type AgentRegisterResponse struct {
 
 // --- agent: heartbeat ---
 
+// HeartbeatRequest is the V1 heartbeat shape (kept until S11).
 type HeartbeatRequest struct {
 	Metadata map[string]any `json:"metadata"`
 }
 
+// HeartbeatResponse is the V1 heartbeat response (kept until S11).
 type HeartbeatResponse struct {
 	CancelTaskIDs []string `json:"cancel_task_ids,omitempty"`
+}
+
+// --- agent: V2 heartbeat ---
+
+// AgentEndpoint is one subnet→address binding the agent observed.
+type AgentEndpoint struct {
+	Subnet  string `json:"subnet"`  // e.g. "home-tailnet", "home-lan", "home-tailnet@100.64.1.1"
+	Address string `json:"address"` // IP address on that subnet
+}
+
+// AgentPolicyState is the agent's last known policy synchronisation status.
+type AgentPolicyState struct {
+	DesiredVersion  *int64  `json:"desired_version"`            // version the server last pushed; null if none yet
+	AppliedVersion  int64   `json:"applied_version"`            // last version the agent successfully applied
+	AppliedHash     string  `json:"applied_hash"`               // blake3:<hex> of the applied policy
+	LastApplyStatus string  `json:"last_apply_status"`          // "ok" | "failed"
+	LastApplyError  *string `json:"last_apply_error,omitempty"` // non-nil on failure
+	LastApplyAt     int64   `json:"last_apply_at"`              // unix seconds
+}
+
+// AgentHealthCheck is one structured health check item.
+type AgentHealthCheck struct {
+	Component string  `json:"component"` // "sshd", "ca_pubkey", "principals", ...
+	Check     string  `json:"check"`     // "running", "config_drop_in", "present", "dir_writable"
+	State     string  `json:"state"`     // "ok" | "warn" | "fail" | "unknown"
+	ErrorCode *string `json:"error_code,omitempty"`
+	Message   *string `json:"message,omitempty"`
+}
+
+// V2HeartbeatRequest is the V2 typed state-sync envelope.
+type V2HeartbeatRequest struct {
+	AgentID      string             `json:"agent_id"`
+	AgentVersion string             `json:"agent_version"`
+	ObservedAt   int64              `json:"observed_at"` // unix seconds
+	Endpoints    []AgentEndpoint    `json:"endpoints"`
+	PolicyState  AgentPolicyState   `json:"policy_state"`
+	Health       []AgentHealthCheck `json:"health"`
+	Metrics      map[string]any     `json:"metrics,omitempty"` // best-effort; absent = ok
+}
+
+// V2HeartbeatResponse is the server's response to a V2 heartbeat.
+type V2HeartbeatResponse struct {
+	AckTS      int64 `json:"ack_ts"`      // server's unix timestamp acknowledging the beat
+	ServerTime int64 `json:"server_time"` // server wall-clock unix seconds
+	Policy     *any  `json:"policy"`      // null until S3b; will carry policy payload
+	Commands   []any `json:"commands"`    // empty until S8b
 }
 
 // --- agent: next-task ---
