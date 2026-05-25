@@ -89,3 +89,9 @@ func (c *ServerClient) HeartbeatV2(ctx context.Context, req api.V2HeartbeatReque
 	_, err := c.do(ctx, "POST", "/v1/agent/heartbeat", req, &out)
 	return out, err
 }
+
+func (c *ServerClient) GetUpdatePlan(ctx context.Context) (api.UpdatePlanResponse, error) {
+	var out api.UpdatePlanResponse
+	_, err := c.do(ctx, "GET", "/v1/agent/update-plan", nil, &out)
+	return out, err
+}

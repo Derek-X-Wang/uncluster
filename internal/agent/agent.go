@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -268,6 +269,40 @@ func (a *Agent) heartbeatOnceV2(ctx context.Context) error {
 			default:
 			}
 		}
+	}
+
+	// Dispatch server commands (e.g. check_update).
+	for _, rawCmd := range resp.Commands {
+		if err := a.dispatchCommand(ctx, rawCmd); err != nil {
+			a.logger.Warn("command dispatch error", "err", err)
+		}
+	}
+
+	return nil
+}
+
+// dispatchCommand routes a single command from the heartbeat response.
+func (a *Agent) dispatchCommand(ctx context.Context, rawCmd any) error {
+	// Re-marshal to get the type field.
+	b, err := json.Marshal(rawCmd)
+	if err != nil {
+		return err
+	}
+	var typed struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(b, &typed); err != nil {
+		return err
+	}
+	switch typed.Type {
+	case "check_update":
+		var cmd api.CheckUpdateCommand
+		if err := json.Unmarshal(b, &cmd); err != nil {
+			return err
+		}
+		return a.HandleCheckUpdate(ctx, cmd)
+	default:
+		a.logger.Debug("unknown command type; ignoring", "type", typed.Type)
 	}
 	return nil
 }

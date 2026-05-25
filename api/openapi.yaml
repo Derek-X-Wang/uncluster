@@ -238,6 +238,38 @@ paths:
         "204": { description: deleted }
         "404": { description: not found }
 
+  /v1/agent/update-plan:
+    get:
+      summary: Fetch the current update plan (agent auth)
+      description: |
+        Returns the operator-set expected version and asset URL templates.
+        An empty expected_version means no update is mandated.
+        Agents call this after receiving a check_update command in a heartbeat response.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UpdatePlanResponse" }
+
+  /v1/server/update:
+    post:
+      summary: Set the expected agent version (operator auth)
+      description: |
+        Upserts the update policy. On the next heartbeat any agent whose
+        agent_version differs from expected_version will receive a check_update command.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetUpdatePolicyRequest" }
+      responses:
+        "204": { description: update policy set }
+        "400": { description: missing expected_version }
+        "401": { description: unauthorized }
+
   /v1/audit/certs:
     get:
       summary: List cert issuance audit events
@@ -449,6 +481,27 @@ components:
         key_id: { type: string }
         outcome: { type: string, enum: [signed, denied] }
         denial_reason: { type: string }
+    UpdatePlanResponse:
+      type: object
+      properties:
+        expected_version: { type: string, description: "Empty = no update mandated" }
+        asset_url_template: { type: string, description: "URL template; {os}, {arch}, {version} substituted" }
+        sha256_url_template: { type: string, description: "URL template for SHA256 checksum file" }
+        force: { type: boolean, description: "Force update even if agent is already on expected_version" }
+    SetUpdatePolicyRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: string }
+        asset_url_template: { type: string }
+        sha256_url_template: { type: string }
+        force: { type: boolean }
+    CheckUpdateCommand:
+      type: object
+      required: [type, version]
+      properties:
+        type: { type: string, enum: [check_update] }
+        version: { type: string, description: "The expected version string" }
     CreateACLRequest:
       type: object
       required: [caller, agent, username]

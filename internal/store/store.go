@@ -171,6 +171,24 @@ type CertEventFilter struct {
 	Limit         int // 0 = default (100)
 }
 
+// UpdatePolicy is the server-side update configuration (single row in DB).
+// ExpectedVersion is empty when no update is mandated.
+type UpdatePolicy struct {
+	ExpectedVersion    string
+	AssetURLTemplate   string
+	SHA256URLTemplate  string
+	Force              bool
+	UpdatedAt          time.Time
+}
+
+// SetUpdatePolicyParams holds fields for upserting the update policy.
+type SetUpdatePolicyParams struct {
+	ExpectedVersion   string
+	AssetURLTemplate  string
+	SHA256URLTemplate string
+	Force             bool
+}
+
 // Store is the full control-plane persistence surface.
 type Store interface {
 	// tokens
@@ -205,6 +223,10 @@ type Store interface {
 	// cert events (V2 — S6)
 	WriteCertEvent(ctx context.Context, e CertEvent) error
 	ListCertEvents(ctx context.Context, f CertEventFilter) ([]CertEvent, error)
+
+	// update policy (S8b)
+	GetUpdatePolicy(ctx context.Context) (UpdatePolicy, error)
+	SetUpdatePolicy(ctx context.Context, p SetUpdatePolicyParams) error
 
 	// lifecycle
 	Close() error

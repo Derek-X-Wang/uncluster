@@ -601,3 +601,56 @@ func TestWriteCertEvent_Idempotent(t *testing.T) {
 		t.Errorf("want 1 row (idempotent), got %d", len(events))
 	}
 }
+
+// ---- update policy (S8b) ----
+
+func TestUpdatePolicy_GetBeforeSet_ReturnsNotFound(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	_, err := s.GetUpdatePolicy(ctx)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestUpdatePolicy_SetAndGet(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	err := s.SetUpdatePolicy(ctx, store.SetUpdatePolicyParams{
+		ExpectedVersion:   "v2.1.0",
+		AssetURLTemplate:  "https://example.com/{os}/{arch}/uncluster-{version}",
+		SHA256URLTemplate: "https://example.com/{os}/{arch}/uncluster-{version}.sha256",
+		Force:             true,
+	})
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	got, err := s.GetUpdatePolicy(ctx)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.ExpectedVersion != "v2.1.0" {
+		t.Errorf("expected_version = %q, want v2.1.0", got.ExpectedVersion)
+	}
+	if !got.Force {
+		t.Error("force should be true")
+	}
+}
+
+func TestUpdatePolicy_Upsert(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	_ = s.SetUpdatePolicy(ctx, store.SetUpdatePolicyParams{ExpectedVersion: "v1.0.0"})
+	_ = s.SetUpdatePolicy(ctx, store.SetUpdatePolicyParams{ExpectedVersion: "v2.0.0", Force: false})
+
+	got, err := s.GetUpdatePolicy(ctx)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.ExpectedVersion != "v2.0.0" {
+		t.Errorf("want v2.0.0 after upsert, got %q", got.ExpectedVersion)
+	}
+}

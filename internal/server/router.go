@@ -30,10 +30,16 @@ func (s *Server) buildRouter() http.Handler {
 		v1.Group(func(agent chi.Router) {
 			agent.Post("/agent/register", s.handleAgentRegister)
 		})
-		// Agent heartbeat — authenticated with agent token.
+		// Agent heartbeat + update-plan — authenticated with agent token.
 		v1.Group(func(agent chi.Router) {
 			agent.Use(s.requireAuth(store.TokenAgent))
 			agent.Post("/agent/heartbeat", s.handleAgentHeartbeat)
+			agent.Get("/agent/update-plan", s.handleGetUpdatePlan)
+		})
+		// Update policy management — caller token.
+		v1.Group(func(caller chi.Router) {
+			caller.Use(s.requireAuth(store.TokenCaller))
+			caller.Post("/server/update", s.handleSetUpdatePolicy)
 		})
 		// ACL management — caller token.
 		v1.Group(func(caller chi.Router) {

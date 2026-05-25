@@ -228,6 +228,8 @@ func newServerCmd() *cobra.Command {
 	bootstrap.Flags().StringVar(&bsLabel, "label", "bootstrap", "label for the minted caller token")
 	cmd.AddCommand(bootstrap)
 
+	cmd.AddCommand(newServerUpdateCmd())
+
 	return cmd
 }
 

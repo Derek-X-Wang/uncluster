@@ -72,6 +72,9 @@ func newAgentCmd() *cobra.Command {
 	doctor := newAgentDoctorCmd()
 	cmd.AddCommand(doctor)
 
+	cmd.AddCommand(newAgentUpdateCmd())
+	cmd.AddCommand(newAgentRollbackCmd())
+
 	return cmd
 }
 
