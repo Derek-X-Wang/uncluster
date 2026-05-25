@@ -4,8 +4,11 @@ info:
   version: 0.1.0
   description: |
     Wire protocol between the `uncluster` CLI, agents, and the control plane.
-    This file is the source of truth; see
-    docs/superpowers/specs/2026-04-23-uncluster-v1-design.md for design.
+    This file is the source of truth for the wire shape. See
+    docs/architecture.md for current-state design and docs/adr/ for
+    decision rationale. Note: V1 task-execution endpoints (tasks, chunks,
+    SSE) are being removed per ADR-0002; the V2 surface centers on cert
+    signing, ACL CRUD, agent enrollment, and the typed heartbeat envelope.
 servers:
   - url: https://uncluster.example.com:7777
     description: Example production URL (operator-provided)

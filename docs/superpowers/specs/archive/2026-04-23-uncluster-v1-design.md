@@ -1,5 +1,14 @@
 # Uncluster V1 — Design
 
+> **SUPERSEDED — 2026-05-25.** Uncluster pivoted from a long-poll task-execution model to an OpenSSH certificate-authority gatekeeper model. This document captured the V1 design and is preserved for historical reference; **do not use it as a source of truth for current or planned behavior.**
+>
+> Current design surface:
+> - **[`/CONTEXT.md`](../../../../CONTEXT.md)** — vocabulary and relationships
+> - **[`/docs/architecture.md`](../../../architecture.md)** — current-state narrative (system purpose, components, flows, threat model)
+> - **[`/docs/adr/`](../../../adr/)** — decision records (rationale + alternatives), starting with [ADR-0002 V2 clean cut over incremental pivot](../../../adr/0002-v2-clean-cut-pivot.md) for the supersession reason
+> - **[`/api/openapi.yaml`](../../../../api/openapi.yaml)** — wire contract
+> - **[`/ACCEPTANCE.md`](../../../../ACCEPTANCE.md)** — V2 definition of done
+
 **Date:** 2026-04-23
 **Status:** Approved (brainstorming phase) — awaiting implementation plan
 **Author:** Derek (derek@getbite.com) with Claude
