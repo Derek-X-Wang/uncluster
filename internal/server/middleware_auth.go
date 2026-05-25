@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/store"
 	"github.com/derek-x-wang/uncluster/internal/token"
 )
@@ -46,33 +47,23 @@ func (s *Server) requireAuth(requiredKind store.TokenKind) func(http.Handler) ht
 				writeError(w, http.StatusUnauthorized, "wrong token kind for this route")
 				return
 			}
-			if row.RevokedAt != nil {
-				writeError(w, http.StatusUnauthorized, "token revoked")
-				return
-			}
-			if row.ExpiresAt != nil && row.ExpiresAt.Before(time.Now()) {
-				writeError(w, http.StatusUnauthorized, "token expired")
-				return
-			}
-			if row.Kind == store.TokenJoin && row.UsedAt != nil {
-				writeError(w, http.StatusUnauthorized, "join token already used")
-				return
-			}
-			// VerifySecret last: argon2 is expensive; only run after all cheap checks pass.
-			ok, err := token.VerifySecret(parsed.Secret, row.SecretHash)
-			if err != nil || !ok {
-				writeError(w, http.StatusUnauthorized, "secret mismatch")
-				return
-			}
+			// For agent tokens, agent-record status takes priority over token revocation:
+			// a revoked *agent* (410 Gone) must be distinguished from a merely revoked
+			// token (401 Unauthorized). Check the agent record first, then fall through to
+			// the generic revoked-token check only for non-agent-token kinds.
 			ctx := context.WithValue(r.Context(), ctxAuthedToken, row)
-			// For agent tokens, carry the node (V1) or agent (V2) and reject revoked ones.
 			if row.Kind == store.TokenAgent {
 				switch {
 				case row.AgentID != nil:
 					// V2: token linked to agents table.
 					ag, err := s.cfg.Store.GetAgent(r.Context(), *row.AgentID)
-					if err != nil || ag.Status == store.AgentRevoked {
-						writeError(w, http.StatusUnauthorized, "agent revoked")
+					if err != nil {
+						writeError(w, http.StatusUnauthorized, "agent not found")
+						return
+					}
+					if ag.Status == store.AgentRevoked {
+						// 410 Gone signals explicit deprovision; agent must wipe principals.
+						writeJSON(w, http.StatusGone, api.RevokedResponse{Reason: "node_revoked"})
 						return
 					}
 					ctx = context.WithValue(ctx, ctxAuthedAgent, ag)
@@ -88,6 +79,28 @@ func (s *Server) requireAuth(requiredKind store.TokenKind) func(http.Handler) ht
 					writeError(w, http.StatusUnauthorized, "agent token has no linked record")
 					return
 				}
+				// For agent tokens, skip generic revoked-token check: the agent-record
+				// check above already handled the revoked case with a 410.
+			} else {
+				// Non-agent tokens: apply generic revocation and expiry checks.
+				if row.RevokedAt != nil {
+					writeError(w, http.StatusUnauthorized, "token revoked")
+					return
+				}
+				if row.ExpiresAt != nil && row.ExpiresAt.Before(time.Now()) {
+					writeError(w, http.StatusUnauthorized, "token expired")
+					return
+				}
+				if row.Kind == store.TokenJoin && row.UsedAt != nil {
+					writeError(w, http.StatusUnauthorized, "join token already used")
+					return
+				}
+			}
+			// VerifySecret last: argon2 is expensive; only run after all cheap checks pass.
+			ok, err := token.VerifySecret(parsed.Secret, row.SecretHash)
+			if err != nil || !ok {
+				writeError(w, http.StatusUnauthorized, "secret mismatch")
+				return
 			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

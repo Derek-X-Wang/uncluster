@@ -69,12 +69,13 @@ type Node struct {
 // Agent is the V2 enrollment record. Created when an Agent registers via
 // POST /v1/agent/register; linked to its agent token via the tokens table.
 type Agent struct {
-	ID           string
-	Name         string
-	CreatedAt    time.Time
-	LastSeenAt   *time.Time
-	Status       AgentStatus
-	AgentVersion string
+	ID               string
+	Name             string
+	CreatedAt        time.Time
+	LastSeenAt       *time.Time
+	Status           AgentStatus
+	AgentVersion     string
+	FailClosedAfter  *int64 // seconds; nil means "no fail-closed"
 }
 
 // AgentEndpoint is one subnet→address binding for an agent.
@@ -232,7 +233,10 @@ type Store interface {
 	CreateAgent(ctx context.Context, p NewAgentParams) (Agent, error)
 	GetAgent(ctx context.Context, id string) (Agent, error)
 	GetAgentByName(ctx context.Context, name string) (Agent, error)
+	ListAgents(ctx context.Context) ([]Agent, error)
 	UpdateAgentHeartbeat(ctx context.Context, id, agentVersion string, at time.Time) error
+	RevokeAgent(ctx context.Context, id string, at time.Time) error
+	SetAgentFailClosedAfter(ctx context.Context, id string, seconds *int64) error
 	UpsertAgentPolicyState(ctx context.Context, p UpsertAgentPolicyStateParams) error
 	GetAgentPolicyState(ctx context.Context, agentID string) (AgentPolicyState, error)
 

@@ -46,11 +46,13 @@ func (s *Server) buildRouter() http.Handler {
 			op.Delete("/acl/{id}", s.handleDeleteACL)
 			op.Get("/acl", s.handleListACL)
 		})
-		// V2 agents — operator CLI token for list/detail.
+		// V2 agents — operator CLI token for list/detail/revoke.
 		v1.Group(func(op chi.Router) {
 			op.Use(s.requireAuth(store.TokenCLI))
 			op.Get("/agents", s.handleListAgents)
 			op.Get("/agents/{id}", s.handleGetAgent)
+			op.Delete("/agents/{id}", s.handleDeleteAgent)
+			op.Patch("/agents/{id}", s.handleSetAgent)
 		})
 		// Cert issuance — caller token.
 		v1.Group(func(caller chi.Router) {

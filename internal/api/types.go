@@ -126,10 +126,16 @@ type V2HeartbeatRequest struct {
 
 // V2HeartbeatResponse is the server's response to a V2 heartbeat.
 type V2HeartbeatResponse struct {
-	AckTS      int64            `json:"ack_ts"`      // server's unix timestamp acknowledging the beat
-	ServerTime int64            `json:"server_time"` // server wall-clock unix seconds
-	Policy     *PolicyPayload   `json:"policy"`      // null when policy matches applied_hash
-	Commands   []any            `json:"commands"`    // empty until S8b
+	AckTS           int64          `json:"ack_ts"`                       // server's unix timestamp acknowledging the beat
+	ServerTime      int64          `json:"server_time"`                  // server wall-clock unix seconds
+	Policy          *PolicyPayload `json:"policy"`                       // null when policy matches applied_hash
+	Commands        []any          `json:"commands"`                     // empty until S8b
+	FailClosedAfter *int64         `json:"fail_closed_after,omitempty"`  // seconds; nil = no fail-closed
+}
+
+// RevokedResponse is the body returned with 410 Gone when an agent is revoked.
+type RevokedResponse struct {
+	Reason string `json:"reason"` // "node_revoked"
 }
 
 // --- ACL ---
@@ -180,13 +186,14 @@ type AgentEndpointSummary struct {
 
 // AgentDetail is the full agent record returned by GET /v1/agents/{id}.
 type AgentDetail struct {
-	ID           string                 `json:"id"`
-	Name         string                 `json:"name"`
-	Status       string                 `json:"status"`
-	AgentVersion string                 `json:"agent_version"`
-	CreatedAt    int64                  `json:"created_at"`
-	LastSeenAt   *int64                 `json:"last_seen_at,omitempty"`
-	Endpoints    []AgentEndpointSummary `json:"endpoints"`
+	ID              string                 `json:"id"`
+	Name            string                 `json:"name"`
+	Status          string                 `json:"status"`
+	AgentVersion    string                 `json:"agent_version"`
+	CreatedAt       int64                  `json:"created_at"`
+	LastSeenAt      *int64                 `json:"last_seen_at,omitempty"`
+	Endpoints       []AgentEndpointSummary `json:"endpoints"`
+	FailClosedAfter *int64                 `json:"fail_closed_after,omitempty"` // seconds
 }
 
 // --- cert signing ---

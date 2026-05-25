@@ -380,18 +380,81 @@ func (s *sqliteStore) GetAgentByName(ctx context.Context, name string) (Agent, e
 }
 
 func (s *sqliteStore) queryAgent(ctx context.Context, where string, arg any) (Agent, error) {
-	q := `SELECT id, name, created_at, last_seen_at, status, agent_version FROM agents ` + where
+	q := `SELECT id, name, created_at, last_seen_at, status, agent_version, fail_closed_after FROM agents ` + where
 	return scanAgent(s.db.QueryRowContext(ctx, q, arg))
+}
+
+func (s *sqliteStore) ListAgents(ctx context.Context) ([]Agent, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, created_at, last_seen_at, status, agent_version, fail_closed_after
+		 FROM agents WHERE status != 'revoked' ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Agent
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) RevokeAgent(ctx context.Context, id string, at time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var currentName string
+	if err := tx.QueryRowContext(ctx, `SELECT name FROM agents WHERE id = ?`, id).Scan(&currentName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	newName := fmt.Sprintf("%s-revoked-%d", currentName, at.Unix())
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE agents SET status = 'revoked', name = ? WHERE id = ?`, newName, id); err != nil {
+		return err
+	}
+	// Revoke the agent token(s) linked to this agent.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE tokens SET revoked_at = ?
+		 WHERE agent_id = ? AND kind = 'agent' AND revoked_at IS NULL`,
+		at.Unix(), id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *sqliteStore) SetAgentFailClosedAfter(ctx context.Context, id string, seconds *int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET fail_closed_after = ? WHERE id = ? AND status != 'revoked'`,
+		seconds, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func scanAgent(r rowScanner) (Agent, error) {
 	var (
-		a            Agent
-		lastSeen     sql.NullInt64
-		agentVersion sql.NullString
-		createdAt    int64
+		a                Agent
+		lastSeen         sql.NullInt64
+		agentVersion     sql.NullString
+		failClosedAfter  sql.NullInt64
+		createdAt        int64
 	)
-	if err := r.Scan(&a.ID, &a.Name, &createdAt, &lastSeen, &a.Status, &agentVersion); err != nil {
+	if err := r.Scan(&a.ID, &a.Name, &createdAt, &lastSeen, &a.Status, &agentVersion, &failClosedAfter); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Agent{}, ErrNotFound
 		}
@@ -404,6 +467,9 @@ func scanAgent(r rowScanner) (Agent, error) {
 	}
 	if agentVersion.Valid {
 		a.AgentVersion = agentVersion.String
+	}
+	if failClosedAfter.Valid {
+		a.FailClosedAfter = &failClosedAfter.Int64
 	}
 	return a, nil
 }

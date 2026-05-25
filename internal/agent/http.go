@@ -28,7 +28,10 @@ func NewServerClient(baseURL, tok string) *ServerClient {
 	}
 }
 
-var ErrUnauthorized = errors.New("agent: unauthorized")
+var (
+	ErrUnauthorized = errors.New("agent: unauthorized")
+	ErrRevoked      = errors.New("agent: revoked by control plane")
+)
 
 func (c *ServerClient) do(ctx context.Context, method, path string, in any, out any) (*http.Response, error) {
 	var body io.Reader
@@ -53,9 +56,13 @@ func (c *ServerClient) do(ctx context.Context, method, path string, in any, out 
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode == 401 {
+	if resp.StatusCode == http.StatusUnauthorized {
 		_ = resp.Body.Close()
 		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode == http.StatusGone {
+		_ = resp.Body.Close()
+		return nil, ErrRevoked
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
