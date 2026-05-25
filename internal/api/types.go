@@ -170,6 +170,45 @@ type CreateACLResponse struct {
 	ACLEntrySummary
 }
 
+// --- agents list / detail ---
+
+// AgentEndpointSummary is one subnet→address binding in the agent detail response.
+type AgentEndpointSummary struct {
+	Subnet  string `json:"subnet"`
+	Address string `json:"address"`
+}
+
+// AgentDetail is the full agent record returned by GET /v1/agents/{id}.
+type AgentDetail struct {
+	ID           string                 `json:"id"`
+	Name         string                 `json:"name"`
+	Status       string                 `json:"status"`
+	AgentVersion string                 `json:"agent_version"`
+	CreatedAt    int64                  `json:"created_at"`
+	LastSeenAt   *int64                 `json:"last_seen_at,omitempty"`
+	Endpoints    []AgentEndpointSummary `json:"endpoints"`
+}
+
+// --- cert signing ---
+
+// CertRequest is the body for POST /v1/certs.
+type CertRequest struct {
+	Agent      string `json:"agent"`       // agent id or name
+	Username   string `json:"username"`    // SSH principal
+	Pubkey     string `json:"pubkey"`      // authorized_keys-format user public key
+	TTLSeconds int    `json:"ttl_seconds"` // 0 → default (300s); max 900s
+}
+
+// CertResponse is the response from POST /v1/certs.
+type CertResponse struct {
+	Certificate string `json:"certificate"` // authorized_keys-format cert
+	KeyID       string `json:"key_id"`
+	Principal   string `json:"principal"`
+	Serial      uint64 `json:"serial"`
+	ValidAfter  int64  `json:"valid_after"`
+	ValidBefore int64  `json:"valid_before"`
+}
+
 // --- agent: next-task ---
 
 type NextTaskResponse struct {

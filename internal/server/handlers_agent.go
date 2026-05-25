@@ -173,6 +173,15 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 		return
 	}
 
+	// Persist endpoints (best-effort).
+	if len(req.Endpoints) > 0 {
+		eps := make([]store.AgentEndpoint, 0, len(req.Endpoints))
+		for _, e := range req.Endpoints {
+			eps = append(eps, store.AgentEndpoint{Subnet: e.Subnet, Address: e.Address})
+		}
+		_ = s.cfg.Store.UpsertAgentEndpoints(ctx, ag.ID, eps)
+	}
+
 	// Persist policy state (best-effort).
 	_ = s.cfg.Store.UpsertAgentPolicyState(ctx, store.UpsertAgentPolicyStateParams{
 		AgentID:         ag.ID,

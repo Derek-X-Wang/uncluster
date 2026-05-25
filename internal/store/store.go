@@ -77,6 +77,12 @@ type Agent struct {
 	AgentVersion string
 }
 
+// AgentEndpoint is one subnet→address binding for an agent.
+type AgentEndpoint struct {
+	Subnet  string
+	Address string
+}
+
 // ACLEntry is a single access-control grant: caller_token_id may SSH to
 // agent_id as username. The UNIQUE constraint is (caller_token_id, agent_id, username).
 type ACLEntry struct {
@@ -236,6 +242,10 @@ type Store interface {
 	DeleteACL(ctx context.Context, id string) error
 	ListACL(ctx context.Context, f ListACLFilter) ([]ACLEntry, error)
 	GetPolicySnapshot(ctx context.Context, agentID string) (PolicySnapshot, error)
+
+	// agent endpoints (V2)
+	UpsertAgentEndpoints(ctx context.Context, agentID string, endpoints []AgentEndpoint) error
+	ListAgentEndpoints(ctx context.Context, agentID string) ([]AgentEndpoint, error)
 
 	// tasks
 	CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error)

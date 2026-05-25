@@ -5,7 +5,10 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/derek-x-wang/uncluster/internal/store"
 )
@@ -28,12 +31,16 @@ type Config struct {
 	// Agents at enrollment. When empty, the register handler returns an empty
 	// ca_pubkey (server started without bootstrap; cert signing will not work).
 	CAPubkey string
+	// CASigner is the SSH CA signer for cert issuance. When nil, POST /v1/certs
+	// returns 503 "CA not configured".
+	CASigner ssh.Signer
 }
 
 type Server struct {
 	cfg        Config
 	dispatcher Dispatcher
 	handler    http.Handler
+	serial     atomic.Uint64 // monotonic cert serial
 }
 
 func New(cfg Config) *Server {

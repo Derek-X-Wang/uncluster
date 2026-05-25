@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/ca"
@@ -34,11 +35,14 @@ func newServerCmd() *cobra.Command {
 			// Absent CA = warn but allow start (cert signing and enrollment CA
 			// pubkey delivery simply won't work).
 			var caPubkeyLine string
+			var caSigner ssh.Signer
 			caPubPath := caPath + ".pub"
 			if _, err := os.Stat(caPath); err == nil {
-				if _, err := ca.LoadPrivateFromDisk(caPath); err != nil {
+				signer, err := ca.LoadPrivateFromDisk(caPath)
+				if err != nil {
 					return fmt.Errorf("ca check: %w", err)
 				}
+				caSigner = signer
 				// Read the public key line to embed in enrollment responses.
 				if b, err := os.ReadFile(caPubPath); err == nil {
 					caPubkeyLine = strings.TrimSpace(string(b))
@@ -56,7 +60,7 @@ func newServerCmd() *cobra.Command {
 			}
 			defer st.Close()
 
-			srv := server.New(server.Config{Store: st, CAPubkey: caPubkeyLine})
+			srv := server.New(server.Config{Store: st, CAPubkey: caPubkeyLine, CASigner: caSigner})
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer cancel()
 			return srv.Start(ctx, addr)

@@ -695,6 +695,46 @@ func computePolicyHash(ctx context.Context, db dbQueryer, agentID string) (strin
 	return fmt.Sprintf("blake3:%x", sum), nil
 }
 
+// ------------- agent endpoints (V2) -------------
+
+func (s *sqliteStore) UpsertAgentEndpoints(ctx context.Context, agentID string, endpoints []AgentEndpoint) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Replace all endpoints for this agent atomically.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_endpoints WHERE agent_id = ?`, agentID); err != nil {
+		return err
+	}
+	for _, e := range endpoints {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO agent_endpoints(agent_id, subnet, address) VALUES(?, ?, ?)`,
+			agentID, e.Subnet, e.Address); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *sqliteStore) ListAgentEndpoints(ctx context.Context, agentID string) ([]AgentEndpoint, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT subnet, address FROM agent_endpoints WHERE agent_id = ? ORDER BY subnet`, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AgentEndpoint
+	for rows.Next() {
+		var e AgentEndpoint
+		if err := rows.Scan(&e.Subnet, &e.Address); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // ------------- tasks -------------
 
 func (s *sqliteStore) CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error) {

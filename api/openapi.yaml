@@ -144,6 +144,57 @@ paths:
         "204": { description: revoked }
         "404": { description: not found }
 
+  /v1/agents:
+    get:
+      summary: List registered V2 agents
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AgentDetail" }
+
+  /v1/agents/{id}:
+    get:
+      summary: Get a V2 agent by id or name
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentDetail" }
+        "404": { description: not found }
+
+  /v1/certs:
+    post:
+      summary: Issue an SSH user certificate for a Caller→Agent access grant
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CertRequest" }
+      responses:
+        "200":
+          description: Signed certificate
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CertResponse" }
+        "400": { description: bad input (pubkey is cert, TTL too long, etc.) }
+        "401": { description: unauthorized }
+        "403": { description: acl_miss — no ACL grant for (caller, agent, username) }
+        "404": { description: agent not found }
+        "503": { description: CA not configured }
+
   /v1/acl:
     post:
       summary: Grant a caller access to an agent for a given SSH username
@@ -496,6 +547,40 @@ components:
         exit_code:
           type: integer
           description: Process exit code (0 = success)
+    AgentEndpointSummary:
+      type: object
+      properties:
+        subnet: { type: string }
+        address: { type: string }
+    AgentDetail:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        status: { type: string, enum: [online, offline, revoked] }
+        agent_version: { type: string }
+        created_at: { type: integer, format: int64 }
+        last_seen_at: { type: integer, format: int64, nullable: true }
+        endpoints:
+          type: array
+          items: { $ref: "#/components/schemas/AgentEndpointSummary" }
+    CertRequest:
+      type: object
+      required: [agent, username, pubkey]
+      properties:
+        agent: { type: string, description: "Agent id or name" }
+        username: { type: string, description: "SSH username" }
+        pubkey: { type: string, description: "authorized_keys-format user public key" }
+        ttl_seconds: { type: integer, description: "0=default(300); max 900" }
+    CertResponse:
+      type: object
+      properties:
+        certificate: { type: string, description: "authorized_keys-format signed certificate" }
+        key_id: { type: string }
+        principal: { type: string }
+        serial: { type: integer, format: int64 }
+        valid_after: { type: integer, format: int64 }
+        valid_before: { type: integer, format: int64 }
     CreateACLRequest:
       type: object
       required: [caller, agent, username]
