@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -69,21 +68,15 @@ func ParsePrivate(data []byte) (ssh.Signer, error) {
 }
 
 // LoadPrivateFromDisk reads the CA private key at path and returns a Signer.
-// On Unix, refuses the file if its mode has any group or world bits set.
-// On Windows, POSIX mode bits are not enforced by the filesystem; the mode
-// check is skipped. Access restriction on Windows must be set via ACLs at
-// install time (S9a scope).
-// TODO(S9a): replace with Windows ACL check (icacls/SetNamedSecurityInfo)
-// to enforce equivalent access restriction on Windows.
+// On Unix: refuses the file if its POSIX mode has any group or world bits set.
+// On Windows: checks the DACL via GetNamedSecurityInfo; refuses if the file is
+// accessible to accounts other than SYSTEM and Administrators.
 func LoadPrivateFromDisk(path string) (ssh.Signer, error) {
-	info, err := os.Stat(path)
-	if err != nil {
+	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("ca: stat %s: %w", path, err)
 	}
-	if runtime.GOOS != "windows" {
-		if extra := info.Mode().Perm() & 0o077; extra != 0 {
-			return nil, fmt.Errorf("ca: %s has mode %#o with group/world bits set; refusing (must be 0600)", path, info.Mode().Perm())
-		}
+	if err := checkFileACL(path); err != nil {
+		return nil, err
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -94,10 +87,9 @@ func LoadPrivateFromDisk(path string) (ssh.Signer, error) {
 
 // WritePrivateToDisk writes marshaled private-key bytes to path with mode 0600.
 // Refuses to overwrite an existing file (so re-bootstrap is safe).
-// Note: on Windows, os.WriteFile with mode 0o600 is accepted without error
-// but the filesystem does not enforce POSIX mode bits. The file is not truly
-// restricted by mode; Windows ACL must be applied at install time (S9a scope).
-// TODO(S9a): call icacls/SetNamedSecurityInfo after writing on Windows.
+// On Unix: mode 0600 is applied at write time.
+// On Windows: mode 0600 is set (no-op on Windows filesystem), then
+// restrictFileACL applies a DACL restricting access to SYSTEM + Administrators.
 func WritePrivateToDisk(path string, marshaled []byte) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("ca: %s already exists; refusing to overwrite", path)
@@ -109,6 +101,10 @@ func WritePrivateToDisk(path string, marshaled []byte) error {
 	}
 	if err := os.WriteFile(path, marshaled, 0o600); err != nil {
 		return fmt.Errorf("ca: write %s: %w", path, err)
+	}
+	// On Windows, apply DACL to restrict to SYSTEM + Administrators only.
+	if err := restrictFileACL(path); err != nil {
+		return fmt.Errorf("ca: set file ACL %s: %w", path, err)
 	}
 	return nil
 }

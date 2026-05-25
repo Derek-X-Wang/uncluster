@@ -60,6 +60,14 @@ func SaveConfig(path string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return toml.NewEncoder(f).Encode(cfg)
+	if err := toml.NewEncoder(f).Encode(cfg); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// On Windows, apply a DACL restricting access to SYSTEM + Administrators
+	// (equivalent of mode 0600 which is a no-op on Windows NTFS).
+	return restrictConfigACL(path)
 }
