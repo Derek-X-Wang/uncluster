@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
+	"lukechampine.com/blake3"
 )
 
 type sqliteStore struct {
@@ -474,6 +475,224 @@ func (s *sqliteStore) GetAgentPolicyState(ctx context.Context, agentID string) (
 		ps.UpdatedAt = time.Unix(updatedAt.Int64, 0)
 	}
 	return ps, nil
+}
+
+// ------------- acl (V2) -------------
+
+func (s *sqliteStore) CreateACL(ctx context.Context, p CreateACLParams) (ACLEntry, error) {
+	id := "acl_" + shortID(24)
+	now := time.Now()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO acl(id, caller_token_id, agent_id, username, created_at, created_by)
+		 VALUES(?, ?, ?, ?, ?, ?)`,
+		id, p.CallerTokenID, p.AgentID, p.Username, now.Unix(), p.CreatedBy)
+	if err != nil {
+		if isUniqueViolation(err) {
+			// Idempotent: re-grant returns the existing entry.
+			return s.getACLByTriple(ctx, p.CallerTokenID, p.AgentID, p.Username)
+		}
+		return ACLEntry{}, fmt.Errorf("insert acl: %w", err)
+	}
+	// Bump policy version for this agent.
+	if err := s.bumpPolicyVersion(ctx, p.AgentID); err != nil {
+		return ACLEntry{}, fmt.Errorf("bump policy version: %w", err)
+	}
+	return s.GetACL(ctx, id)
+}
+
+func (s *sqliteStore) GetACL(ctx context.Context, id string) (ACLEntry, error) {
+	return s.scanACL(s.db.QueryRowContext(ctx,
+		`SELECT id, caller_token_id, agent_id, username, created_at, created_by FROM acl WHERE id = ?`, id))
+}
+
+func (s *sqliteStore) getACLByTriple(ctx context.Context, callerTokenID, agentID, username string) (ACLEntry, error) {
+	return s.scanACL(s.db.QueryRowContext(ctx,
+		`SELECT id, caller_token_id, agent_id, username, created_at, created_by
+		 FROM acl WHERE caller_token_id = ? AND agent_id = ? AND username = ?`,
+		callerTokenID, agentID, username))
+}
+
+func (s *sqliteStore) scanACL(r rowScanner) (ACLEntry, error) {
+	var (
+		e         ACLEntry
+		createdAt int64
+		createdBy sql.NullString
+	)
+	if err := r.Scan(&e.ID, &e.CallerTokenID, &e.AgentID, &e.Username, &createdAt, &createdBy); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ACLEntry{}, ErrNotFound
+		}
+		return ACLEntry{}, err
+	}
+	e.CreatedAt = time.Unix(createdAt, 0)
+	if createdBy.Valid {
+		e.CreatedBy = &createdBy.String
+	}
+	return e, nil
+}
+
+func (s *sqliteStore) DeleteACL(ctx context.Context, id string) error {
+	// Look up agent_id before deleting so we can bump the version.
+	entry, err := s.GetACL(ctx, id)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM acl WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return s.bumpPolicyVersion(ctx, entry.AgentID)
+}
+
+func (s *sqliteStore) ListACL(ctx context.Context, f ListACLFilter) ([]ACLEntry, error) {
+	where := "1=1"
+	var args []any
+	if f.CallerTokenID != "" {
+		where += " AND caller_token_id = ?"
+		args = append(args, f.CallerTokenID)
+	}
+	if f.AgentID != "" {
+		where += " AND agent_id = ?"
+		args = append(args, f.AgentID)
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, caller_token_id, agent_id, username, created_at, created_by
+		 FROM acl WHERE `+where+` ORDER BY created_at ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ACLEntry
+	for rows.Next() {
+		e, err := s.scanACL(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// bumpPolicyVersion increments the monotonic policy version for an agent and
+// recomputes the hash from current ACL rows. Upserts the row if absent.
+func (s *sqliteStore) bumpPolicyVersion(ctx context.Context, agentID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Upsert version row.
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO agent_policy_versions(agent_id, version, hash)
+		 VALUES(?, 1, '')
+		 ON CONFLICT(agent_id) DO UPDATE SET version = version + 1`,
+		agentID)
+	if err != nil {
+		return err
+	}
+
+	// Recompute hash from current ACL.
+	h, err := computePolicyHash(ctx, tx, agentID)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx,
+		`UPDATE agent_policy_versions SET hash = ? WHERE agent_id = ?`, h, agentID)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// GetPolicySnapshot returns the current policy projection for an agent.
+// Returns a zero-version empty snapshot (no error) if no ACL rows exist.
+func (s *sqliteStore) GetPolicySnapshot(ctx context.Context, agentID string) (PolicySnapshot, error) {
+	// Get version + hash.
+	var version int64
+	var hash string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT version, hash FROM agent_policy_versions WHERE agent_id = ?`, agentID).
+		Scan(&version, &hash)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return PolicySnapshot{}, err
+	}
+	// Either no version row or version=0 → return empty snapshot at version 0.
+	// The agent should apply an empty principals map (wipe all principals files).
+
+	// Load principals.
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT username, caller_token_id FROM acl WHERE agent_id = ? ORDER BY username, caller_token_id`, agentID)
+	if err != nil {
+		return PolicySnapshot{}, err
+	}
+	defer rows.Close()
+
+	byUser := map[string][]string{}
+	var order []string
+	for rows.Next() {
+		var u, c string
+		if err := rows.Scan(&u, &c); err != nil {
+			return PolicySnapshot{}, err
+		}
+		if _, seen := byUser[u]; !seen {
+			order = append(order, u)
+		}
+		byUser[u] = append(byUser[u], c)
+	}
+	if err := rows.Err(); err != nil {
+		return PolicySnapshot{}, err
+	}
+
+	principals := make([]PolicyPrincipal, 0, len(order))
+	for _, u := range order {
+		principals = append(principals, PolicyPrincipal{Username: u, CallerTokenIDs: byUser[u]})
+	}
+
+	return PolicySnapshot{
+		AgentID:    agentID,
+		Version:    version,
+		Hash:       hash,
+		Principals: principals,
+	}, nil
+}
+
+type dbQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// computePolicyHash calculates blake3:<hex> over the canonical serialisation:
+// sorted "username:caller1,caller2\n" lines (callers sorted within each user).
+// Returns "" for an empty ACL.
+func computePolicyHash(ctx context.Context, db dbQueryer, agentID string) (string, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT username, caller_token_id FROM acl WHERE agent_id = ? ORDER BY username, caller_token_id`, agentID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var lines []byte
+	for rows.Next() {
+		var u, c string
+		if err := rows.Scan(&u, &c); err != nil {
+			return "", err
+		}
+		lines = append(lines, []byte(u+":"+c+"\n")...)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(lines) == 0 {
+		return "", nil
+	}
+	sum := blake3.Sum256(lines)
+	return fmt.Sprintf("blake3:%x", sum), nil
 }
 
 // ------------- tasks -------------

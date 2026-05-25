@@ -481,3 +481,192 @@ func TestGetAgentPolicyState_NotFound(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got: %v", err)
 	}
 }
+
+// ---- V2 ACL + policy projection ----
+
+func TestCreateAndGetACL(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "target-box"})
+	tok, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h", Label: "caller"})
+
+	e, err := s.CreateACL(ctx, store.CreateACLParams{
+		CallerTokenID: tok.ID,
+		AgentID:       ag.ID,
+		Username:      "derek",
+	})
+	if err != nil {
+		t.Fatalf("CreateACL: %v", err)
+	}
+	if e.ID == "" || e.CallerTokenID != tok.ID || e.AgentID != ag.ID || e.Username != "derek" {
+		t.Errorf("unexpected entry: %+v", e)
+	}
+
+	got, err := s.GetACL(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("GetACL: %v", err)
+	}
+	if got.ID != e.ID {
+		t.Errorf("GetACL id mismatch: %s", got.ID)
+	}
+}
+
+func TestCreateACL_Idempotent(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "idem-box"})
+	tok, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h"})
+
+	e1, err := s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok.ID, AgentID: ag.ID, Username: "root"})
+	if err != nil {
+		t.Fatalf("first CreateACL: %v", err)
+	}
+	e2, err := s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok.ID, AgentID: ag.ID, Username: "root"})
+	if err != nil {
+		t.Fatalf("second (idempotent) CreateACL: %v", err)
+	}
+	if e1.ID != e2.ID {
+		t.Errorf("idempotent re-grant returned different ids: %s vs %s", e1.ID, e2.ID)
+	}
+}
+
+func TestDeleteACL(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "del-box"})
+	tok, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h"})
+	e, _ := s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok.ID, AgentID: ag.ID, Username: "alice"})
+
+	if err := s.DeleteACL(ctx, e.ID); err != nil {
+		t.Fatalf("DeleteACL: %v", err)
+	}
+	// Second delete should ErrNotFound.
+	if err := s.DeleteACL(ctx, e.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound on second delete, got: %v", err)
+	}
+}
+
+func TestListACL_Filters(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ag1, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "ls-box-1"})
+	ag2, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "ls-box-2"})
+	tok1, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h1"})
+	tok2, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h2"})
+
+	_, _ = s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok1.ID, AgentID: ag1.ID, Username: "derek"})
+	_, _ = s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok2.ID, AgentID: ag1.ID, Username: "alice"})
+	_, _ = s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok1.ID, AgentID: ag2.ID, Username: "derek"})
+
+	// Filter by agent.
+	byAgent, err := s.ListACL(ctx, store.ListACLFilter{AgentID: ag1.ID})
+	if err != nil {
+		t.Fatalf("ListACL by agent: %v", err)
+	}
+	if len(byAgent) != 2 {
+		t.Errorf("want 2 entries for ag1, got %d", len(byAgent))
+	}
+
+	// Filter by caller.
+	byCaller, err := s.ListACL(ctx, store.ListACLFilter{CallerTokenID: tok1.ID})
+	if err != nil {
+		t.Fatalf("ListACL by caller: %v", err)
+	}
+	if len(byCaller) != 2 {
+		t.Errorf("want 2 entries for tok1, got %d", len(byCaller))
+	}
+
+	// All.
+	all, err := s.ListACL(ctx, store.ListACLFilter{})
+	if err != nil {
+		t.Fatalf("ListACL all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("want 3 total entries, got %d", len(all))
+	}
+}
+
+func TestGetPolicySnapshot_Empty(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "snap-empty"})
+	snap, err := s.GetPolicySnapshot(ctx, ag.ID)
+	if err != nil {
+		t.Fatalf("GetPolicySnapshot: %v", err)
+	}
+	if snap.Version != 0 || snap.Hash != "" || len(snap.Principals) != 0 {
+		t.Errorf("expected empty snapshot, got: %+v", snap)
+	}
+}
+
+func TestGetPolicySnapshot_Version(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "snap-v"})
+	tok1, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h1"})
+	tok2, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h2"})
+
+	// Grant 1.
+	e1, err := s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok1.ID, AgentID: ag.ID, Username: "derek"})
+	if err != nil {
+		t.Fatalf("CreateACL: %v", err)
+	}
+	snap1, err := s.GetPolicySnapshot(ctx, ag.ID)
+	if err != nil {
+		t.Fatalf("GetPolicySnapshot after 1 grant: %v", err)
+	}
+	if snap1.Version != 1 {
+		t.Errorf("expected version 1 after 1 grant, got %d", snap1.Version)
+	}
+	if snap1.Hash == "" {
+		t.Error("hash should be non-empty after grant")
+	}
+	if len(snap1.Principals) != 1 || snap1.Principals[0].Username != "derek" {
+		t.Errorf("unexpected principals: %+v", snap1.Principals)
+	}
+
+	// Grant 2 (different caller, same user).
+	_, _ = s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok2.ID, AgentID: ag.ID, Username: "derek"})
+	snap2, _ := s.GetPolicySnapshot(ctx, ag.ID)
+	if snap2.Version != 2 {
+		t.Errorf("expected version 2 after 2nd grant, got %d", snap2.Version)
+	}
+	if len(snap2.Principals[0].CallerTokenIDs) != 2 {
+		t.Errorf("expected 2 caller_token_ids for derek, got %d", len(snap2.Principals[0].CallerTokenIDs))
+	}
+
+	// Revoke 1st grant.
+	_ = s.DeleteACL(ctx, e1.ID)
+	snap3, _ := s.GetPolicySnapshot(ctx, ag.ID)
+	if snap3.Version != 3 {
+		t.Errorf("expected version 3 after revoke, got %d", snap3.Version)
+	}
+	if snap3.Hash == snap1.Hash {
+		t.Error("hash should change after revoke")
+	}
+}
+
+func TestGetPolicySnapshot_Deterministic(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "snap-det"})
+	tok1, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h1"})
+	tok2, _ := s.CreateToken(ctx, store.NewTokenParams{Kind: store.TokenCaller, SecretHash: "h2"})
+
+	_, _ = s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok1.ID, AgentID: ag.ID, Username: "alice"})
+	_, _ = s.CreateACL(ctx, store.CreateACLParams{CallerTokenID: tok2.ID, AgentID: ag.ID, Username: "bob"})
+
+	snap1, _ := s.GetPolicySnapshot(ctx, ag.ID)
+	snap2, _ := s.GetPolicySnapshot(ctx, ag.ID)
+
+	if snap1.Hash != snap2.Hash {
+		t.Errorf("hash not deterministic: %s vs %s", snap1.Hash, snap2.Hash)
+	}
+}

@@ -39,6 +39,14 @@ func (s *Server) buildRouter() http.Handler {
 			cli.Get("/nodes/{id}", s.handleGetNode)
 			cli.Delete("/nodes/{id}", s.handleDeleteNode)
 		})
+		// ACL management — caller tokens (or CLI tokens for operator use).
+		// POST + DELETE + GET /v1/acl require a CLI token (operator-level).
+		v1.Group(func(op chi.Router) {
+			op.Use(s.requireAuth(store.TokenCLI))
+			op.Post("/acl", s.handleCreateACL)
+			op.Delete("/acl/{id}", s.handleDeleteACL)
+			op.Get("/acl", s.handleListACL)
+		})
 		v1.Group(func(cli chi.Router) {
 			cli.Use(s.requireAuth(store.TokenCLI))
 			cli.Post("/tasks", s.handleCreateTask)

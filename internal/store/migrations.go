@@ -148,4 +148,15 @@ var migrations = []string{
 
 	// 13: add updated_at to agent_policy_state for heartbeat timestamp tracking.
 	`ALTER TABLE agent_policy_state ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`,
+
+	// ---- V2 (S3b) ----
+
+	// 14: monotonic policy version counter per agent. Incremented whenever an
+	// ACL row touching agent_id is created or deleted. Hash tracks the canonical
+	// blake3 hash of the resulting policy snapshot.
+	`CREATE TABLE agent_policy_versions (
+		agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+		version  INTEGER NOT NULL DEFAULT 0,
+		hash     TEXT NOT NULL DEFAULT ''
+	)`,
 }

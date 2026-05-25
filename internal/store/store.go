@@ -77,6 +77,49 @@ type Agent struct {
 	AgentVersion string
 }
 
+// ACLEntry is a single access-control grant: caller_token_id may SSH to
+// agent_id as username. The UNIQUE constraint is (caller_token_id, agent_id, username).
+type ACLEntry struct {
+	ID            string
+	CallerTokenID string
+	AgentID       string
+	Username      string
+	CreatedAt     time.Time
+	CreatedBy     *string
+}
+
+// CreateACLParams holds the fields needed to create an ACL entry.
+type CreateACLParams struct {
+	CallerTokenID string
+	AgentID       string
+	Username      string
+	CreatedBy     *string
+}
+
+// ListACLFilter controls which rows are returned by ListACL. Zero values mean
+// "no filter for this field".
+type ListACLFilter struct {
+	CallerTokenID string // filter by caller, or ""
+	AgentID       string // filter by agent, or ""
+}
+
+// PolicyPrincipal is one user and the set of caller_token_ids permitted to
+// SSH as that user on a given agent.
+type PolicyPrincipal struct {
+	Username      string
+	CallerTokenIDs []string
+}
+
+// PolicySnapshot is the server-side projection of ACL rows for one agent.
+// Version is monotonically incremented (stored in agent_policy_versions).
+// Hash is blake3:<hex> over the canonical serialisation of Principals.
+type PolicySnapshot struct {
+	AgentID    string
+	Version    int64
+	Hash       string // "blake3:<hex>" or "" when ACL is empty
+	Principals []PolicyPrincipal
+}
+
 // AgentPolicyState is the last observed policy synchronisation state reported
 // by the agent via V2 heartbeat. One row per agent (upserted on each beat).
 type AgentPolicyState struct {
@@ -186,6 +229,13 @@ type Store interface {
 	UpdateAgentHeartbeat(ctx context.Context, id, agentVersion string, at time.Time) error
 	UpsertAgentPolicyState(ctx context.Context, p UpsertAgentPolicyStateParams) error
 	GetAgentPolicyState(ctx context.Context, agentID string) (AgentPolicyState, error)
+
+	// acl (V2)
+	CreateACL(ctx context.Context, p CreateACLParams) (ACLEntry, error)
+	GetACL(ctx context.Context, id string) (ACLEntry, error)
+	DeleteACL(ctx context.Context, id string) error
+	ListACL(ctx context.Context, f ListACLFilter) ([]ACLEntry, error)
+	GetPolicySnapshot(ctx context.Context, agentID string) (PolicySnapshot, error)
 
 	// tasks
 	CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error)

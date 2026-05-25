@@ -184,10 +184,28 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 		LastApplyAt:     time.Unix(req.PolicyState.LastApplyAt, 0),
 	})
 
+	// Compute current policy snapshot; send it if the agent's applied_hash differs.
+	var policy *api.PolicyPayload
+	snap, err := s.cfg.Store.GetPolicySnapshot(ctx, ag.ID)
+	if err == nil && snap.Hash != req.PolicyState.AppliedHash {
+		principals := make([]api.PolicyPrincipal, 0, len(snap.Principals))
+		for _, p := range snap.Principals {
+			principals = append(principals, api.PolicyPrincipal{
+				Username:       p.Username,
+				CallerTokenIDs: p.CallerTokenIDs,
+			})
+		}
+		policy = &api.PolicyPayload{
+			Version:    snap.Version,
+			Hash:       snap.Hash,
+			Principals: principals,
+		}
+	}
+
 	writeJSON(w, http.StatusOK, api.V2HeartbeatResponse{
 		AckTS:      req.ObservedAt,
 		ServerTime: now.Unix(),
-		Policy:     nil,
+		Policy:     policy,
 		Commands:   []any{},
 	})
 }
