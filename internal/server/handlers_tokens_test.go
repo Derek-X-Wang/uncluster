@@ -2,7 +2,6 @@ package server_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,17 +11,7 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/server"
 	"github.com/derek-x-wang/uncluster/internal/store"
-	"github.com/derek-x-wang/uncluster/internal/token"
 )
-
-func seedCLIToken(t *testing.T, st store.Store) string {
-	t.Helper()
-	tok, _ := token.Generate(token.KindCLI)
-	hash, _ := token.HashSecret(tok.Secret)
-	_, _ = st.(store.TestInsertHook).InsertTokenWithID(context.Background(),
-		tok.ID, store.TokenCLI, nil, hash, "seed")
-	return tok.String()
-}
 
 func TestCreateAndListTokens(t *testing.T) {
 	st, _ := store.OpenSQLite(filepath.Join(t.TempDir(), "t.db"))
@@ -30,7 +19,7 @@ func TestCreateAndListTokens(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cli := seedCLIToken(t, st)
+	cli, _ := seedCallerToken(t, st)
 
 	body, _ := json.Marshal(api.CreateTokenRequest{Kind: "join", Label: "new-node"})
 	req, _ := http.NewRequest("POST", ts.URL+"/v1/tokens", bytes.NewReader(body))

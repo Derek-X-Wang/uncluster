@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -31,7 +30,6 @@ type EndpointProvider func() []api.AgentEndpoint
 type Agent struct {
 	cfg              Config
 	client           *ServerClient
-	cancels          *cancelDispatcher
 	logger           *slog.Logger
 	healthProvider   HealthProvider   // optional; injected by CLI
 	endpointProvider EndpointProvider // optional; injected by CLI or tests
@@ -51,10 +49,9 @@ func New(cfg Config, logger *slog.Logger) *Agent {
 		logger = slog.Default()
 	}
 	return &Agent{
-		cfg:     cfg,
-		client:  NewServerClient(cfg.Server, cfg.AgentToken),
-		cancels: newCancelDispatcher(),
-		logger:  logger,
+		cfg:    cfg,
+		client: NewServerClient(cfg.Server, cfg.AgentToken),
+		logger: logger,
 	}
 }
 
@@ -84,9 +81,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	}()
 	defer close(a.applyCh)
 
-	authErrCh := make(chan error, 2)
+	authErrCh := make(chan error, 1)
 	go func() { authErrCh <- a.heartbeatLoop(hbCtx) }()
-	go func() { authErrCh <- a.pollLoop(hbCtx) }()
 
 	select {
 	case <-ctx.Done():
@@ -197,19 +193,7 @@ func (a *Agent) onRevoked() error {
 }
 
 func (a *Agent) heartbeatOnce(ctx context.Context) error {
-	// V2 agents (AgentID starts with "ag_") send the typed V2 envelope.
-	if strings.HasPrefix(a.cfg.AgentID, "ag_") {
-		return a.heartbeatOnceV2(ctx)
-	}
-	// V1 fallback: metadata-only heartbeat.
-	resp, err := a.client.Heartbeat(ctx, CollectMetrics())
-	if err != nil {
-		return err
-	}
-	if len(resp.CancelTaskIDs) > 0 {
-		a.cancels.Signal(resp.CancelTaskIDs)
-	}
-	return nil
+	return a.heartbeatOnceV2(ctx)
 }
 
 func (a *Agent) heartbeatOnceV2(ctx context.Context) error {
@@ -288,36 +272,3 @@ func (a *Agent) heartbeatOnceV2(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) pollLoop(ctx context.Context) error {
-	backoff := time.Second
-	for ctx.Err() == nil {
-		task, err := a.client.NextTask(ctx)
-		if err == ErrUnauthorized {
-			return err
-		}
-		if err != nil {
-			a.logger.Warn("next-task error", "err", err)
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return nil
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-		backoff = time.Second
-		if task == nil {
-			continue // 204 → reconnect
-		}
-		exitCode := a.executeTask(ctx, task.TaskID, task.Command)
-		if err := a.client.Complete(ctx, task.TaskID, exitCode); err != nil {
-			if err == ErrUnauthorized {
-				return err
-			}
-			a.logger.Warn("complete failed", "err", err)
-		}
-	}
-	return nil
-}

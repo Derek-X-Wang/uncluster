@@ -18,7 +18,7 @@ func TestCertAudit_SignedEventWritten(t *testing.T) {
 	srv, st, _ := newTestServerWithCA(t)
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	callerPlaintext, callerID := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "audit-box")
 
@@ -91,7 +91,7 @@ func TestCertAudit_DeniedEventWritten_ACLMiss(t *testing.T) {
 	srv, st, _ := newTestServerWithCA(t)
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	callerPlaintext, callerID := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "audit-deny")
 
@@ -135,7 +135,7 @@ func TestCertAudit_FilterByOutcome(t *testing.T) {
 	srv, st, _ := newTestServerWithCA(t)
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	callerPlaintext, callerID := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "audit-filter")
 
@@ -189,7 +189,7 @@ func TestListCertEvents_Empty(t *testing.T) {
 	defer st.Close()
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 
 	req, _ := http.NewRequest("GET", ts.URL+"/v1/audit/certs", nil)
 	req.Header.Set("Authorization", "Bearer "+cliTok)

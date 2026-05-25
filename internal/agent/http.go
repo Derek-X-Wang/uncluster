@@ -84,57 +84,8 @@ func (c *ServerClient) Register(ctx context.Context, req api.AgentRegisterReques
 	return out, err
 }
 
-func (c *ServerClient) Heartbeat(ctx context.Context, metadata map[string]any) (api.HeartbeatResponse, error) {
-	var out api.HeartbeatResponse
-	_, err := c.do(ctx, "POST", "/v1/agent/heartbeat", api.HeartbeatRequest{Metadata: metadata}, &out)
-	return out, err
-}
-
 func (c *ServerClient) HeartbeatV2(ctx context.Context, req api.V2HeartbeatRequest) (api.V2HeartbeatResponse, error) {
 	var out api.V2HeartbeatResponse
 	_, err := c.do(ctx, "POST", "/v1/agent/heartbeat", req, &out)
 	return out, err
-}
-
-func (c *ServerClient) NextTask(ctx context.Context) (*api.NextTaskResponse, error) {
-	// Uses a separate HTTP client with longer timeout for long-poll.
-	req, err := http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/v1/agent/next-task", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	lpClient := &http.Client{Timeout: 45 * time.Second}
-	resp, err := lpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 401 {
-		return nil, ErrUnauthorized
-	}
-	if resp.StatusCode == 204 {
-		return nil, nil
-	}
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("next-task: %d: %s", resp.StatusCode, string(b))
-	}
-	var out api.NextTaskResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-func (c *ServerClient) UploadChunk(ctx context.Context, taskID, stream string, data []byte) (api.ChunkUploadResponse, error) {
-	var out api.ChunkUploadResponse
-	_, err := c.do(ctx, "POST", "/v1/agent/tasks/"+taskID+"/chunks",
-		api.ChunkUploadRequest{Stream: stream, Data: data}, &out)
-	return out, err
-}
-
-func (c *ServerClient) Complete(ctx context.Context, taskID string, exitCode int) error {
-	_, err := c.do(ctx, "POST", "/v1/agent/tasks/"+taskID+"/complete",
-		api.CompleteRequest{ExitCode: exitCode}, nil)
-	return err
 }

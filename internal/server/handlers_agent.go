@@ -5,8 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
 	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/store"
 	"github.com/derek-x-wang/uncluster/internal/token"
@@ -86,7 +84,6 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check for existing enrollment: idempotency-by-rejection for this slice.
-	// S2b's `agent install` adds self-healing; `agent join` errors if already enrolled.
 	if _, err := s.cfg.Store.GetAgentByName(r.Context(), req.Name); err == nil {
 		writeError(w, http.StatusConflict, "already enrolled")
 		return
@@ -133,28 +130,12 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Dispatch: V2 agent token → new heartbeat path; V1 node token → legacy path.
-	if ag, ok := ctx.Value(ctxAuthedAgent).(store.Agent); ok {
-		s.handleV2Heartbeat(w, r, ag)
+	ag, ok := r.Context().Value(ctxAuthedAgent).(store.Agent)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "agent context missing")
 		return
 	}
-
-	// V1 legacy path.
-	node := ctx.Value(ctxAuthedNode).(store.Node)
-	var req api.HeartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-	metaJSON, _ := json.Marshal(req.Metadata)
-	if err := s.cfg.Store.UpdateNodeHeartbeat(ctx, node.ID, string(metaJSON), time.Now()); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	cancels, _ := s.cfg.Store.PendingCancelsForNode(ctx, node.ID)
-	writeJSON(w, http.StatusOK, api.HeartbeatResponse{CancelTaskIDs: cancels})
+	s.handleV2Heartbeat(w, r, ag)
 }
 
 func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag store.Agent) {
@@ -221,100 +202,4 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 		Commands:        []any{},
 		FailClosedAfter: latestAg.FailClosedAfter,
 	})
-}
-
-func (s *Server) handleAgentChunks(w http.ResponseWriter, r *http.Request) {
-	node := r.Context().Value(ctxAuthedNode).(store.Node)
-	taskID := chi.URLParam(r, "id")
-
-	// Ownership check: task must belong to this node.
-	task, err := s.cfg.Store.GetTask(r.Context(), taskID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
-	if task.NodeID != node.ID {
-		writeError(w, http.StatusForbidden, "task not assigned to this node")
-		return
-	}
-
-	var req api.ChunkUploadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-
-	now := time.Now()
-	result, err := s.cfg.Store.AppendChunk(r.Context(), taskID, req.Stream, req.Data, now, s.cfg.OutputCapBytes)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	s.dispatcher.PublishChunk(taskID, DispatcherEvent{
-		Kind: "chunk",
-		Payload: api.ChunkOut{
-			Stream:    req.Stream,
-			Data:      req.Data,
-			CreatedAt: now.Unix(),
-		},
-	})
-
-	cancels, _ := s.cfg.Store.PendingCancelsForNode(r.Context(), node.ID)
-	writeJSON(w, http.StatusOK, api.ChunkUploadResponse{
-		Truncated:     result.Truncated,
-		CancelTaskIDs: cancels,
-	})
-}
-
-func (s *Server) handleAgentComplete(w http.ResponseWriter, r *http.Request) {
-	node := r.Context().Value(ctxAuthedNode).(store.Node)
-	taskID := chi.URLParam(r, "id")
-
-	// Ownership check: task must belong to this node.
-	task, err := s.cfg.Store.GetTask(r.Context(), taskID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
-	if task.NodeID != node.ID {
-		writeError(w, http.StatusForbidden, "task not assigned to this node")
-		return
-	}
-
-	var req api.CompleteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-
-	now := time.Now()
-	if err := s.cfg.Store.CompleteTask(r.Context(), taskID, req.ExitCode, now); err != nil {
-		switch err {
-		case store.ErrTaskCompleted:
-			writeError(w, http.StatusConflict, "task already completed")
-		case store.ErrNotFound:
-			writeError(w, http.StatusNotFound, "task not found")
-		default:
-			writeError(w, http.StatusInternalServerError, err.Error())
-		}
-		return
-	}
-
-	// Fetch final task state to include in the done event.
-	finalTask, err := s.cfg.Store.GetTask(r.Context(), taskID)
-	if err != nil {
-		// Non-fatal: publish best-effort done event with what we have.
-		finalTask = store.Task{ID: taskID, ExitCode: &req.ExitCode, Status: store.TaskSucceeded}
-	}
-
-	s.dispatcher.PublishChunk(taskID, DispatcherEvent{
-		Kind: "done",
-		Payload: map[string]any{
-			"exit_code": req.ExitCode,
-			"status":    string(finalTask.Status),
-		},
-	})
-
-	w.WriteHeader(http.StatusNoContent)
 }

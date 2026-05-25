@@ -19,7 +19,7 @@ func TestDeleteAgent_Returns204(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "rev-box")
 
 	req, _ := http.NewRequest("DELETE", ts.URL+"/v1/agents/"+agentID, nil)
@@ -39,7 +39,7 @@ func TestDeleteAgent_ByName(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	_, _ = mintAgentAndToken(t, st, ts, "rev-box-byname")
 
 	req, _ := http.NewRequest("DELETE", ts.URL+"/v1/agents/rev-box-byname", nil)
@@ -60,7 +60,7 @@ func TestRevokedAgent_Heartbeat_Returns410(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	agentID, agentTok := mintAgentAndToken(t, st, ts, "hb410-box")
 
 	// Revoke the agent.
@@ -102,7 +102,7 @@ func TestSetAgent_FailClosedAfter(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "fca-box")
 
 	secs := int64(3600)
@@ -137,7 +137,7 @@ func TestHeartbeat_IncludesFailClosedAfter(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	agentID, agentTok := mintAgentAndToken(t, st, ts, "hbfca-box")
 
 	// Set fail-closed-after.
@@ -178,7 +178,7 @@ func TestListAgents_ReturnsRegistered(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	mintAgentAndToken(t, st, ts, "list-box-1")
 	mintAgentAndToken(t, st, ts, "list-box-2")
 

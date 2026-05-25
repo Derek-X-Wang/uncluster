@@ -20,11 +20,11 @@ func newAuthTestSetup(t *testing.T) (*httptest.Server, store.Store, token.Token)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	tok, _ := token.Generate(token.KindCLI)
+	tok, _ := token.Generate(token.KindCaller)
 	hash, _ := token.HashSecret(tok.Secret)
 	// Poke the token directly into the store with our desired ID.
 	if _, err := st.(store.TestInsertHook).InsertTokenWithID(context.Background(),
-		tok.ID, store.TokenCLI, nil, hash, "test"); err != nil {
+		tok.ID, store.TokenCaller, nil, hash, "test"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -60,7 +60,7 @@ func TestAuthMiddleware_RejectsMissing(t *testing.T) {
 
 func TestAuthMiddleware_RejectsWrongSecret(t *testing.T) {
 	ts, _, tok := newAuthTestSetup(t)
-	bad := "uct_cli_" + tok.ID + "_" + strings("A", 52) // wrong secret
+	bad := "uct_caller_" + tok.ID + "_" + strings("A", 52) // wrong secret
 	req, _ := http.NewRequest("GET", ts.URL+"/__probe", nil)
 	req.Header.Set("Authorization", "Bearer "+bad)
 	resp, _ := http.DefaultClient.Do(req)

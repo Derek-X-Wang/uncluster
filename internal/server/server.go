@@ -14,10 +14,10 @@ import (
 )
 
 // MountProbeRoute is a test-only helper: returns a handler with a route
-// "/__probe" that requires a CLI bearer token. Used by middleware tests.
+// "/__probe" that requires a Caller bearer token. Used by middleware tests.
 func MountProbeRoute(s *Server) http.Handler {
 	r := http.NewServeMux()
-	r.Handle("/__probe", s.requireAuth(store.TokenCLI)(http.HandlerFunc(
+	r.Handle("/__probe", s.requireAuth(store.TokenCaller)(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })))
 	return r
 }
@@ -25,8 +25,6 @@ func MountProbeRoute(s *Server) http.Handler {
 type Config struct {
 	Store  store.Store
 	Logger *slog.Logger
-	// OutputCapBytes is the per-task output cap. Defaults to 10 MiB if zero.
-	OutputCapBytes int64
 	// CAPubkey is the authorized_keys-format SSH CA public key line returned to
 	// Agents at enrollment. When empty, the register handler returns an empty
 	// ca_pubkey (server started without bootstrap; cert signing will not work).
@@ -37,23 +35,16 @@ type Config struct {
 }
 
 type Server struct {
-	cfg        Config
-	dispatcher Dispatcher
-	handler    http.Handler
-	serial     atomic.Uint64 // monotonic cert serial
+	cfg     Config
+	handler http.Handler
+	serial  atomic.Uint64 // monotonic cert serial
 }
 
 func New(cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	if cfg.OutputCapBytes == 0 {
-		cfg.OutputCapBytes = 10 * 1024 * 1024
-	}
-	s := &Server{
-		cfg:        cfg,
-		dispatcher: newInProcessDispatcher(),
-	}
+	s := &Server{cfg: cfg}
 	s.handler = s.buildRouter()
 	return s
 }
@@ -74,7 +65,6 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 		defer cancel()
 		_ = hs.Shutdown(shutdownCtx)
 	}()
-	go s.runReaper(ctx)
 	s.cfg.Logger.Info("server listening", "addr", addr)
 	if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err

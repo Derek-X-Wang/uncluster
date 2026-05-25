@@ -16,8 +16,7 @@ type ctxKey string
 
 const (
 	ctxAuthedToken ctxKey = "authed_token"
-	ctxAuthedNode  ctxKey = "authed_node"  // store.Node — V1 agent tokens (node_id set)
-	ctxAuthedAgent ctxKey = "authed_agent" // store.Agent — V2 agent tokens (agent_id set)
+	ctxAuthedAgent ctxKey = "authed_agent" // store.Agent — V2 agent tokens
 )
 
 func (s *Server) requireAuth(requiredKind store.TokenKind) func(http.Handler) http.Handler {
@@ -53,32 +52,21 @@ func (s *Server) requireAuth(requiredKind store.TokenKind) func(http.Handler) ht
 			// the generic revoked-token check only for non-agent-token kinds.
 			ctx := context.WithValue(r.Context(), ctxAuthedToken, row)
 			if row.Kind == store.TokenAgent {
-				switch {
-				case row.AgentID != nil:
-					// V2: token linked to agents table.
-					ag, err := s.cfg.Store.GetAgent(r.Context(), *row.AgentID)
-					if err != nil {
-						writeError(w, http.StatusUnauthorized, "agent not found")
-						return
-					}
-					if ag.Status == store.AgentRevoked {
-						// 410 Gone signals explicit deprovision; agent must wipe principals.
-						writeJSON(w, http.StatusGone, api.RevokedResponse{Reason: "node_revoked"})
-						return
-					}
-					ctx = context.WithValue(ctx, ctxAuthedAgent, ag)
-				case row.NodeID != nil:
-					// V1: token linked to nodes table.
-					node, err := s.cfg.Store.GetNode(r.Context(), *row.NodeID)
-					if err != nil || node.Status == store.NodeRevoked {
-						writeError(w, http.StatusUnauthorized, "node revoked")
-						return
-					}
-					ctx = context.WithValue(ctx, ctxAuthedNode, node)
-				default:
+				if row.AgentID == nil {
 					writeError(w, http.StatusUnauthorized, "agent token has no linked record")
 					return
 				}
+				ag, err := s.cfg.Store.GetAgent(r.Context(), *row.AgentID)
+				if err != nil {
+					writeError(w, http.StatusUnauthorized, "agent not found")
+					return
+				}
+				if ag.Status == store.AgentRevoked {
+					// 410 Gone signals explicit deprovision; agent must wipe principals.
+					writeJSON(w, http.StatusGone, api.RevokedResponse{Reason: "node_revoked"})
+					return
+				}
+				ctx = context.WithValue(ctx, ctxAuthedAgent, ag)
 				// For agent tokens, skip generic revoked-token check: the agent-record
 				// check above already handled the revoked case with a 410.
 			} else {

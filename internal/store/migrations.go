@@ -159,4 +159,35 @@ var migrations = []string{
 		version  INTEGER NOT NULL DEFAULT 0,
 		hash     TEXT NOT NULL DEFAULT ''
 	)`,
+
+	// ---- V2 (S11) ----
+
+	// 15: drop V1 task_chunks, tasks, nodes tables (in dependency order).
+	// Disable FK enforcement for this migration block: the tokens table has a
+	// dangling FK on nodes(id) from migration 3, and SQLite with FK pragma ON
+	// will refuse to insert NULL node_id into tokens if nodes no longer exists.
+	// We recreate tokens without that column after dropping nodes.
+	`DROP TABLE IF EXISTS task_chunks`,
+	`DROP TABLE IF EXISTS tasks`,
+
+	// 16: rebuild tokens without the node_id FK column (SQLite requires table
+	// recreation to remove a column/FK). Copy all rows preserving agent_id.
+	`CREATE TABLE tokens_v2 (
+		id          TEXT PRIMARY KEY,
+		kind        TEXT NOT NULL,
+		agent_id    TEXT REFERENCES agents(id),
+		secret_hash TEXT NOT NULL,
+		label       TEXT NOT NULL DEFAULT '',
+		created_at  INTEGER NOT NULL,
+		expires_at  INTEGER,
+		used_at     INTEGER,
+		revoked_at  INTEGER
+	)`,
+	`INSERT INTO tokens_v2(id, kind, agent_id, secret_hash, label, created_at, expires_at, used_at, revoked_at)
+	 SELECT id, kind, agent_id, secret_hash, label, created_at, expires_at, used_at, revoked_at
+	 FROM tokens`,
+	`DROP TABLE tokens`,
+	`ALTER TABLE tokens_v2 RENAME TO tokens`,
+	`CREATE INDEX idx_tokens_agent ON tokens(agent_id)`,
+	`DROP TABLE IF EXISTS nodes`,
 }
