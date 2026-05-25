@@ -50,7 +50,10 @@ func TestCertAudit_SignedEventWritten(t *testing.T) {
 	// Query audit log.
 	auditReq, _ := http.NewRequest("GET", ts.URL+"/v1/audit/certs", nil)
 	auditReq.Header.Set("Authorization", "Bearer "+cliTok)
-	auditResp, _ := http.DefaultClient.Do(auditReq)
+	auditResp, err := http.DefaultClient.Do(auditReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer auditResp.Body.Close()
 	if auditResp.StatusCode != http.StatusOK {
 		t.Fatalf("audit list: status=%d", auditResp.StatusCode)
@@ -113,7 +116,10 @@ func TestCertAudit_DeniedEventWritten_ACLMiss(t *testing.T) {
 	// Query audit log.
 	auditReq, _ := http.NewRequest("GET", ts.URL+"/v1/audit/certs?caller="+callerID, nil)
 	auditReq.Header.Set("Authorization", "Bearer "+cliTok)
-	auditResp, _ := http.DefaultClient.Do(auditReq)
+	auditResp, err := http.DefaultClient.Do(auditReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer auditResp.Body.Close()
 
 	var events []api.CertEventSummary
@@ -166,7 +172,10 @@ func TestCertAudit_FilterByOutcome(t *testing.T) {
 		u := ts.URL + "/v1/audit/certs?outcome=" + outcome
 		req, _ := http.NewRequest("GET", u, nil)
 		req.Header.Set("Authorization", "Bearer "+cliTok)
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer resp.Body.Close()
 		var events []api.CertEventSummary
 		json.NewDecoder(resp.Body).Decode(&events)
@@ -193,7 +202,10 @@ func TestListCertEvents_Empty(t *testing.T) {
 
 	req, _ := http.NewRequest("GET", ts.URL+"/v1/audit/certs", nil)
 	req.Header.Set("Authorization", "Bearer "+cliTok)
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)

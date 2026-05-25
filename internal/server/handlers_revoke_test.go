@@ -81,7 +81,10 @@ func TestRevokedAgent_Heartbeat_Returns410(t *testing.T) {
 	hbReq, _ := http.NewRequest("POST", ts.URL+"/v1/agent/heartbeat", bytes.NewReader(hbBody))
 	hbReq.Header.Set("Authorization", "Bearer "+agentTok)
 	hbReq.Header.Set("Content-Type", "application/json")
-	hbResp, _ := http.DefaultClient.Do(hbReq)
+	hbResp, err := http.DefaultClient.Do(hbReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer hbResp.Body.Close()
 
 	if hbResp.StatusCode != http.StatusGone {
@@ -120,7 +123,10 @@ func TestSetAgent_FailClosedAfter(t *testing.T) {
 	// Verify GET returns the updated value.
 	getReq, _ := http.NewRequest("GET", ts.URL+"/v1/agents/"+agentID, nil)
 	getReq.Header.Set("Authorization", "Bearer "+cliTok)
-	getResp, _ := http.DefaultClient.Do(getReq)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer getResp.Body.Close()
 	var detail api.AgentDetail
 	json.NewDecoder(getResp.Body).Decode(&detail)
@@ -158,7 +164,10 @@ func TestHeartbeat_IncludesFailClosedAfter(t *testing.T) {
 	hbReq, _ := http.NewRequest("POST", ts.URL+"/v1/agent/heartbeat", bytes.NewReader(hbBody))
 	hbReq.Header.Set("Authorization", "Bearer "+agentTok)
 	hbReq.Header.Set("Content-Type", "application/json")
-	hbResp, _ := http.DefaultClient.Do(hbReq)
+	hbResp, err := http.DefaultClient.Do(hbReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer hbResp.Body.Close()
 
 	if hbResp.StatusCode != http.StatusOK {
@@ -184,7 +193,10 @@ func TestListAgents_ReturnsRegistered(t *testing.T) {
 
 	req, _ := http.NewRequest("GET", ts.URL+"/v1/agents", nil)
 	req.Header.Set("Authorization", "Bearer "+cliTok)
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
