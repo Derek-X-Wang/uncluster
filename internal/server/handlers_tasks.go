@@ -105,6 +105,12 @@ func (s *Server) handleAgentNextTask(w http.ResponseWriter, r *http.Request) {
 	for {
 		task, err := s.cfg.Store.ClaimNextPending(ctx, node.ID, time.Now())
 		if err != nil {
+			// ctx may have expired between Wait and Claim (CI is slower than dev);
+			// distinguish ctx-done from real errors to avoid spurious 500s.
+			if ctx.Err() != nil {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -117,18 +123,12 @@ func (s *Server) handleAgentNextTask(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// No task available — wait for a wakeup or timeout.
-		waitErr := s.dispatcher.Wait(ctx, node.ID, time.Until(deadline(ctx)))
-		if waitErr != nil {
-			// ctx cancelled or timed out — check which.
-			select {
-			case <-ctx.Done():
-				w.WriteHeader(http.StatusNoContent)
-				return
-			default:
-				// Spurious or other error; loop to re-try ClaimNextPending.
-			}
+		_ = s.dispatcher.Wait(ctx, node.ID, time.Until(deadline(ctx)))
+		if ctx.Err() != nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
 		}
-		// After any wakeup (spurious or real) re-attempt ClaimNextPending.
+		// Spurious / Notify wakeup with ctx still live — loop and retry Claim.
 	}
 }
 
