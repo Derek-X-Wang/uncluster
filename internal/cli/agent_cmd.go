@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kardianos/service"
 	"github.com/spf13/cobra"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
 	"github.com/derek-x-wang/uncluster/internal/api"
+	"github.com/derek-x-wang/uncluster/internal/gatekeeper"
 )
 
 func newAgentCmd() *cobra.Command {
@@ -47,23 +47,89 @@ func newAgentCmd() *cobra.Command {
 	}
 	cmd.AddCommand(run)
 
-	install := &cobra.Command{
-		Use:   "install",
-		Short: "Install the agent as a user service (launchd on macOS, systemd user on Linux)",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return svcAction("install")
-		},
-	}
-	uninstall := &cobra.Command{
-		Use:   "uninstall",
-		Short: "Uninstall the agent service",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return svcAction("uninstall")
-		},
-	}
-	cmd.AddCommand(install, uninstall)
+	install := newAgentInstallCmd()
+	cmd.AddCommand(install)
+
+	doctor := newAgentDoctorCmd()
+	cmd.AddCommand(doctor)
 
 	return cmd
+}
+
+func newAgentInstallCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "install",
+		Short: "Privileged install: configure sshd, create service account, and start system service (requires root)",
+		Long: `Writes CA pubkey and sshd drop-in config, creates the low-priv service account,
+installs the agent as a system service (launchd on macOS, systemd on Linux),
+and reloads sshd. Must run as root (sudo).
+
+Re-running is safe — install is idempotent and self-heals drift.`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfgPath, err := agent.DefaultConfigPath()
+			if err != nil {
+				return err
+			}
+			cfg, err := agent.LoadConfig(cfgPath)
+			if err != nil {
+				return fmt.Errorf("load agent config: %w (run `uncluster agent join` first)", err)
+			}
+			if cfg.AgentToken == "" {
+				return fmt.Errorf("agent not enrolled; run `uncluster agent join` first")
+			}
+			if cfg.CAPubkey == "" {
+				return fmt.Errorf("CA pubkey missing from agent config; re-enroll")
+			}
+
+			exe, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("resolve executable: %w", err)
+			}
+
+			if err := gatekeeper.Install(cmd.Context(), cfg, exe); err != nil {
+				return fmt.Errorf("install: %w", err)
+			}
+
+			fmt.Fprintln(cmd.OutOrStdout(), "install complete — run `uncluster agent doctor` to verify")
+			return nil
+		},
+	}
+}
+
+func newAgentDoctorCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "doctor",
+		Short: "Check gatekeeper configuration state (no mutations). Exit 0=ok, 1=warn, 2=fail.",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfgPath, err := agent.DefaultConfigPath()
+			if err != nil {
+				return err
+			}
+			cfg, err := agent.LoadConfig(cfgPath)
+			if err != nil {
+				return fmt.Errorf("load agent config: %w", err)
+			}
+
+			results := gatekeeper.Doctor(cmd.Context(), cfg)
+
+			statusLabel := map[gatekeeper.CheckStatus]string{
+				gatekeeper.CheckOK:   "ok  ",
+				gatekeeper.CheckWarn: "warn",
+				gatekeeper.CheckFail: "FAIL",
+			}
+			for _, r := range results {
+				fmt.Fprintf(cmd.OutOrStdout(), "[%s] %-30s %s\n", statusLabel[r.Status], r.Name, r.Message)
+			}
+
+			code := results.ExitCode()
+			if code != 0 {
+				// Return a typed error so cobra prints nothing extra but os.Exit
+				// still gets the right code via the root command's exit handler.
+				return &exitCodeError{code: code}
+			}
+			return nil
+		},
+	}
 }
 
 func newAgentJoinCmd() *cobra.Command {
@@ -145,28 +211,9 @@ is self-healing.`,
 	return join
 }
 
-func svcAction(action string) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	svcCfg := &service.Config{
-		Name:        "com.uncluster.agent",
-		DisplayName: "Uncluster Agent",
-		Description: "Uncluster node agent",
-		Executable:  exe,
-		Arguments:   []string{"agent", "run"},
-		Option:      map[string]interface{}{"UserService": true},
-	}
-	prg := &agentService{}
-	s, err := service.New(prg, svcCfg)
-	if err != nil {
-		return err
-	}
-	return service.Control(s, action)
-}
+// exitCodeError is a sentinel that carries a non-zero exit code without
+// printing an error message (cobra prints the message from error.Error()).
+type exitCodeError struct{ code int }
 
-type agentService struct{}
-
-func (a *agentService) Start(service.Service) error { return nil }
-func (a *agentService) Stop(service.Service) error  { return nil }
+func (e *exitCodeError) Error() string { return "" }
+func (e *exitCodeError) ExitCode() int { return e.code }

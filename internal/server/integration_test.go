@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -48,6 +49,12 @@ func mintV1NodeAndToken(t *testing.T, st store.Store, name string) (nodeID, agen
 // Note: Uses V1 node+token path directly (no register endpoint) because the
 // V1 heartbeat / task handlers still operate on the nodes table.
 func TestEndToEnd_RunCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("V1 task execution (bash + process groups) not supported on Windows")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
 	// ------------------------------------------------------------------
 	// 1. Store + server + httptest
 	// ------------------------------------------------------------------
@@ -377,6 +384,9 @@ func TestAcceptance_NoDoubleClaim(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAcceptance_SilentCommandCancel(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("V1 task execution (bash + process groups) not supported on Windows")
+	}
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
 	}
@@ -406,6 +416,9 @@ func TestAcceptance_SilentCommandCancel(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAcceptance_OutputCap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("V1 task execution (bash + process groups) not supported on Windows")
+	}
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
 	}
