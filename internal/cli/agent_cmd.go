@@ -75,16 +75,30 @@ func newAgentJoinCmd() *cobra.Command {
 
 	join := &cobra.Command{
 		Use:   "join",
-		Short: "Register this machine as an agent node with an Uncluster server",
+		Short: "Register this machine as an Agent with an Uncluster Control plane",
 		Long: `Register this machine with an Uncluster control plane using a join token.
 The join token must be supplied via --token-stdin or the UNCLUSTER_TOKEN env var.
-Never pass the token as a command-line argument.`,
+Never pass the token as a command-line argument.
+
+If this machine is already enrolled (agent.toml already exists with a token),
+this command returns an error. Run ` + "`uncluster agent install`" + ` instead, which
+is self-healing.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if server == "" {
 				return fmt.Errorf("--server is required")
 			}
 			if name == "" {
 				return fmt.Errorf("--name is required")
+			}
+
+			cfgPath, err := agent.DefaultConfigPath()
+			if err != nil {
+				return fmt.Errorf("config path: %w", err)
+			}
+
+			// Idempotency-by-rejection: if already enrolled, refuse.
+			if existing, err := agent.LoadConfig(cfgPath); err == nil && existing.AgentToken != "" {
+				return fmt.Errorf("already enrolled (agent_id=%s); remove %s to re-enroll", existing.AgentID, cfgPath)
 			}
 
 			tok, err := ReadSecretToken(tokenStdin)
@@ -102,27 +116,30 @@ Never pass the token as a command-line argument.`,
 				return fmt.Errorf("register: %w", err)
 			}
 
-			cfgPath, err := agent.DefaultConfigPath()
-			if err != nil {
-				return fmt.Errorf("config path: %w", err)
-			}
 			cfg := agent.Config{
 				Server:     server,
-				NodeID:     resp.NodeID,
-				NodeName:   name,
+				AgentID:    resp.AgentID,
+				AgentName:  name,
 				AgentToken: resp.AgentToken,
+				CAPubkey:   resp.CAPubkey,
+				ServerHTTPSPin: resp.ServerHTTPSPin,
+				ExpectedPaths: agent.ExpectedPaths{
+					CAPubkey:      resp.ExpectedPaths.CAPubkey,
+					SSHDropIn:     resp.ExpectedPaths.SSHDropIn,
+					PrincipalsDir: resp.ExpectedPaths.PrincipalsDir,
+				},
 			}
 			if err := agent.SaveConfig(cfgPath, cfg); err != nil {
 				return fmt.Errorf("save config: %w", err)
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "registered: node_id=%s  config=%s\n", resp.NodeID, cfgPath)
+			fmt.Fprintf(cmd.OutOrStdout(), "registered: agent_id=%s  config=%s\n", resp.AgentID, cfgPath)
 			return nil
 		},
 	}
 
 	join.Flags().StringVar(&server, "server", "", "control plane URL, e.g. https://uncluster.example.com (required)")
-	join.Flags().StringVar(&name, "name", "", "human-readable name for this agent node (required)")
+	join.Flags().StringVar(&name, "name", "", "human-readable name for this Agent (required)")
 	join.Flags().BoolVar(&tokenStdin, "token-stdin", false, "read join token from stdin (first line); alternatively set UNCLUSTER_TOKEN")
 
 	return join

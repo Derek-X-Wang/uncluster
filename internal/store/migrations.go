@@ -135,4 +135,12 @@ var migrations = []string{
 		last_apply_error  TEXT,
 		last_apply_at     INTEGER
 	)`,
+
+	// ---- V2 (S2a) ----
+
+	// 12: link agent tokens to the V2 agents table. The V1 tokens.node_id
+	// column stays intact for V1 node tokens. V2 agent tokens use agent_id
+	// instead; node_id is left NULL for those rows.
+	`ALTER TABLE tokens ADD COLUMN agent_id TEXT REFERENCES agents(id)`,
+	`CREATE INDEX idx_tokens_agent ON tokens(agent_id)`,
 }

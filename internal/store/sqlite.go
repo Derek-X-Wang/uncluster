@@ -87,9 +87,9 @@ func (s *sqliteStore) CreateToken(ctx context.Context, p NewTokenParams) (Token,
 		expiresAt = &v
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO tokens(id, kind, node_id, secret_hash, label, created_at, expires_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		id, string(p.Kind), p.NodeID, p.SecretHash, p.Label, now.Unix(), expiresAt)
+		`INSERT INTO tokens(id, kind, node_id, agent_id, secret_hash, label, created_at, expires_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, string(p.Kind), p.NodeID, p.AgentID, p.SecretHash, p.Label, now.Unix(), expiresAt)
 	if err != nil {
 		return Token{}, fmt.Errorf("insert token: %w", err)
 	}
@@ -98,14 +98,14 @@ func (s *sqliteStore) CreateToken(ctx context.Context, p NewTokenParams) (Token,
 
 func (s *sqliteStore) GetTokenByID(ctx context.Context, id string) (Token, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, kind, node_id, secret_hash, label, created_at, expires_at, used_at, revoked_at
+		`SELECT id, kind, node_id, agent_id, secret_hash, label, created_at, expires_at, used_at, revoked_at
 		 FROM tokens WHERE id = ?`, id)
 	return scanToken(row)
 }
 
 func (s *sqliteStore) ListTokens(ctx context.Context) ([]Token, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, kind, node_id, secret_hash, label, created_at, expires_at, used_at, revoked_at
+		`SELECT id, kind, node_id, agent_id, secret_hash, label, created_at, expires_at, used_at, revoked_at
 		 FROM tokens ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -170,11 +170,12 @@ func scanToken(r rowScanner) (Token, error) {
 	var (
 		t                            Token
 		nodeID                       sql.NullString
+		agentID                      sql.NullString
 		label                        sql.NullString
 		expiresAt, usedAt, revokedAt sql.NullInt64
 		createdAt                    int64
 	)
-	if err := r.Scan(&t.ID, &t.Kind, &nodeID, &t.SecretHash, &label, &createdAt, &expiresAt, &usedAt, &revokedAt); err != nil {
+	if err := r.Scan(&t.ID, &t.Kind, &nodeID, &agentID, &t.SecretHash, &label, &createdAt, &expiresAt, &usedAt, &revokedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Token{}, ErrNotFound
 		}
@@ -184,6 +185,10 @@ func scanToken(r rowScanner) (Token, error) {
 	if nodeID.Valid {
 		v := nodeID.String
 		t.NodeID = &v
+	}
+	if agentID.Valid {
+		v := agentID.String
+		t.AgentID = &v
 	}
 	if label.Valid {
 		t.Label = label.String
@@ -345,6 +350,61 @@ func containsAny(s string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// ------------- agents (V2) -------------
+
+func (s *sqliteStore) CreateAgent(ctx context.Context, p NewAgentParams) (Agent, error) {
+	id := "ag_" + shortID(24)
+	now := time.Now()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO agents(id, name, created_at, status, agent_version)
+		 VALUES(?, ?, ?, ?, '')`,
+		id, p.Name, now.Unix(), string(AgentOnline))
+	if err != nil {
+		if isUniqueViolation(err) {
+			return Agent{}, ErrAgentNameTaken
+		}
+		return Agent{}, fmt.Errorf("insert agent: %w", err)
+	}
+	return s.GetAgent(ctx, id)
+}
+
+func (s *sqliteStore) GetAgent(ctx context.Context, id string) (Agent, error) {
+	return s.queryAgent(ctx, `WHERE id = ?`, id)
+}
+
+func (s *sqliteStore) GetAgentByName(ctx context.Context, name string) (Agent, error) {
+	return s.queryAgent(ctx, `WHERE name = ?`, name)
+}
+
+func (s *sqliteStore) queryAgent(ctx context.Context, where string, arg any) (Agent, error) {
+	q := `SELECT id, name, created_at, last_seen_at, status, agent_version FROM agents ` + where
+	return scanAgent(s.db.QueryRowContext(ctx, q, arg))
+}
+
+func scanAgent(r rowScanner) (Agent, error) {
+	var (
+		a            Agent
+		lastSeen     sql.NullInt64
+		agentVersion sql.NullString
+		createdAt    int64
+	)
+	if err := r.Scan(&a.ID, &a.Name, &createdAt, &lastSeen, &a.Status, &agentVersion); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Agent{}, ErrNotFound
+		}
+		return Agent{}, err
+	}
+	a.CreatedAt = time.Unix(createdAt, 0)
+	if lastSeen.Valid {
+		v := time.Unix(lastSeen.Int64, 0)
+		a.LastSeenAt = &v
+	}
+	if agentVersion.Valid {
+		a.AgentVersion = agentVersion.String
+	}
+	return a, nil
 }
 
 // ------------- tasks -------------
@@ -691,8 +751,8 @@ type TestInsertHook interface {
 func (s *sqliteStore) InsertTokenWithID(ctx context.Context, id string, kind TokenKind, nodeID *string, secretHash, label string) (Token, error) {
 	now := time.Now()
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO tokens(id, kind, node_id, secret_hash, label, created_at)
-		 VALUES(?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tokens(id, kind, node_id, agent_id, secret_hash, label, created_at)
+		 VALUES(?, ?, ?, NULL, ?, ?, ?)`,
 		id, string(kind), nodeID, secretHash, label, now.Unix())
 	if err != nil {
 		return Token{}, err

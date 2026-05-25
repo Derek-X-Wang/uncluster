@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -30,10 +31,17 @@ func newServerCmd() *cobra.Command {
 			caPath = resolveCAPath(caPath)
 
 			// If a CA file exists, verify mode before we accept any traffic.
-			// Absent CA = warn but allow start (cert signing simply won't work).
+			// Absent CA = warn but allow start (cert signing and enrollment CA
+			// pubkey delivery simply won't work).
+			var caPubkeyLine string
+			caPubPath := caPath + ".pub"
 			if _, err := os.Stat(caPath); err == nil {
 				if _, err := ca.LoadPrivateFromDisk(caPath); err != nil {
 					return fmt.Errorf("ca check: %w", err)
+				}
+				// Read the public key line to embed in enrollment responses.
+				if b, err := os.ReadFile(caPubPath); err == nil {
+					caPubkeyLine = strings.TrimSpace(string(b))
 				}
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("ca stat: %w", err)
@@ -48,7 +56,7 @@ func newServerCmd() *cobra.Command {
 			}
 			defer st.Close()
 
-			srv := server.New(server.Config{Store: st})
+			srv := server.New(server.Config{Store: st, CAPubkey: caPubkeyLine})
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer cancel()
 			return srv.Start(ctx, addr)

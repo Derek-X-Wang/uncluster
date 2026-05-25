@@ -12,6 +12,40 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/token"
 )
 
+// expectedPaths returns the canonical SSH-related paths for the given GOOS
+// platform string (as reported in metadata["os"] by the Agent). Defaults to
+// POSIX paths for unknown platforms.
+func expectedPaths(goos string) api.ExpectedPaths {
+	switch goos {
+	case "windows":
+		return api.ExpectedPaths{
+			CAPubkey:      `C:\ProgramData\ssh\uncluster_ca.pub`,
+			SSHDropIn:     `C:\ProgramData\ssh\sshd_config.d\uncluster.conf`,
+			PrincipalsDir: `C:\ProgramData\ssh\auth_principals`,
+		}
+	default: // linux, darwin, and anything else
+		return api.ExpectedPaths{
+			CAPubkey:      "/etc/ssh/uncluster_ca.pub",
+			SSHDropIn:     "/etc/ssh/sshd_config.d/uncluster.conf",
+			PrincipalsDir: "/etc/ssh/auth_principals",
+		}
+	}
+}
+
+// osFromMetadata extracts the "os" string from request metadata. Returns an
+// empty string when absent.
+func osFromMetadata(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m["os"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
 func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 	var req api.AgentRegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -51,12 +85,19 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	metaJSON, _ := json.Marshal(req.Metadata)
-	node, err := s.cfg.Store.CreateNode(r.Context(), store.NewNodeParams{
-		Name: req.Name, Metadata: string(metaJSON),
+	// Check for existing enrollment: idempotency-by-rejection for this slice.
+	// S2b's `agent install` adds self-healing; `agent join` errors if already enrolled.
+	if _, err := s.cfg.Store.GetAgentByName(r.Context(), req.Name); err == nil {
+		writeError(w, http.StatusConflict, "already enrolled")
+		return
+	}
+
+	// Create V2 Agent record.
+	ag, err := s.cfg.Store.CreateAgent(r.Context(), store.NewAgentParams{
+		Name: req.Name,
 	})
 	if err != nil {
-		if err == store.ErrNameTaken {
+		if err == store.ErrAgentNameTaken {
 			writeError(w, http.StatusConflict, "name already in use")
 			return
 		}
@@ -70,9 +111,9 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash, _ := token.HashSecret(agentTok.Secret)
-	nid := node.ID
+	aid := ag.ID
 	if _, err := s.cfg.Store.CreateToken(r.Context(), store.NewTokenParams{
-		ID: agentTok.ID, Kind: store.TokenAgent, NodeID: &nid, SecretHash: hash, Label: "agent:" + node.Name,
+		ID: agentTok.ID, Kind: store.TokenAgent, AgentID: &aid, SecretHash: hash, Label: "agent:" + ag.Name,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -82,8 +123,12 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	goos := osFromMetadata(req.Metadata)
 	writeJSON(w, http.StatusOK, api.AgentRegisterResponse{
-		NodeID: node.ID, AgentToken: agentTok.String(),
+		AgentID:       ag.ID,
+		AgentToken:    agentTok.String(),
+		CAPubkey:      s.cfg.CAPubkey,
+		ExpectedPaths: expectedPaths(goos),
 	})
 }
 

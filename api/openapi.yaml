@@ -341,12 +341,26 @@ components:
         join_token: { type: string }
         name: { type: string }
         metadata: { type: object, additionalProperties: true }
+    ExpectedPaths:
+      type: object
+      required: [ca_pubkey, sshd_drop_in, principals_dir]
+      properties:
+        ca_pubkey: { type: string, description: "Absolute path for the CA public key file" }
+        sshd_drop_in: { type: string, description: "Absolute path for the sshd config drop-in" }
+        principals_dir: { type: string, description: "Absolute path for the AuthorizedPrincipalsFile directory" }
     AgentRegisterResponse:
       type: object
-      required: [node_id, agent_token]
+      required: [agent_id, agent_token, ca_pubkey, expected_paths]
       properties:
-        node_id: { type: string }
-        agent_token: { type: string }
+        agent_id: { type: string }
+        agent_token: { type: string, description: "Plaintext agent token; shown exactly once" }
+        ca_pubkey: { type: string, description: "authorized_keys-format CA public key line" }
+        server_https_pin:
+          type: string
+          nullable: true
+          description: "sha256:<hex> of TLS cert; empty when not pinned"
+        expected_paths:
+          $ref: "#/components/schemas/ExpectedPaths"
     HeartbeatRequest:
       type: object
       properties:
