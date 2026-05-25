@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -231,20 +232,30 @@ func TestWritePrivateRefusesOverwriteAndEnforcesMode(t *testing.T) {
 	if err := WritePrivateToDisk(path, bytes); err != nil {
 		t.Fatalf("first write: %v", err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
+	// Mode enforcement: POSIX mode bits are not enforced on Windows.
+	// TODO(S9a): restore this coverage via Windows ACL check.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("file mode = %#o, want 0600", mode)
+		}
 	}
-	if mode := info.Mode().Perm(); mode != 0o600 {
-		t.Errorf("file mode = %#o, want 0600", mode)
-	}
-	// Refuse overwrite.
+	// Refuse overwrite — works on all platforms.
 	if err := WritePrivateToDisk(path, bytes); err == nil {
 		t.Error("expected refusal to overwrite existing CA key")
 	}
 }
 
 func TestLoadPrivateRejectsLoosePerms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// POSIX mode bits are not enforced on Windows; LoadPrivateFromDisk skips
+		// the mode check on Windows. ACL-based restriction is deferred to S9a.
+		// TODO(S9a): restore via Windows ACL check.
+		t.Skip("POSIX mode bits not enforced on Windows; see follow-up for ACL-based check")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ca")
 	priv, _, _ := Generate()

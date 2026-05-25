@@ -3,6 +3,7 @@ package agent_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
@@ -59,7 +60,12 @@ func TestConfigAlreadyEnrolledCheck(t *testing.T) {
 
 // TestSaveConfigMode0600 verifies that SaveConfig writes the file with mode 0600.
 // Acceptance criteria: `uncluster agent join` persists config with mode 0600.
+// Skipped on Windows: POSIX mode bits are not enforced by the Windows filesystem.
+// TODO(S9a): restore via Windows ACL check (icacls/SetNamedSecurityInfo).
 func TestSaveConfigMode0600(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode bits not enforced on Windows; see follow-up for ACL-based check")
+	}
 	p := filepath.Join(t.TempDir(), "agent.toml")
 	if err := agent.SaveConfig(p, agent.Config{Server: "https://x", AgentToken: "tok"}); err != nil {
 		t.Fatal(err)
