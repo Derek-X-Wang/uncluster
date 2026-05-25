@@ -7,11 +7,24 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// ExpectedPaths mirrors api.ExpectedPaths as a persisted struct so the agent
+// config can store the paths returned by the Control plane at enrollment.
+type ExpectedPaths struct {
+	CAPubkey      string `toml:"ca_pubkey"`
+	SSHDropIn     string `toml:"sshd_drop_in"`
+	PrincipalsDir string `toml:"principals_dir"`
+}
+
+// Config is the agent's persisted configuration. Written by `uncluster agent
+// join` and read by `uncluster agent run`. Mode 0600 on disk.
 type Config struct {
-	Server     string `toml:"server"`
-	NodeID     string `toml:"node_id"`
-	NodeName   string `toml:"node_name"`
-	AgentToken string `toml:"agent_token"`
+	Server         string        `toml:"server"`
+	AgentID        string        `toml:"agent_id"`
+	AgentName      string        `toml:"agent_name"`
+	AgentToken     string        `toml:"agent_token"`
+	CAPubkey       string        `toml:"ca_pubkey"`
+	ServerHTTPSPin string        `toml:"server_https_pin,omitempty"`
+	ExpectedPaths  ExpectedPaths `toml:"expected_paths"`
 }
 
 func DefaultConfigPath() (string, error) {

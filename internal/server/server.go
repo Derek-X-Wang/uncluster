@@ -24,6 +24,10 @@ type Config struct {
 	Logger *slog.Logger
 	// OutputCapBytes is the per-task output cap. Defaults to 10 MiB if zero.
 	OutputCapBytes int64
+	// CAPubkey is the authorized_keys-format SSH CA public key line returned to
+	// Agents at enrollment. When empty, the register handler returns an empty
+	// ca_pubkey (server started without bootstrap; cert signing will not work).
+	CAPubkey string
 }
 
 type Server struct {

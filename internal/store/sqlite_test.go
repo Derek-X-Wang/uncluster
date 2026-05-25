@@ -288,6 +288,76 @@ func TestAppendChunk_OutputCap(t *testing.T) {
 	}
 }
 
+// ---- V2 Agent store tests ----
+
+func TestCreateAndGetAgent(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	ag, err := s.CreateAgent(ctx, store.NewAgentParams{Name: "linux-box"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ag.ID == "" || ag.Name != "linux-box" {
+		t.Fatalf("unexpected agent: %+v", ag)
+	}
+	if ag.Status != store.AgentOnline {
+		t.Fatalf("status: got %s want online", ag.Status)
+	}
+
+	got, err := s.GetAgent(ctx, ag.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != ag.ID {
+		t.Fatalf("GetAgent mismatch: %+v vs %+v", got, ag)
+	}
+
+	byName, err := s.GetAgentByName(ctx, "linux-box")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byName.ID != ag.ID {
+		t.Fatalf("GetAgentByName mismatch: %+v", byName)
+	}
+}
+
+func TestCreateAgentRejectsDuplicateName(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateAgent(ctx, store.NewAgentParams{Name: "dup"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.CreateAgent(ctx, store.NewAgentParams{Name: "dup"})
+	if err == nil || !errors.Is(err, store.ErrAgentNameTaken) {
+		t.Fatalf("expected ErrAgentNameTaken, got: %v", err)
+	}
+}
+
+func TestCreateAgentTokenLinksAgentID(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	ag, _ := s.CreateAgent(ctx, store.NewAgentParams{Name: "mac"})
+	tok, err := s.CreateToken(ctx, store.NewTokenParams{
+		Kind:       store.TokenAgent,
+		AgentID:    &ag.ID,
+		SecretHash: "h",
+		Label:      "agent:mac",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTokenByID(ctx, tok.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentID == nil || *got.AgentID != ag.ID {
+		t.Fatalf("AgentID mismatch: %v", got.AgentID)
+	}
+	if got.NodeID != nil {
+		t.Fatalf("NodeID should be nil for V2 agent token, got: %v", got.NodeID)
+	}
+}
+
 func TestListChunks_PerStream(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

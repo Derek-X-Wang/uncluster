@@ -55,9 +55,23 @@ type AgentRegisterRequest struct {
 	Metadata  map[string]any `json:"metadata"`
 }
 
+// ExpectedPaths holds the canonical SSH-related file paths the Agent should
+// manage on disk. Values are resolved by the Control plane at enrollment time
+// based on the registering platform (linux/darwin vs. windows).
+type ExpectedPaths struct {
+	CAPubkey      string `json:"ca_pubkey"`
+	SSHDropIn     string `json:"sshd_drop_in"`
+	PrincipalsDir string `json:"principals_dir"`
+}
+
+// AgentRegisterResponse is the V2 enrollment response from the Control plane.
+// The agent_token is plaintext and shown exactly once; the caller must persist it.
 type AgentRegisterResponse struct {
-	NodeID     string `json:"node_id"`
-	AgentToken string `json:"agent_token"` // plaintext, shown once
+	AgentID        string        `json:"agent_id"`
+	AgentToken     string        `json:"agent_token"`              // plaintext, shown once
+	CAPubkey       string        `json:"ca_pubkey"`                // authorized_keys-format line
+	ServerHTTPSPin string        `json:"server_https_pin,omitempty"` // sha256:<hex>; empty if not pinned
+	ExpectedPaths  ExpectedPaths `json:"expected_paths"`
 }
 
 // --- agent: heartbeat ---

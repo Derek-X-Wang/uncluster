@@ -19,13 +19,34 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/token"
 )
 
+// mintV1NodeAndToken creates a V1 (node-based) agent pair directly in the
+// store. Used by e2e tests that exercise the V1 task-execution path (heartbeat
+// + poll + complete) which still operates on the nodes table until S11.
+func mintV1NodeAndToken(t *testing.T, st store.Store, name string) (nodeID, agentTokenStr string) {
+	t.Helper()
+	n, err := st.CreateNode(context.Background(), store.NewNodeParams{Name: name})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+	agentTok, _ := token.Generate(token.KindAgent)
+	hash, _ := token.HashSecret(agentTok.Secret)
+	nid := n.ID
+	if _, err := st.(store.TestInsertHook).InsertTokenWithID(context.Background(),
+		agentTok.ID, store.TokenAgent, &nid, hash, "v1-agent:"+name); err != nil {
+		t.Fatalf("InsertTokenWithID: %v", err)
+	}
+	return n.ID, agentTok.String()
+}
+
 // TestEndToEnd_RunCommand is a full integration test:
 //   - real SQLite store in a tmpdir
 //   - real HTTP server via httptest
 //   - real agent running in a goroutine
 //
-// Flow: register agent -> heartbeat -> POST task -> poll until succeeded ->
-// GET /v1/tasks/{id}/chunks -> assert output contains "hello" and "world".
+// Flow: setup V1 node+token → heartbeat → POST task → poll until succeeded →
+// GET /v1/tasks/{id}/chunks → assert output contains "hello" and "world".
+// Note: Uses V1 node+token path directly (no register endpoint) because the
+// V1 heartbeat / task handlers still operate on the nodes table.
 func TestEndToEnd_RunCommand(t *testing.T) {
 	// ------------------------------------------------------------------
 	// 1. Store + server + httptest
@@ -40,7 +61,7 @@ func TestEndToEnd_RunCommand(t *testing.T) {
 	ts := httpTestServer(t, srv.Handler())
 
 	// ------------------------------------------------------------------
-	// 2. Mint tokens via TestInsertHook
+	// 2. Mint tokens via TestInsertHook / store helpers
 	// ------------------------------------------------------------------
 	// CLI token (used to create tasks).
 	cliTok, _ := token.Generate(token.KindCLI)
@@ -52,43 +73,20 @@ func TestEndToEnd_RunCommand(t *testing.T) {
 	}
 	cliBearerToken := cliTok.String()
 
-	// Join token (used by the agent to register).
-	joinTok, _ := token.Generate(token.KindJoin)
-	joinHash, _ := token.HashSecret(joinTok.Secret)
-	if _, err := st.(store.TestInsertHook).InsertTokenWithID(
-		context.Background(), joinTok.ID, store.TokenJoin, nil, joinHash, "e2e-join",
-	); err != nil {
-		t.Fatal(err)
-	}
-	joinBearerToken := joinTok.String()
+	// V1 node + agent token (bypasses register endpoint; V1 task path).
+	nodeID, agentTokenStr := mintV1NodeAndToken(t, st, "e2e-node")
 
 	// ------------------------------------------------------------------
-	// 3. Register the agent via HTTP (using agent.NewServerClient)
-	// ------------------------------------------------------------------
-	registrar := agent.NewServerClient(ts.URL, "")
-	regResp, err := registrar.Register(context.Background(), api.AgentRegisterRequest{
-		JoinToken: joinBearerToken,
-		Name:      "e2e-node",
-		Metadata:  map[string]any{"test": true},
-	})
-	if err != nil {
-		t.Fatalf("agent register: %v", err)
-	}
-	if regResp.AgentToken == "" || regResp.NodeID == "" {
-		t.Fatalf("empty register response: %+v", regResp)
-	}
-
-	// ------------------------------------------------------------------
-	// 4. Spin up the agent in a goroutine
+	// 3. Spin up the agent in a goroutine
 	// ------------------------------------------------------------------
 	agentCtx, agentCancel := context.WithCancel(context.Background())
 	t.Cleanup(agentCancel)
 
 	ag := agent.New(agent.Config{
 		Server:     ts.URL,
-		NodeID:     regResp.NodeID,
-		NodeName:   "e2e-node",
-		AgentToken: regResp.AgentToken,
+		AgentID:    nodeID, // V1 compat: nodeID used as AgentID in config
+		AgentName:  "e2e-node",
+		AgentToken: agentTokenStr,
 	}, nil)
 
 	agentDone := make(chan error, 1)
@@ -101,7 +99,7 @@ func TestEndToEnd_RunCommand(t *testing.T) {
 	// 5. POST a task via the CLI endpoint
 	// ------------------------------------------------------------------
 	taskBody, _ := json.Marshal(api.CreateTaskRequest{
-		Node:    regResp.NodeID,
+		Node:    nodeID,
 		Command: "echo hello && echo world",
 	})
 	req, _ := http.NewRequest("POST", ts.URL+"/v1/tasks", bytes.NewReader(taskBody))
@@ -233,24 +231,14 @@ func newHarness(t *testing.T, outputCap int64) *e2eHarness {
 	_, _ = st.(store.TestInsertHook).InsertTokenWithID(context.Background(),
 		cliTok.ID, store.TokenCLI, nil, cliHash, "h")
 
-	jt, _ := token.Generate(token.KindJoin)
-	jtHash, _ := token.HashSecret(jt.Secret)
-	_, _ = st.(store.TestInsertHook).InsertTokenWithID(context.Background(),
-		jt.ID, store.TokenJoin, nil, jtHash, "h-join")
-
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
 
-	ac := agent.NewServerClient(ts.URL, "")
-	reg, err := ac.Register(ctx, api.AgentRegisterRequest{
-		JoinToken: jt.String(), Name: "h-node", Metadata: map[string]any{"os": "test"},
-	})
-	if err != nil {
-		t.Fatalf("register: %v", err)
-	}
+	// V1 node+token path: V1 heartbeat/task handlers use nodes table until S11.
+	nodeID, agentTokenStr := mintV1NodeAndToken(t, st, "h-node")
 
 	a := agent.New(agent.Config{
-		Server: ts.URL, NodeID: reg.NodeID, NodeName: "h-node", AgentToken: reg.AgentToken,
+		Server: ts.URL, AgentID: nodeID, AgentName: "h-node", AgentToken: agentTokenStr,
 	}, nil)
 	agentCtx, agentStop := context.WithCancel(ctx)
 	go func() { _ = a.Run(agentCtx) }()
@@ -259,7 +247,7 @@ func newHarness(t *testing.T, outputCap int64) *e2eHarness {
 	// Wait for first heartbeat so node.last_seen_at is set.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		n, err := st.GetNode(ctx, reg.NodeID)
+		n, err := st.GetNode(ctx, nodeID)
 		if err == nil && n.LastSeenAt != nil {
 			break
 		}
@@ -270,7 +258,7 @@ func newHarness(t *testing.T, outputCap int64) *e2eHarness {
 		st: st, srv: srv, ts: ts,
 		cliToken:  cliTok.String(),
 		agentCtx:  agentCtx, agentStop: agentStop,
-		nodeName:  "h-node", nodeID: reg.NodeID,
+		nodeName:  "h-node", nodeID: nodeID,
 	}
 }
 

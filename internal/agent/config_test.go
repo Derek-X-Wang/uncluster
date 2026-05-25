@@ -1,6 +1,7 @@
 package agent_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -10,7 +11,16 @@ import (
 func TestConfigRoundTrip(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "agent.toml")
 	in := agent.Config{
-		Server: "https://x", NodeID: "node_a", NodeName: "mac", AgentToken: "uct_agent_xxx_yyy",
+		Server:     "https://x",
+		AgentID:    "ag_abc123",
+		AgentName:  "mac",
+		AgentToken: "uct_agent_AAAAAAAAAAAAAAAA_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+		CAPubkey:   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest uncluster-ca",
+		ExpectedPaths: agent.ExpectedPaths{
+			CAPubkey:      "/etc/ssh/uncluster_ca.pub",
+			SSHDropIn:     "/etc/ssh/sshd_config.d/uncluster.conf",
+			PrincipalsDir: "/etc/ssh/auth_principals",
+		},
 	}
 	if err := agent.SaveConfig(p, in); err != nil {
 		t.Fatal(err)
@@ -20,6 +30,45 @@ func TestConfigRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out != in {
-		t.Fatalf("round trip mismatch: %+v vs %+v", out, in)
+		t.Fatalf("round trip mismatch:\n got  %+v\n want %+v", out, in)
+	}
+}
+
+// TestConfigAlreadyEnrolledCheck verifies that a config with an AgentToken is
+// detected as "already enrolled" — tested via LoadConfig + AgentToken check,
+// matching what the join command does.
+func TestConfigAlreadyEnrolledCheck(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "agent.toml")
+	in := agent.Config{
+		Server:     "https://x",
+		AgentID:    "ag_existing",
+		AgentName:  "my-box",
+		AgentToken: "uct_agent_AAAAAAAAAAAAAAAA_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+	}
+	if err := agent.SaveConfig(p, in); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := agent.LoadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.AgentToken == "" {
+		t.Fatal("expected AgentToken to be set for already-enrolled check")
+	}
+}
+
+// TestSaveConfigMode0600 verifies that SaveConfig writes the file with mode 0600.
+// Acceptance criteria: `uncluster agent join` persists config with mode 0600.
+func TestSaveConfigMode0600(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "agent.toml")
+	if err := agent.SaveConfig(p, agent.Config{Server: "https://x", AgentToken: "tok"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("config file mode: got %#o want 0600", perm)
 	}
 }

@@ -10,13 +10,14 @@ import (
 )
 
 var (
-	ErrNotFound      = errors.New("store: not found")
-	ErrNameTaken     = errors.New("store: node name already in use")
-	ErrTokenUsed     = errors.New("store: token already used")
-	ErrTokenExpired  = errors.New("store: token expired")
-	ErrTokenRevoked  = errors.New("store: token revoked")
-	ErrNotClaimable  = errors.New("store: task is not claimable")
-	ErrTaskCompleted = errors.New("store: task already completed")
+	ErrNotFound       = errors.New("store: not found")
+	ErrNameTaken      = errors.New("store: node name already in use")
+	ErrAgentNameTaken = errors.New("store: agent name already in use")
+	ErrTokenUsed      = errors.New("store: token already used")
+	ErrTokenExpired   = errors.New("store: token expired")
+	ErrTokenRevoked   = errors.New("store: token revoked")
+	ErrNotClaimable   = errors.New("store: task is not claimable")
+	ErrTaskCompleted  = errors.New("store: task already completed")
 )
 
 type NodeStatus string
@@ -25,6 +26,15 @@ const (
 	NodeOnline  NodeStatus = "online"
 	NodeOffline NodeStatus = "offline"
 	NodeRevoked NodeStatus = "revoked"
+)
+
+// AgentStatus mirrors NodeStatus for the V2 agents table.
+type AgentStatus string
+
+const (
+	AgentOnline  AgentStatus = "online"
+	AgentOffline AgentStatus = "offline"
+	AgentRevoked AgentStatus = "revoked"
 )
 
 type TaskStatus string
@@ -56,10 +66,22 @@ type Node struct {
 	Metadata   string // JSON blob (free-form)
 }
 
+// Agent is the V2 enrollment record. Created when an Agent registers via
+// POST /v1/agent/register; linked to its agent token via the tokens table.
+type Agent struct {
+	ID           string
+	Name         string
+	CreatedAt    time.Time
+	LastSeenAt   *time.Time
+	Status       AgentStatus
+	AgentVersion string
+}
+
 type Token struct {
 	ID         string
 	Kind       TokenKind
-	NodeID     *string
+	NodeID     *string // V1: set for node-agent tokens
+	AgentID    *string // V2: set for V2 agent tokens
 	SecretHash string
 	Label      string
 	CreatedAt  time.Time
@@ -93,7 +115,8 @@ type Chunk struct {
 type NewTokenParams struct {
 	ID         string // if empty, the store generates one
 	Kind       TokenKind
-	NodeID     *string
+	NodeID     *string  // V1: link to nodes table
+	AgentID    *string  // V2: link to agents table
 	SecretHash string
 	Label      string
 	ExpiresAt  *time.Time
@@ -102,6 +125,11 @@ type NewTokenParams struct {
 type NewNodeParams struct {
 	Name     string
 	Metadata string
+}
+
+// NewAgentParams are the fields supplied at enrollment time.
+type NewAgentParams struct {
+	Name string
 }
 
 // ChunkAppendResult is returned to agents so they can short-circuit flushing
@@ -119,13 +147,18 @@ type Store interface {
 	RevokeToken(ctx context.Context, id string, at time.Time) error
 	MarkJoinTokenUsed(ctx context.Context, id string, at time.Time) error
 
-	// nodes
+	// nodes (V1; removed in S11)
 	CreateNode(ctx context.Context, p NewNodeParams) (Node, error)
 	GetNode(ctx context.Context, id string) (Node, error)
 	GetNodeByName(ctx context.Context, name string) (Node, error)
 	ListNodes(ctx context.Context) ([]Node, error)
 	UpdateNodeHeartbeat(ctx context.Context, id, metadata string, at time.Time) error
 	RevokeNode(ctx context.Context, id string, at time.Time) error // status=revoked, rename, revoke agent token
+
+	// agents (V2)
+	CreateAgent(ctx context.Context, p NewAgentParams) (Agent, error)
+	GetAgent(ctx context.Context, id string) (Agent, error)
+	GetAgentByName(ctx context.Context, name string) (Agent, error)
 
 	// tasks
 	CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error)

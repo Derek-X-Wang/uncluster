@@ -15,7 +15,8 @@ type ctxKey string
 
 const (
 	ctxAuthedToken ctxKey = "authed_token"
-	ctxAuthedNode  ctxKey = "authed_node"
+	ctxAuthedNode  ctxKey = "authed_node"  // store.Node — V1 agent tokens (node_id set)
+	ctxAuthedAgent ctxKey = "authed_agent" // store.Agent — V2 agent tokens (agent_id set)
 )
 
 func (s *Server) requireAuth(requiredKind store.TokenKind) func(http.Handler) http.Handler {
@@ -64,18 +65,29 @@ func (s *Server) requireAuth(requiredKind store.TokenKind) func(http.Handler) ht
 				return
 			}
 			ctx := context.WithValue(r.Context(), ctxAuthedToken, row)
-			// For agent tokens, also carry the node and reject revoked nodes.
+			// For agent tokens, carry the node (V1) or agent (V2) and reject revoked ones.
 			if row.Kind == store.TokenAgent {
-				if row.NodeID == nil {
-					writeError(w, http.StatusUnauthorized, "agent token has no node")
+				switch {
+				case row.AgentID != nil:
+					// V2: token linked to agents table.
+					ag, err := s.cfg.Store.GetAgent(r.Context(), *row.AgentID)
+					if err != nil || ag.Status == store.AgentRevoked {
+						writeError(w, http.StatusUnauthorized, "agent revoked")
+						return
+					}
+					ctx = context.WithValue(ctx, ctxAuthedAgent, ag)
+				case row.NodeID != nil:
+					// V1: token linked to nodes table.
+					node, err := s.cfg.Store.GetNode(r.Context(), *row.NodeID)
+					if err != nil || node.Status == store.NodeRevoked {
+						writeError(w, http.StatusUnauthorized, "node revoked")
+						return
+					}
+					ctx = context.WithValue(ctx, ctxAuthedNode, node)
+				default:
+					writeError(w, http.StatusUnauthorized, "agent token has no linked record")
 					return
 				}
-				node, err := s.cfg.Store.GetNode(r.Context(), *row.NodeID)
-				if err != nil || node.Status == store.NodeRevoked {
-					writeError(w, http.StatusUnauthorized, "node revoked")
-					return
-				}
-				ctx = context.WithValue(ctx, ctxAuthedNode, node)
 			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
