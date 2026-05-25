@@ -759,3 +759,93 @@ func TestSetAgentFailClosedAfter(t *testing.T) {
 		t.Errorf("FailClosedAfter should be nil after clear, got %v", got2.FailClosedAfter)
 	}
 }
+
+// ---- S6: cert audit log ----
+
+func TestWriteAndListCertEvents(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	now := time.Now().Truncate(time.Second)
+
+	e := store.CertEvent{
+		RequestID:     "req_abc123",
+		TS:            now,
+		CallerTokenID: "caller_tok_1",
+		TargetAgentID: "ag_agent_1",
+		Username:      "derek",
+		CertPrincipal: "caller_tok_1",
+		PubkeyFP:      "SHA256:abc",
+		TTLSeconds:    300,
+		Serial:        42,
+		KeyID:         "uncluster:req_abc123:caller=caller_tok_1:agent=ag_agent_1:user=derek",
+		Outcome:       "signed",
+	}
+
+	if err := s.WriteCertEvent(ctx, e); err != nil {
+		t.Fatalf("WriteCertEvent: %v", err)
+	}
+
+	events, err := s.ListCertEvents(ctx, store.CertEventFilter{})
+	if err != nil {
+		t.Fatalf("ListCertEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	got := events[0]
+	if got.RequestID != e.RequestID {
+		t.Errorf("RequestID = %q, want %q", got.RequestID, e.RequestID)
+	}
+	if got.Outcome != "signed" {
+		t.Errorf("Outcome = %q, want signed", got.Outcome)
+	}
+	if got.Serial != 42 {
+		t.Errorf("Serial = %d, want 42", got.Serial)
+	}
+	if got.PubkeyFP != "SHA256:abc" {
+		t.Errorf("PubkeyFP = %q", got.PubkeyFP)
+	}
+}
+
+func TestListCertEvents_FilterByOutcome(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	_ = s.WriteCertEvent(ctx, store.CertEvent{RequestID: "r1", TS: now, CallerTokenID: "c1", Outcome: "signed"})
+	_ = s.WriteCertEvent(ctx, store.CertEvent{RequestID: "r2", TS: now, CallerTokenID: "c1", Outcome: "denied", DenialReason: "acl_miss"})
+	_ = s.WriteCertEvent(ctx, store.CertEvent{RequestID: "r3", TS: now, CallerTokenID: "c2", Outcome: "signed"})
+
+	signed, _ := s.ListCertEvents(ctx, store.CertEventFilter{Outcome: "signed"})
+	if len(signed) != 2 {
+		t.Errorf("signed: want 2, got %d", len(signed))
+	}
+
+	denied, _ := s.ListCertEvents(ctx, store.CertEventFilter{Outcome: "denied"})
+	if len(denied) != 1 || denied[0].DenialReason != "acl_miss" {
+		t.Errorf("denied: %+v", denied)
+	}
+
+	byCaller, _ := s.ListCertEvents(ctx, store.CertEventFilter{CallerTokenID: "c1"})
+	if len(byCaller) != 2 {
+		t.Errorf("by caller c1: want 2, got %d", len(byCaller))
+	}
+}
+
+func TestWriteCertEvent_Idempotent(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	e := store.CertEvent{RequestID: "dup_req", TS: time.Now(), CallerTokenID: "c", Outcome: "signed"}
+	if err := s.WriteCertEvent(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	// Second write with same request_id should be ignored (INSERT OR IGNORE).
+	if err := s.WriteCertEvent(ctx, e); err != nil {
+		t.Fatalf("second write should be idempotent: %v", err)
+	}
+	events, _ := s.ListCertEvents(ctx, store.CertEventFilter{})
+	if len(events) != 1 {
+		t.Errorf("want 1 row (idempotent), got %d", len(events))
+	}
+}

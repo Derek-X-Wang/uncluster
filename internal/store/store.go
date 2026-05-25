@@ -206,6 +206,32 @@ type NewAgentParams struct {
 	Name string
 }
 
+// CertEvent is one row in cert_issuance_events.
+type CertEvent struct {
+	RequestID     string
+	TS            time.Time
+	CallerTokenID string
+	TargetAgentID string // "" if agent could not be resolved
+	Username      string
+	CertPrincipal string  // the caller_token_id used as the SSH principal; "" on denial
+	PubkeyFP      string  // pubkey fingerprint; "" on denial
+	TTLSeconds    int
+	Serial        uint64  // 0 on denial
+	KeyID         string  // "" on denial
+	Outcome       string  // "signed" or "denied"
+	DenialReason  string  // "" on success
+}
+
+// CertEventFilter controls which rows are returned by ListCertEvents.
+type CertEventFilter struct {
+	CallerTokenID string   // "" = any
+	AgentID       string   // "" = any
+	Username      string   // "" = any
+	Outcome       string   // "" = any; "signed" | "denied"
+	Since         *time.Time
+	Limit         int // 0 = default (100)
+}
+
 // ChunkAppendResult is returned to agents so they can short-circuit flushing
 // when the server output cap has been hit.
 type ChunkAppendResult struct {
@@ -250,6 +276,10 @@ type Store interface {
 	// agent endpoints (V2)
 	UpsertAgentEndpoints(ctx context.Context, agentID string, endpoints []AgentEndpoint) error
 	ListAgentEndpoints(ctx context.Context, agentID string) ([]AgentEndpoint, error)
+
+	// cert events (V2 — S6)
+	WriteCertEvent(ctx context.Context, e CertEvent) error
+	ListCertEvents(ctx context.Context, f CertEventFilter) ([]CertEvent, error)
 
 	// tasks
 	CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error)

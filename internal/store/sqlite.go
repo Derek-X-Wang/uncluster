@@ -801,6 +801,106 @@ func (s *sqliteStore) ListAgentEndpoints(ctx context.Context, agentID string) ([
 	return out, rows.Err()
 }
 
+// ------------- cert events (V2 — S6) -------------
+
+func (s *sqliteStore) WriteCertEvent(ctx context.Context, e CertEvent) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO cert_issuance_events
+		   (request_id, ts, caller_token_id, target_agent_id, username,
+		    cert_principal, pubkey_fp, ttl_seconds, serial, key_id, outcome, denial_reason)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.RequestID, e.TS.Unix(),
+		nullString(e.CallerTokenID), nullString(e.TargetAgentID), nullString(e.Username),
+		nullString(e.CertPrincipal), nullString(e.PubkeyFP),
+		e.TTLSeconds, e.Serial, nullString(e.KeyID),
+		e.Outcome, nullString(e.DenialReason),
+	)
+	return err
+}
+
+func (s *sqliteStore) ListCertEvents(ctx context.Context, f CertEventFilter) ([]CertEvent, error) {
+	limit := f.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	where := "1=1"
+	var args []any
+	if f.CallerTokenID != "" {
+		where += " AND caller_token_id = ?"
+		args = append(args, f.CallerTokenID)
+	}
+	if f.AgentID != "" {
+		where += " AND target_agent_id = ?"
+		args = append(args, f.AgentID)
+	}
+	if f.Username != "" {
+		where += " AND username = ?"
+		args = append(args, f.Username)
+	}
+	if f.Outcome != "" {
+		where += " AND outcome = ?"
+		args = append(args, f.Outcome)
+	}
+	if f.Since != nil {
+		where += " AND ts >= ?"
+		args = append(args, f.Since.Unix())
+	}
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT request_id, ts, caller_token_id, target_agent_id, username,
+		        cert_principal, pubkey_fp, ttl_seconds, serial, key_id, outcome, denial_reason
+		 FROM cert_issuance_events
+		 WHERE `+where+` ORDER BY ts DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []CertEvent
+	for rows.Next() {
+		var e CertEvent
+		var ts int64
+		var callerID, agentID, username, principal, fp, keyID, denial sql.NullString
+		var serial sql.NullInt64
+		if err := rows.Scan(
+			&e.RequestID, &ts, &callerID, &agentID, &username,
+			&principal, &fp, &e.TTLSeconds, &serial, &keyID,
+			&e.Outcome, &denial,
+		); err != nil {
+			return nil, err
+		}
+		e.TS = time.Unix(ts, 0)
+		if callerID.Valid {
+			e.CallerTokenID = callerID.String
+		}
+		if agentID.Valid {
+			e.TargetAgentID = agentID.String
+		}
+		if username.Valid {
+			e.Username = username.String
+		}
+		if principal.Valid {
+			e.CertPrincipal = principal.String
+		}
+		if fp.Valid {
+			e.PubkeyFP = fp.String
+		}
+		if serial.Valid {
+			e.Serial = uint64(serial.Int64)
+		}
+		if keyID.Valid {
+			e.KeyID = keyID.String
+		}
+		if denial.Valid {
+			e.DenialReason = denial.String
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // ------------- tasks -------------
 
 func (s *sqliteStore) CreateTask(ctx context.Context, nodeID, command, createdBy string, at time.Time) (Task, error) {
