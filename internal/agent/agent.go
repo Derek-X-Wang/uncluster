@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/derek-x-wang/uncluster/internal/api"
@@ -27,6 +28,10 @@ type Agent struct {
 	logger           *slog.Logger
 	healthProvider   HealthProvider   // optional; injected by CLI
 	endpointProvider EndpointProvider // optional; injected by CLI or tests
+
+	policyMu       sync.Mutex
+	policyStateVal policyState    // last-applied policy state; guarded by policyMu
+	applyCh        chan applyRequest // serialised policy-apply channel; set in Run; nil until Run called
 }
 
 func New(cfg Config, logger *slog.Logger) *Agent {
@@ -57,6 +62,15 @@ func (a *Agent) WithEndpointProvider(ep EndpointProvider) *Agent {
 func (a *Agent) Run(ctx context.Context) error {
 	hbCtx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
+
+	// Start the serialised policy-apply worker.
+	a.applyCh = make(chan applyRequest, 1)
+	go func() {
+		for req := range a.applyCh {
+			a.runApplyPolicy(req.snapshot)
+		}
+	}()
+	defer close(a.applyCh)
 
 	authErrCh := make(chan error, 2)
 	go func() { authErrCh <- a.heartbeatLoop(hbCtx) }()
@@ -129,26 +143,56 @@ func (a *Agent) heartbeatOnceV2(ctx context.Context) error {
 		}()
 	}
 
+	// Snapshot current policy state (last-applied).
+	a.policyMu.Lock()
+	ps := a.policyStateVal
+	a.policyMu.Unlock()
+
 	req := api.V2HeartbeatRequest{
 		AgentID:      a.cfg.AgentID,
 		AgentVersion: version.Version,
 		ObservedAt:   time.Now().Unix(),
 		Endpoints:    endpoints,
 		PolicyState: api.AgentPolicyState{
-			AppliedVersion:  0,
-			AppliedHash:     "",
-			LastApplyStatus: "ok",
-			LastApplyAt:     0,
+			AppliedVersion:  ps.appliedVersion,
+			AppliedHash:     ps.appliedHash,
+			LastApplyStatus: ps.lastApplyStatus,
+			LastApplyError:  ps.lastApplyError,
+			LastApplyAt:     ps.lastApplyAt,
 		},
 		Health: health,
+	}
+	if req.PolicyState.LastApplyStatus == "" {
+		req.PolicyState.LastApplyStatus = "ok"
 	}
 	// Best-effort metrics.
 	if m := CollectMetrics(); m != nil {
 		req.Metrics = m
 	}
 
-	_, err := a.client.HeartbeatV2(ctx, req)
-	return err
+	resp, err := a.client.HeartbeatV2(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	// If the server sent a policy snapshot, dispatch it for application.
+	if resp.Policy != nil && a.applyCh != nil {
+		select {
+		case a.applyCh <- applyRequest{snapshot: *resp.Policy}:
+		default:
+			// Channel already has a pending apply; replace it (coalesce).
+			// Drain and re-send. Non-blocking drain to avoid deadlock.
+			select {
+			case <-a.applyCh:
+			default:
+			}
+			select {
+			case a.applyCh <- applyRequest{snapshot: *resp.Policy}:
+			default:
+			}
+		}
+	}
+	return nil
 }
 
 func (a *Agent) pollLoop(ctx context.Context) error {
