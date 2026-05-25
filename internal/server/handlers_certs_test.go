@@ -87,7 +87,7 @@ func TestIssueCert_Success(t *testing.T) {
 	srv, st, _ := newTestServerWithCA(t)
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	callerPlaintext, callerID := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "cert-agent")
 
@@ -170,7 +170,7 @@ func TestIssueCert_RejectsCertAsPubkey(t *testing.T) {
 	srv, st, caSigner := newTestServerWithCA(t)
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	callerPlaintext, callerID := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "cert-certpub")
 
@@ -204,7 +204,7 @@ func TestIssueCert_TTLTooLong(t *testing.T) {
 	srv, st, _ := newTestServerWithCA(t)
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	callerPlaintext, callerID := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "cert-ttl")
 
@@ -260,14 +260,17 @@ func TestGetAgent_ByIDAndName(t *testing.T) {
 	defer st.Close()
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	agentID, _ := mintAgentAndToken(t, st, ts, "my-box")
 
 	doGet := func(path string) api.AgentDetail {
 		t.Helper()
 		req, _ := http.NewRequest("GET", ts.URL+path, nil)
 		req.Header.Set("Authorization", "Bearer "+cliTok)
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
 			t.Fatalf("GET %s: status=%d", path, resp.StatusCode)

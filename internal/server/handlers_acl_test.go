@@ -43,7 +43,7 @@ func TestACL_CreateListDelete(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	callerPlaintext, callerID := seedCallerToken(t, st)
 	_ = callerPlaintext
 
@@ -135,7 +135,7 @@ func TestACL_Idempotent(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	_, callerID := seedCallerToken(t, st)
 
 	jt := mintJoinToken(t, st)
@@ -173,7 +173,7 @@ func TestV2Heartbeat_PolicyDelivered(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	_, callerID := seedCallerToken(t, st)
 
 	// Register agent.
@@ -245,7 +245,7 @@ func TestV2Heartbeat_PolicyNotDeliveredWhenMatch(t *testing.T) {
 	srv := server.New(server.Config{Store: st})
 	ts := httpTestServer(t, srv.Handler())
 
-	cliTok := seedCLIToken(t, st)
+	cliTok, _ := seedCallerToken(t, st)
 	_, callerID := seedCallerToken(t, st)
 
 	agentID, agentTok := mintAgentAndToken(t, st, ts, "pmatch-agent")

@@ -22,12 +22,10 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	switch req.Kind {
 	case "join":
 		kind = store.TokenJoin
-	case "cli":
-		kind = store.TokenCLI
 	case "caller":
 		kind = store.TokenCaller
 	default:
-		writeError(w, http.StatusBadRequest, "kind must be join, cli, or caller")
+		writeError(w, http.StatusBadRequest, "kind must be join or caller")
 		return
 	}
 
@@ -78,7 +76,6 @@ func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
 			ID:        t.ID,
 			Kind:      string(t.Kind),
 			Label:     t.Label,
-			NodeID:    t.NodeID,
 			CreatedAt: t.CreatedAt.Unix(),
 			ExpiresAt: api.TimePtr(t.ExpiresAt),
 			UsedAt:    api.TimePtr(t.UsedAt),

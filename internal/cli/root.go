@@ -10,7 +10,7 @@ import (
 func NewRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "uncluster",
-		Short:         "Uncluster — a lightweight personal compute layer",
+		Short:         "Uncluster — SSH certificate-authority compute gateway",
 		Version:       version.Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -20,9 +20,6 @@ func NewRoot() *cobra.Command {
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(newACLCmd())
 	root.AddCommand(newSSHCmd())
-	root.AddCommand(newRunCmd())
-	root.AddCommand(newTasksCmd())
-	root.AddCommand(newNodesCmd())
 	root.AddCommand(newAgentsCmd())
 	root.AddCommand(newAuditCmd())
 	return root

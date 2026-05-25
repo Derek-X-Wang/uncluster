@@ -1,14 +1,14 @@
 openapi: 3.1.0
 info:
   title: Uncluster Control Plane API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Wire protocol between the `uncluster` CLI, agents, and the control plane.
     This file is the source of truth for the wire shape. See
     docs/architecture.md for current-state design and docs/adr/ for
-    decision rationale. Note: V1 task-execution endpoints (tasks, chunks,
-    SSE) are being removed per ADR-0002; the V2 surface centers on cert
-    signing, ACL CRUD, agent enrollment, and the typed heartbeat envelope.
+    decision rationale. V1 task-execution endpoints were removed in S11 (ADR-0002).
+    The V2 surface centers on SSH cert signing, ACL CRUD, agent enrollment,
+    and the typed heartbeat envelope.
 servers:
   - url: https://uncluster.example.com:7777
     description: Example production URL (operator-provided)
@@ -31,7 +31,7 @@ paths:
 
   /v1/tokens:
     post:
-      summary: Create a token (join or cli)
+      summary: Create a token (join or caller)
       security: [{ bearerAuth: [] }]
       requestBody:
         required: true
@@ -85,68 +85,32 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/AgentRegisterResponse" }
         "401": { description: invalid/used/expired join token }
-        "409": { description: node name already in use }
+        "409": { description: agent name already in use }
 
   /v1/agent/heartbeat:
     post:
-      summary: Report node liveness and metadata; receive cancel instructions
+      summary: Report agent liveness, endpoints, and policy state; receive policy updates
       security: [{ bearerAuth: [] }]
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/HeartbeatRequest" }
+            schema: { $ref: "#/components/schemas/V2HeartbeatRequest" }
       responses:
         "200":
           description: OK
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/HeartbeatResponse" }
-
-  /v1/nodes:
-    get:
-      summary: List registered nodes
-      security: [{ bearerAuth: [] }]
-      responses:
-        "200":
-          description: OK
+              schema: { $ref: "#/components/schemas/V2HeartbeatResponse" }
+        "410":
+          description: Agent has been revoked; wipe principals
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/NodeSummary" }
-
-  /v1/nodes/{id}:
-    get:
-      summary: Get a single node by id or name
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/NodeSummary" }
-        "404": { description: not found }
-    delete:
-      summary: Revoke (remove) a node; frees its name for reuse
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string }
-      responses:
-        "204": { description: revoked }
-        "404": { description: not found }
+              schema: { $ref: "#/components/schemas/RevokedResponse" }
 
   /v1/agents:
     get:
-      summary: List registered V2 agents
+      summary: List registered V2 agents (excludes revoked)
       security: [{ bearerAuth: [] }]
       responses:
         "200":
@@ -310,161 +274,6 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/CertEventSummary" }
 
-  /v1/tasks:
-    post:
-      summary: Create a task for a node
-      security: [{ bearerAuth: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CreateTaskRequest" }
-      responses:
-        "201":
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/CreateTaskResponse" }
-    get:
-      summary: List recent tasks
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - { in: query, name: node, schema: { type: string } }
-        - { in: query, name: status, schema: { type: string } }
-        - { in: query, name: limit, schema: { type: integer } }
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/TaskDetail" }
-
-  /v1/tasks/{id}:
-    get:
-      summary: Get task details
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - { in: path, name: id, required: true, schema: { type: string } }
-      responses:
-        "200":
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/TaskDetail" }
-        "404": { description: not found }
-
-  /v1/tasks/{id}/chunks:
-    get:
-      summary: List stored output chunks for a task
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - { in: path, name: id, required: true, schema: { type: string } }
-        - in: query
-          name: stream
-          schema: { type: string, enum: [stdout, stderr] }
-          description: Filter to a specific stream; omit for all streams
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ChunksResponse" }
-        "404": { description: task not found }
-
-  /v1/tasks/{id}/stream:
-    get:
-      summary: Stream task output as Server-Sent Events
-      description: |
-        Replays all stored stdout/stderr chunks, then streams live chunks as
-        they arrive.  Sends a final `done` event when the task reaches a
-        terminal state, then closes the stream.
-
-        Event types:
-        - `chunk`: a ChunkOut payload (stream, seq, data, created_at)
-        - `done`: `{exit_code, status}` — signals task completion
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - { in: path, name: id, required: true, schema: { type: string } }
-      responses:
-        "200":
-          description: SSE stream of task events
-          content:
-            text/event-stream:
-              schema:
-                type: string
-                description: |
-                  Newline-delimited SSE frames.  Each frame is one of:
-                    event: chunk\ndata: <ChunkOut JSON>\n\n
-                    event: done\ndata: {"exit_code":<int>,"status":"<string>"}\n\n
-        "404": { description: task not found }
-        "500": { description: server does not support streaming }
-
-  /v1/tasks/{id}/cancel:
-    post:
-      summary: Cancel a pending or running task
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - { in: path, name: id, required: true, schema: { type: string } }
-      responses:
-        "202": { description: cancellation requested }
-        "404": { description: not found }
-        "409": { description: not cancellable in current state }
-
-  /v1/agent/next-task:
-    get:
-      summary: Long-poll for the next task assigned to this agent (30s)
-      security: [{ bearerAuth: [] }]
-      responses:
-        "200":
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/NextTaskResponse" }
-        "204": { description: no task within timeout }
-
-  /v1/agent/tasks/{id}/chunks:
-    post:
-      summary: Upload a chunk of task output (stdout or stderr)
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string }
-          description: Task ID
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/ChunkUploadRequest" }
-      responses:
-        "200":
-          description: Chunk accepted; returns truncation flag and any pending cancels
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ChunkUploadResponse" }
-        "403": { description: Task not assigned to this node }
-        "404": { description: Task not found }
-
-  /v1/agent/tasks/{id}/complete:
-    post:
-      summary: Mark a task as complete with its exit code
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string }
-          description: Task ID
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CompleteRequest" }
-      responses:
-        "204": { description: Task marked complete }
-        "403": { description: Task not assigned to this node }
-        "404": { description: Task not found }
-        "409": { description: Task already completed }
-
 components:
   securitySchemes:
     bearerAuth:
@@ -477,12 +286,12 @@ components:
       type: object
       required: [kind]
       properties:
-        kind: { type: string, enum: [join, cli] }
+        kind: { type: string, enum: [join, caller] }
         label: { type: string }
         expires_at:
           type: integer
           format: int64
-          description: Unix seconds; omitted for CLI tokens means "no expiry"; omitted for join tokens defaults to now+15m.
+          description: Unix seconds; omitted for caller tokens means "no expiry"; omitted for join tokens defaults to now+15m.
     CreateTokenResponse:
       type: object
       required: [id, token]
@@ -495,7 +304,6 @@ components:
         id: { type: string }
         kind: { type: string }
         label: { type: string }
-        node_id: { type: string, nullable: true }
         created_at: { type: integer, format: int64 }
         expires_at: { type: integer, format: int64, nullable: true }
         used_at: { type: integer, format: int64, nullable: true }
@@ -527,95 +335,70 @@ components:
           description: "sha256:<hex> of TLS cert; empty when not pinned"
         expected_paths:
           $ref: "#/components/schemas/ExpectedPaths"
-    HeartbeatRequest:
+    V2HeartbeatRequest:
+      type: object
+      required: [agent_id, agent_version, observed_at]
+      properties:
+        agent_id: { type: string }
+        agent_version: { type: string }
+        observed_at: { type: integer, format: int64, description: "Agent wall-clock unix seconds" }
+        endpoints:
+          type: array
+          items: { $ref: "#/components/schemas/AgentEndpoint" }
+        policy_state: { $ref: "#/components/schemas/AgentPolicyState" }
+        health:
+          type: array
+          items: { $ref: "#/components/schemas/AgentHealthCheck" }
+        metrics: { type: object, additionalProperties: true }
+    AgentEndpoint:
       type: object
       properties:
-        metadata: { type: object, additionalProperties: true }
-    HeartbeatResponse:
+        subnet: { type: string }
+        address: { type: string }
+    AgentPolicyState:
       type: object
       properties:
-        cancel_task_ids:
+        desired_version: { type: integer, format: int64, nullable: true }
+        applied_version: { type: integer, format: int64 }
+        applied_hash: { type: string }
+        last_apply_status: { type: string, enum: [ok, failed] }
+        last_apply_error: { type: string, nullable: true }
+        last_apply_at: { type: integer, format: int64 }
+    AgentHealthCheck:
+      type: object
+      properties:
+        component: { type: string }
+        check: { type: string }
+        state: { type: string, enum: [ok, warn, fail, unknown] }
+        error_code: { type: string, nullable: true }
+        message: { type: string, nullable: true }
+    V2HeartbeatResponse:
+      type: object
+      properties:
+        ack_ts: { type: integer, format: int64 }
+        server_time: { type: integer, format: int64 }
+        policy: { $ref: "#/components/schemas/PolicyPayload", nullable: true }
+        commands: { type: array, items: {} }
+        fail_closed_after: { type: integer, format: int64, nullable: true, description: "Seconds; null = no fail-closed" }
+    PolicyPayload:
+      type: object
+      properties:
+        version: { type: integer, format: int64 }
+        hash: { type: string }
+        principals:
+          type: array
+          items: { $ref: "#/components/schemas/PolicyPrincipal" }
+    PolicyPrincipal:
+      type: object
+      properties:
+        username: { type: string }
+        caller_token_ids:
           type: array
           items: { type: string }
-    NodeSummary:
+    RevokedResponse:
       type: object
       properties:
-        id: { type: string }
-        name: { type: string }
-        status: { type: string, enum: [online, offline, revoked] }
-        created_at: { type: integer, format: int64 }
-        last_seen_at: { type: integer, format: int64, nullable: true }
-        metadata: { type: object, additionalProperties: true }
-    CreateTaskRequest:
-      type: object
-      required: [node, command]
-      properties:
-        node: { type: string, description: "node id or name" }
-        command: { type: string }
-    CreateTaskResponse:
-      type: object
-      properties: { task_id: { type: string } }
-    NextTaskResponse:
-      type: object
-      properties:
-        task_id: { type: string }
-        command: { type: string }
-    TaskDetail:
-      type: object
-      properties:
-        id: { type: string }
-        node_id: { type: string }
-        command: { type: string }
-        status: { type: string }
-        exit_code: { type: integer, nullable: true }
-        created_at: { type: integer, format: int64 }
-        started_at: { type: integer, format: int64, nullable: true }
-        finished_at: { type: integer, format: int64, nullable: true }
-        output_bytes: { type: integer, format: int64 }
-        output_truncated: { type: boolean }
-    ChunkUploadRequest:
-      type: object
-      required: [stream, data]
-      properties:
-        stream:
-          type: string
-          enum: [stdout, stderr]
-          description: Output stream identifier
-        data:
-          type: string
-          format: byte
-          description: Base64-encoded chunk bytes
-    ChunkUploadResponse:
-      type: object
-      properties:
-        truncated:
-          type: boolean
-          description: True if the per-task output cap has been reached; agent should stop sending
-        cancel_task_ids:
-          type: array
-          items: { type: string }
-          description: Task IDs pending cancellation on this node (piggyback delivery)
-    ChunkOut:
-      type: object
-      properties:
-        stream: { type: string, enum: [stdout, stderr] }
-        seq: { type: integer, format: int64 }
-        data: { type: string, format: byte, description: Base64-encoded chunk bytes }
-        created_at: { type: integer, format: int64 }
-    ChunksResponse:
-      type: object
-      required: [chunks]
-      properties:
-        chunks:
-          type: array
-          items: { $ref: "#/components/schemas/ChunkOut" }
-    CompleteRequest:
-      type: object
-      required: [exit_code]
-      properties:
-        exit_code:
-          type: integer
-          description: Process exit code (0 = success)
+        reason: { type: string, enum: [node_revoked], description: "Reason for 410 Gone response" }
     AgentEndpointSummary:
       type: object
       properties:
@@ -634,10 +417,6 @@ components:
         endpoints:
           type: array
           items: { $ref: "#/components/schemas/AgentEndpointSummary" }
-    RevokedResponse:
-      type: object
-      properties:
-        reason: { type: string, enum: [node_revoked], description: "Reason for 410 Gone response" }
     CertRequest:
       type: object
       required: [agent, username, pubkey]
