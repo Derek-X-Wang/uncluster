@@ -180,21 +180,16 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 		_ = s.cfg.Store.UpsertAgentEndpoints(ctx, ag.ID, eps)
 	}
 
-	// Persist policy state (best-effort).
-	_ = s.cfg.Store.UpsertAgentPolicyState(ctx, store.UpsertAgentPolicyStateParams{
-		AgentID:         ag.ID,
-		DesiredVersion:  req.PolicyState.DesiredVersion,
-		AppliedVersion:  req.PolicyState.AppliedVersion,
-		AppliedHash:     req.PolicyState.AppliedHash,
-		LastApplyStatus: req.PolicyState.LastApplyStatus,
-		LastApplyError:  req.PolicyState.LastApplyError,
-		LastApplyAt:     time.Unix(req.PolicyState.LastApplyAt, 0),
-	})
-
-	// Compute current policy snapshot; send it if the agent's applied_hash differs.
+	// Compute current policy snapshot before persisting state — the server is
+	// authoritative for desired_version (CONTEXT.md Policy term, bidirectional
+	// handshake). Pre-fix this handler stored req.PolicyState.DesiredVersion,
+	// which is always nil since Agents do not track or send desired_version.
+	// The result was that desired_version stayed at 0 forever and the
+	// "desired vs applied" gap invariant — the entire point of the version
+	// pair — could never fire. See #43.
+	snap, snapErr := s.cfg.Store.GetPolicySnapshot(ctx, ag.ID)
 	var policy *api.PolicyPayload
-	snap, err := s.cfg.Store.GetPolicySnapshot(ctx, ag.ID)
-	if err == nil && snap.Hash != req.PolicyState.AppliedHash {
+	if snapErr == nil && snap.Hash != req.PolicyState.AppliedHash {
 		principals := make([]api.PolicyPrincipal, 0, len(snap.Principals))
 		for _, p := range snap.Principals {
 			principals = append(principals, api.PolicyPrincipal{
@@ -208,6 +203,24 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 			Principals: principals,
 		}
 	}
+
+	// Persist policy state (best-effort). desired_version comes from the
+	// snapshot the server just computed — never from the Agent's report.
+	// Agent-reported desired_version is intentionally discarded.
+	var desiredVersion *int64
+	if snapErr == nil {
+		v := snap.Version
+		desiredVersion = &v
+	}
+	_ = s.cfg.Store.UpsertAgentPolicyState(ctx, store.UpsertAgentPolicyStateParams{
+		AgentID:         ag.ID,
+		DesiredVersion:  desiredVersion,
+		AppliedVersion:  req.PolicyState.AppliedVersion,
+		AppliedHash:     req.PolicyState.AppliedHash,
+		LastApplyStatus: req.PolicyState.LastApplyStatus,
+		LastApplyError:  req.PolicyState.LastApplyError,
+		LastApplyAt:     time.Unix(req.PolicyState.LastApplyAt, 0),
+	})
 
 	// Re-read agent to get latest fail_closed_after setting.
 	latestAg, _ := s.cfg.Store.GetAgent(ctx, ag.ID)
