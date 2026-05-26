@@ -35,7 +35,16 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	callerTok := ctx.Value(ctxAuthedToken).(store.Token)
+	// Defensive comma-ok (#49): today's router always mounts /v1/certs under
+	// requireAuth(TokenCaller), but a future refactor that exposes the route
+	// without the middleware would panic here and chi recovery would obscure
+	// it as a 500 with no useful message. Match the heartbeat handler's
+	// pattern (handlers_agent.go) and return a clean error instead.
+	callerTok, ok := ctx.Value(ctxAuthedToken).(store.Token)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "auth context missing")
+		return
+	}
 
 	var req api.CertRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
