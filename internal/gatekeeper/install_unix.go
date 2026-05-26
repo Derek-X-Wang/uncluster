@@ -268,7 +268,7 @@ func startService(ctx context.Context) error {
 		_ = exec.CommandContext(ctx, "launchctl", "stop", "com.uncluster.agent").Run()
 		return exec.CommandContext(ctx, "launchctl", "start", "com.uncluster.agent").Run()
 	default:
-		return exec.CommandContext(ctx, "systemctl", "restart", "uncluster-agent").Run()
+		return exec.CommandContext(ctx, "systemctl", "restart", "com.uncluster.agent").Run()
 	}
 }
 
