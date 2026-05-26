@@ -222,8 +222,20 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 		LastApplyAt:     time.Unix(req.PolicyState.LastApplyAt, 0),
 	})
 
-	// Re-read agent to get latest fail_closed_after setting.
-	latestAg, _ := s.cfg.Store.GetAgent(ctx, ag.ID)
+	// Re-read agent to get the freshest fail_closed_after (operator may have
+	// just changed it via `uncluster agents set <name> --fail-closed-after`).
+	// Pre-fix this swallowed the error and fell back to a zero-value Agent,
+	// which made FailClosedAfter nil — the agent then briefly switched to
+	// lenient mode until the next heartbeat (#47). Fix: fall back to the
+	// auth-time `ag` (already authoritative for this request) and log the
+	// re-read failure so the underlying lock/IO issue is observable.
+	failClosedAfter := ag.FailClosedAfter
+	if latestAg, err := s.cfg.Store.GetAgent(ctx, ag.ID); err == nil {
+		failClosedAfter = latestAg.FailClosedAfter
+	} else {
+		slog.Warn("heartbeat: failed to re-read agent for fail_closed_after; using auth-time value",
+			"agent_id", ag.ID, "err", err)
+	}
 
 	// Build commands. Inject check_update if agent_version ≠ expected_version.
 	commands := buildUpdateCommands(ctx, s, req.AgentVersion)
@@ -233,6 +245,6 @@ func (s *Server) handleV2Heartbeat(w http.ResponseWriter, r *http.Request, ag st
 		ServerTime:      now.Unix(),
 		Policy:          policy,
 		Commands:        commands,
-		FailClosedAfter: latestAg.FailClosedAfter,
+		FailClosedAfter: failClosedAfter,
 	})
 }
