@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -116,9 +117,14 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write success event.
+	// Write success event. Strict policy (#44 / ACCEPTANCE.md "Audit"): every
+	// cert issuance writes a row to cert_issuance_events. If the audit write
+	// fails we refuse to return the cert — otherwise "uncluster audit certs"
+	// would silently miss a signed-cert event and operators investigating an
+	// incident would get a false-negative answer. The Caller's retry path is
+	// fine here; cert minting is idempotent at the caller's pubkey level.
 	fp := pubkeyFingerprint(req.Pubkey)
-	_ = s.cfg.Store.WriteCertEvent(ctx, store.CertEvent{
+	if err := s.cfg.Store.WriteCertEvent(ctx, store.CertEvent{
 		RequestID:     requestID,
 		TS:            now,
 		CallerTokenID: callerTok.ID,
@@ -130,7 +136,17 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 		Serial:        serial,
 		KeyID:         keyID,
 		Outcome:       "signed",
-	})
+	}); err != nil {
+		slog.Error("audit-event-write-failed",
+			"path", "POST /v1/certs (success)",
+			"request_id", requestID,
+			"caller_token_id", callerTok.ID,
+			"target_agent_id", agent.ID,
+			"err", err)
+		writeError(w, http.StatusInternalServerError,
+			"audit write failed; cert not issued (request_id="+requestID+")")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, api.CertResponse{
 		Certificate: string(certBytes),
@@ -142,12 +158,17 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// writeDeniedEvent writes a denial row to cert_issuance_events. Best-effort;
-// errors are silently dropped since the primary response is already decided.
+// writeDeniedEvent writes a denial row to cert_issuance_events. Lenient
+// policy (#44): the Caller's denial response is already decided; if the audit
+// write fails we log at ERROR (so operators can detect audit-infrastructure
+// breakage) but still return the planned 4xx. Promoting an audit-write
+// failure to a 500 would mask the underlying denial reason and make the
+// Caller's experience worse during incidents.
 func (s *Server) writeDeniedEvent(ctx context.Context, callerID, agentID, username, rawPubkey, reason string) {
 	fp := pubkeyFingerprint(rawPubkey)
-	_ = s.cfg.Store.WriteCertEvent(ctx, store.CertEvent{
-		RequestID:     token.NewRequestID(),
+	requestID := token.NewRequestID()
+	if err := s.cfg.Store.WriteCertEvent(ctx, store.CertEvent{
+		RequestID:     requestID,
 		TS:            time.Now(),
 		CallerTokenID: callerID,
 		TargetAgentID: agentID,
@@ -155,7 +176,15 @@ func (s *Server) writeDeniedEvent(ctx context.Context, callerID, agentID, userna
 		PubkeyFP:      fp,
 		Outcome:       "denied",
 		DenialReason:  reason,
-	})
+	}); err != nil {
+		slog.Error("audit-event-write-failed",
+			"path", "POST /v1/certs (denied)",
+			"request_id", requestID,
+			"caller_token_id", callerID,
+			"target_agent_id", agentID,
+			"denial_reason", reason,
+			"err", err)
+	}
 }
 
 // pubkeyFingerprint returns the SHA-256 fingerprint of an authorized_keys-format
