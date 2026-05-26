@@ -274,6 +274,124 @@ func TestLoadPrivateRejectsLoosePerms(t *testing.T) {
 	}
 }
 
+// TestWritePrivateRejectsSymlinkToExisting ensures WritePrivateToDisk refuses
+// a pre-planted symlink that points at an *existing* file. The original code
+// already happened to catch this case because os.Stat follows symlinks and
+// returns nil err on a valid target — but only via the "refuse to overwrite"
+// branch, not via symlink-awareness. We pin that behaviour with a regression test.
+func TestWritePrivateRejectsSymlinkToExisting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink test requires Unix")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o700); err != nil {
+		t.Fatalf("chmod parent: %v", err)
+	}
+	sentinel := filepath.Join(t.TempDir(), "sentinel")
+	const sentinelContent = "do-not-clobber"
+	if err := os.WriteFile(sentinel, []byte(sentinelContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "ca")
+	if err := os.Symlink(sentinel, path); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	priv, _, _ := Generate()
+	bytes, _ := MarshalPrivate(priv)
+	if err := WritePrivateToDisk(path, bytes); err == nil {
+		t.Fatal("WritePrivateToDisk succeeded with symlink to existing target; must refuse")
+	}
+	got, _ := os.ReadFile(sentinel)
+	if string(got) != sentinelContent {
+		t.Errorf("sentinel clobbered: got %q, want %q", got, sentinelContent)
+	}
+}
+
+// TestWritePrivateRejectsSymlinkToMissing is the real symlink-attack regression:
+// attacker pre-plants `ca -> /attacker-chosen/path-that-does-not-yet-exist`.
+// os.Stat reports ErrNotExist (it follows the symlink and the target doesn't
+// exist), so the legacy "refuse if exists" branch did NOT fire. os.WriteFile
+// then followed the symlink and CREATED the target with private-key bytes.
+//
+// This is the canonical CVE shape called out in the issue body. The fix
+// (O_CREATE|O_EXCL with O_NOFOLLOW where supported) must abort because the
+// symlink itself counts as an existing entry.
+//
+// Parent dir is left at the t.TempDir default (typically 0o700) to isolate
+// the symlink-attack assertion from the parent-dir-mode check.
+func TestWritePrivateRejectsSymlinkToMissing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink test requires Unix")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o700); err != nil {
+		t.Fatalf("chmod parent: %v", err)
+	}
+	// Target lives in a different dir; if the write follows the symlink it
+	// creates an unexpected file here. We assert this file does NOT appear.
+	targetDir := t.TempDir()
+	target := filepath.Join(targetDir, "should-not-be-created")
+	path := filepath.Join(parent, "ca")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	priv, _, _ := Generate()
+	bytes, _ := MarshalPrivate(priv)
+	if err := WritePrivateToDisk(path, bytes); err == nil {
+		t.Fatal("WritePrivateToDisk succeeded with dangling symlink; must refuse")
+	}
+	if _, err := os.Lstat(target); err == nil {
+		t.Error("WritePrivateToDisk created the symlink target; symlink-follow bypass still present")
+	}
+}
+
+// TestWritePrivateRejectsLooseParentDir verifies that WritePrivateToDisk
+// refuses to write into a parent directory whose mode permits group/world
+// access. A 0o600 file inside a 0o777 dir is still attacker-replaceable.
+func TestWritePrivateRejectsLooseParentDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// POSIX mode bits are not the enforcement mechanism on Windows; the
+		// DACL applied at write time on the file is what restricts access.
+		t.Skip("POSIX parent-dir mode not enforced on Windows")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatalf("chmod parent: %v", err)
+	}
+	path := filepath.Join(parent, "ca")
+	priv, _, _ := Generate()
+	bytes, _ := MarshalPrivate(priv)
+	err := WritePrivateToDisk(path, bytes)
+	if err == nil {
+		t.Fatal("expected error for parent dir with mode 0755; got nil")
+	}
+	if !strings.Contains(err.Error(), "parent") && !strings.Contains(err.Error(), "mode") {
+		t.Errorf("error %q does not mention parent or mode; refuse with a clear message", err)
+	}
+	// Confirm no file was created (write must abort before touching disk).
+	if _, statErr := os.Stat(path); statErr == nil {
+		t.Error("file was created despite loose parent dir; must abort before write")
+	}
+}
+
+// TestWritePrivateOKWithTightParentDir is the positive-path companion: a
+// freshly-created 0o700 parent directory is acceptable.
+func TestWritePrivateOKWithTightParentDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX parent-dir mode check is Unix-only")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o700); err != nil {
+		t.Fatalf("chmod parent: %v", err)
+	}
+	path := filepath.Join(parent, "ca")
+	priv, _, _ := Generate()
+	bytes, _ := MarshalPrivate(priv)
+	if err := WritePrivateToDisk(path, bytes); err != nil {
+		t.Fatalf("WritePrivateToDisk on 0700 parent: %v", err)
+	}
+}
+
 func TestWritePublicWritesReadableFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ca.pub")
