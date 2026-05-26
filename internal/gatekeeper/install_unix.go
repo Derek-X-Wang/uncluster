@@ -246,17 +246,84 @@ func grantPrincipalsAccess(dir string) error {
 }
 
 // installService installs the system service using kardianos/service.
+// On "already installed," checks whether the on-disk unit file's executable
+// path, username, and command arguments match the intended config. If any
+// have drifted (operator moved the agent binary, changed the service
+// account, etc.), the unit is rebuilt: Stop → Uninstall → Install. See #50.
+// Pre-fix the "already installed" branch was silently suppressed, so a
+// re-install with a different binary path quietly kept the old unit file.
 func installService(ctx context.Context, cfg agent.Config, serviceExe string) error {
 	svc, err := buildService(cfg, serviceExe)
 	if err != nil {
 		return err
 	}
-	// Install is idempotent — ignore "already installed" errors.
 	err = svc.Install()
-	if err != nil && !isAlreadyInstalledErr(err) {
+	if err == nil {
+		return nil
+	}
+	if !isAlreadyInstalledErr(err) {
 		return err
 	}
+	// Already installed. Check for drift and re-install if needed.
+	drift, drErr := checkServiceUnitDrift(serviceExe, serviceAccountName())
+	if drErr != nil {
+		// Could not read the unit file (permission, missing, etc.). Keep the
+		// idempotent behaviour rather than tearing down on stat error — the
+		// pre-fix path was a no-op too.
+		return nil
+	}
+	if drift == "" {
+		return nil // no drift
+	}
+	// Drift detected — rebuild the unit.
+	_ = stopServiceForReinstall(ctx)
+	if err := svc.Uninstall(); err != nil {
+		return fmt.Errorf("uninstall drifted service (%s): %w", drift, err)
+	}
+	if err := svc.Install(); err != nil {
+		return fmt.Errorf("reinstall service after drift (%s): %w", drift, err)
+	}
 	return nil
+}
+
+// checkServiceUnitDrift reads the on-disk service unit and delegates to
+// detectServiceUnitDrift for the substring comparisons. Returns an error
+// only if the unit file cannot be read.
+func checkServiceUnitDrift(intendedExe, intendedUser string) (string, error) {
+	path := serviceUnitPath()
+	if path == "" {
+		return "", fmt.Errorf("unknown service unit path for GOOS=%s", runtime.GOOS)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return detectServiceUnitDrift(string(data), intendedExe, intendedUser), nil
+}
+
+
+// serviceUnitPath returns the on-disk location of the agent's system service
+// unit file (systemd .service or launchd .plist).
+func serviceUnitPath() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/Library/LaunchDaemons/com.uncluster.agent.plist"
+	case "linux":
+		return "/etc/systemd/system/com.uncluster.agent.service"
+	default:
+		return ""
+	}
+}
+
+// stopServiceForReinstall best-effort stops the service before uninstall.
+// Errors are non-fatal because Uninstall doesn't require a running service.
+func stopServiceForReinstall(ctx context.Context) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.CommandContext(ctx, "launchctl", "stop", "com.uncluster.agent").Run()
+	default:
+		return exec.CommandContext(ctx, "systemctl", "stop", "com.uncluster.agent").Run()
+	}
 }
 
 // startService starts (or restarts) the system service.
