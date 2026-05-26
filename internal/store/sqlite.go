@@ -601,11 +601,25 @@ func (s *sqliteStore) bumpPolicyVersionTx(ctx context.Context, tx *sql.Tx, agent
 
 // GetPolicySnapshot returns the current policy projection for an agent.
 // Returns a zero-version empty snapshot (no error) if no ACL rows exist.
+//
+// All reads run inside a single deferred read transaction so the returned
+// (version, hash, principals) come from one consistent point in time. Without
+// this, a concurrent ACL change between the version read and the principals
+// read returned a torn snapshot — the Agent's applied_hash would never match
+// the desired_hash and the server would re-push policy in a loop. See #41.
 func (s *sqliteStore) GetPolicySnapshot(ctx context.Context, agentID string) (PolicySnapshot, error) {
-	// Get version + hash.
+	// Read-only tx. SQLite's default deferred isolation is sufficient: WAL mode
+	// gives each tx a consistent read snapshot at the point of its first read,
+	// and the writer side already serialises via MaxOpenConns(1).
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return PolicySnapshot{}, fmt.Errorf("begin read tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var version int64
 	var hash string
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT version, hash FROM agent_policy_versions WHERE agent_id = ?`, agentID).
 		Scan(&version, &hash)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -614,8 +628,7 @@ func (s *sqliteStore) GetPolicySnapshot(ctx context.Context, agentID string) (Po
 	// Either no version row or version=0 → return empty snapshot at version 0.
 	// The agent should apply an empty principals map (wipe all principals files).
 
-	// Load principals.
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := tx.QueryContext(ctx,
 		`SELECT username, caller_token_id FROM acl WHERE agent_id = ? ORDER BY username, caller_token_id`, agentID)
 	if err != nil {
 		return PolicySnapshot{}, err
