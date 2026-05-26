@@ -69,29 +69,59 @@ func (a *Agent) WithEndpointProvider(ep EndpointProvider) *Agent {
 }
 
 // Run blocks until ctx is cancelled or auth fails permanently.
+//
+// Shutdown ordering matters for the apply channel (#45): the heartbeat
+// goroutine sends snapshots into applyCh, the apply goroutine receives them.
+// Previously Run() closed applyCh via a defer while the heartbeat goroutine
+// could still be inside heartbeatOnceV2 — a race-with-shutdown caused a
+// send-on-closed-channel panic.
+//
+// Fix: track the heartbeat goroutine with a WaitGroup and close applyCh only
+// after Wait() returns. The apply goroutine then drains and exits on the
+// channel close. We also wait for the apply goroutine itself so Run does not
+// leak a worker once it returns.
 func (a *Agent) Run(ctx context.Context) error {
 	hbCtx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
 
 	// Start the serialised policy-apply worker.
 	a.applyCh = make(chan applyRequest, 1)
+	var applyWG sync.WaitGroup
+	applyWG.Add(1)
 	go func() {
+		defer applyWG.Done()
 		for req := range a.applyCh {
 			a.runApplyPolicy(req.snapshot)
 		}
 	}()
-	defer close(a.applyCh)
 
 	authErrCh := make(chan error, 1)
-	go func() { authErrCh <- a.heartbeatLoop(hbCtx) }()
+	var hbWG sync.WaitGroup
+	hbWG.Add(1)
+	go func() {
+		defer hbWG.Done()
+		authErrCh <- a.heartbeatLoop(hbCtx)
+	}()
 
+	// shutdown drains both goroutines in order: heartbeat first (so it can
+	// finish any in-flight send into applyCh), then close applyCh, then wait
+	// for the apply worker to drain queued requests and exit.
+	shutdown := func() {
+		cancelAll()
+		hbWG.Wait()
+		close(a.applyCh)
+		applyWG.Wait()
+	}
+
+	var runErr error
 	select {
 	case <-ctx.Done():
-		return nil
+		// Caller cancelled; clean exit.
 	case err := <-authErrCh:
-		cancelAll()
-		return err
+		runErr = err
 	}
+	shutdown()
+	return runErr
 }
 
 func (a *Agent) heartbeatLoop(ctx context.Context) error {
