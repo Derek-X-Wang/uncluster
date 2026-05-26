@@ -82,12 +82,16 @@ func TestRun_410Deprovision_EndToEnd(t *testing.T) {
 
 // TestDeprovisionedMarkerPath_Resolution covers the helper independently:
 // when configPath is set it derives sibling-of-agent.toml; when empty it
-// falls back to the default config path.
+// falls back to the default config path. Uses filepath.Join for the want
+// values so the test passes on Windows (backslash separators) as well as
+// POSIX.
 func TestDeprovisionedMarkerPath_Resolution(t *testing.T) {
 	t.Run("with configPath", func(t *testing.T) {
-		got := deprovisionedMarkerPath("/tmp/x/agent.toml")
-		if got != "/tmp/x/.deprovisioned" {
-			t.Errorf("got %q, want /tmp/x/.deprovisioned", got)
+		dir := filepath.Join(t.TempDir(), "x")
+		cfg := filepath.Join(dir, "agent.toml")
+		want := filepath.Join(dir, ".deprovisioned")
+		if got := deprovisionedMarkerPath(cfg); got != want {
+			t.Errorf("got %q, want %q", got, want)
 		}
 	})
 	t.Run("without configPath uses default", func(t *testing.T) {
