@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -9,6 +10,12 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/store"
 	"github.com/derek-x-wang/uncluster/internal/token"
 )
+
+// hashSecret is a package-level indirection over token.HashSecret so tests can
+// inject a deterministic failure to verify the register handler's error path
+// (see TestAgentRegister_HashSecretFailure). Production code uses the real
+// argon2id implementation.
+var hashSecret = token.HashSecret
 
 // expectedPaths returns the canonical SSH-related paths for the given GOOS
 // platform string (as reported in metadata["os"] by the Agent). Defaults to
@@ -107,7 +114,17 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	hash, _ := token.HashSecret(agentTok.Secret)
+	hash, err := hashSecret(agentTok.Secret)
+	if err != nil {
+		// argon2id can fail under memory pressure or if rand.Read fails. The
+		// pre-fix code swallowed this and stored an empty hash, which made
+		// every future heartbeat 401 forever (#42). Returning 500 lets the
+		// Agent's register retry pick a new join token; nothing has been
+		// persisted into tokens yet because CreateToken is below.
+		slog.Error("register: hash agent token secret", "err", err)
+		writeError(w, http.StatusInternalServerError, "hash secret: "+err.Error())
+		return
+	}
 	aid := ag.ID
 	if _, err := s.cfg.Store.CreateToken(r.Context(), store.NewTokenParams{
 		ID: agentTok.ID, Kind: store.TokenAgent, AgentID: &aid, SecretHash: hash, Label: "agent:" + ag.Name,
