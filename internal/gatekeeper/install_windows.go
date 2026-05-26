@@ -178,14 +178,38 @@ func grantPrincipalsAccessWindows(dir string) error {
 }
 
 // installService installs the Windows SCM service.
+// On "already installed," queries the existing service config via `sc qc`
+// and re-installs if the BINARY_PATH_NAME or SERVICE_START_NAME has drifted
+// (see #50 — matches the Unix path's drift detection).
 func installService(ctx context.Context, cfg agent.Config, serviceExe string) error {
 	svc, err := buildService(cfg, serviceExe)
 	if err != nil {
 		return err
 	}
 	err = svc.Install()
-	if err != nil && !isAlreadyInstalledErr(err) {
+	if err == nil {
+		return nil
+	}
+	if !isAlreadyInstalledErr(err) {
 		return err
+	}
+	// Already installed. Probe for drift via sc qc.
+	out, qcErr := exec.CommandContext(ctx, "sc", "qc", "UnclusterAgent").CombinedOutput()
+	if qcErr != nil {
+		// Couldn't query; preserve pre-fix idempotent behaviour.
+		return nil
+	}
+	drift := detectServiceUnitDrift(string(out), serviceExe, windowsServiceAccountName)
+	if drift == "" {
+		return nil
+	}
+	// Drift detected — rebuild.
+	_ = exec.CommandContext(ctx, "net", "stop", "UnclusterAgent").Run()
+	if err := svc.Uninstall(); err != nil {
+		return fmt.Errorf("uninstall drifted service (%s): %w", drift, err)
+	}
+	if err := svc.Install(); err != nil {
+		return fmt.Errorf("reinstall service after drift (%s): %w", drift, err)
 	}
 	return nil
 }
