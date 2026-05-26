@@ -30,6 +30,7 @@ type EndpointProvider func() []api.AgentEndpoint
 
 type Agent struct {
 	cfg              Config
+	configPath       string // path to agent.toml; used to derive .deprovisioned marker location (#46)
 	client           *ServerClient
 	logger           *slog.Logger
 	healthProvider   HealthProvider   // optional; injected by CLI
@@ -66,6 +67,38 @@ func (a *Agent) WithHealthProvider(hp HealthProvider) *Agent {
 func (a *Agent) WithEndpointProvider(ep EndpointProvider) *Agent {
 	a.endpointProvider = ep
 	return a
+}
+
+// WithConfigPath records the path of the agent's config file (agent.toml) so
+// the agent can derive the directory for sibling artefacts — currently the
+// .deprovisioned marker written by onRevoked (#46). Pre-fix the marker path
+// was derived from cfg.ExpectedPaths.CAPubkey, which lives in /etc/ssh, not
+// next to agent.toml — supervisor + re-run flows couldn't see it.
+func (a *Agent) WithConfigPath(path string) *Agent {
+	a.configPath = path
+	return a
+}
+
+// DeprovisionedMarkerPath returns the path of the .deprovisioned marker for
+// this Agent. Exported so CLI startup can check for it and refuse to run a
+// previously-deprovisioned agent (avoids supervisor flap loops).
+func (a *Agent) DeprovisionedMarkerPath() string {
+	return deprovisionedMarkerPath(a.configPath)
+}
+
+// deprovisionedMarkerPath returns the canonical marker path. Pre-fix the
+// computation derived this from cfg.ExpectedPaths.CAPubkey (in /etc/ssh),
+// which is a different directory from agent.toml. Now we resolve from
+// configPath if set, falling back to DefaultConfigPath's directory.
+func deprovisionedMarkerPath(configPath string) string {
+	if configPath != "" {
+		return filepath.Join(filepath.Dir(configPath), ".deprovisioned")
+	}
+	if p, err := DefaultConfigPath(); err == nil {
+		return filepath.Join(filepath.Dir(p), ".deprovisioned")
+	}
+	// Last resort: cwd. Tests typically set configPath explicitly.
+	return ".deprovisioned"
 }
 
 // Run blocks until ctx is cancelled or auth fails permanently.
@@ -207,18 +240,15 @@ func (a *Agent) onRevoked() error {
 			}
 		}
 	}
-	// Write .deprovisioned marker next to agent.toml so the supervisor sees it.
-	configDir := a.cfg.ExpectedPaths.CAPubkey // best proxy for config dir; fall back
-	if configDir == "" {
-		if h, err := os.UserHomeDir(); err == nil {
-			configDir = filepath.Join(h, ".config", "uncluster")
+	// Write .deprovisioned marker NEXT TO agent.toml so the supervisor sees
+	// it on next start (#46). Pre-fix the marker was derived from
+	// ExpectedPaths.CAPubkey (typically /etc/ssh), a different directory
+	// from the config dir; the supervisor restart never noticed the marker.
+	marker := a.DeprovisionedMarkerPath()
+	if marker != "" {
+		if err := os.MkdirAll(filepath.Dir(marker), 0o700); err == nil {
+			_ = os.WriteFile(marker, []byte("deprovisioned\n"), 0o600)
 		}
-	} else {
-		configDir = filepath.Dir(configDir)
-	}
-	if configDir != "" {
-		marker := filepath.Join(configDir, ".deprovisioned")
-		_ = os.WriteFile(marker, []byte("deprovisioned\n"), 0o600)
 	}
 	return ErrDeprovisioned
 }

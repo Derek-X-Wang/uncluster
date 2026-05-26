@@ -35,28 +35,51 @@ func newAgentCmd() *cobra.Command {
 			if cfg.Server == "" || cfg.AgentToken == "" {
 				return fmt.Errorf("agent not joined; run `uncluster agent join` first")
 			}
-			a := agent.New(cfg, nil).WithHealthProvider(
-				func(ctx context.Context) []api.AgentHealthCheck {
-					results := gatekeeper.Doctor(ctx, cfg)
-					checks := make([]api.AgentHealthCheck, 0, len(results))
-					for _, r := range results {
-						hc := api.AgentHealthCheck{
-							Component: gatekeeperComponent(r.Name),
-							Check:     gatekeeperCheck(r.Name),
-							State:     gatekeeperState(r.Status),
+			a := agent.New(cfg, nil).
+				WithConfigPath(p).
+				WithHealthProvider(
+					func(ctx context.Context) []api.AgentHealthCheck {
+						results := gatekeeper.Doctor(ctx, cfg)
+						checks := make([]api.AgentHealthCheck, 0, len(results))
+						for _, r := range results {
+							hc := api.AgentHealthCheck{
+								Component: gatekeeperComponent(r.Name),
+								Check:     gatekeeperCheck(r.Name),
+								State:     gatekeeperState(r.Status),
+							}
+							if r.Message != "" && r.Status != gatekeeper.CheckOK {
+								msg := r.Message
+								hc.Message = &msg
+							}
+							checks = append(checks, hc)
 						}
-						if r.Message != "" && r.Status != gatekeeper.CheckOK {
-							msg := r.Message
-							hc.Message = &msg
-						}
-						checks = append(checks, hc)
-					}
-					return checks
-				},
-			)
+						return checks
+					},
+				)
+			// Refuse to start if a .deprovisioned marker exists next to
+			// agent.toml. The supervisor would otherwise flap-restart us
+			// against a revoked token, which the operator has to manually
+			// untangle (#46).
+			if _, err := os.Stat(a.DeprovisionedMarkerPath()); err == nil {
+				fmt.Fprintln(cmd.ErrOrStderr(),
+					"agent: previously deprovisioned by control plane; uninstall the service unit manually (see `uncluster agent install --help`).")
+				return nil
+			}
 			if err := a.Run(cmd.Context()); err != nil {
-				if errors.Is(err, agent.ErrUnauthorized) {
-					fmt.Fprintln(cmd.ErrOrStderr(), "agent: revoked by server; exiting")
+				switch {
+				case errors.Is(err, agent.ErrDeprovisioned):
+					// 410-Gone path: onRevoked wiped principals and wrote
+					// the marker. Exit 0 so the service supervisor does NOT
+					// restart us (per ACCEPTANCE.md §44).
+					fmt.Fprintln(cmd.ErrOrStderr(),
+						"agent: deprovisioned by control plane; principals wiped, supervisor should not restart")
+					return nil
+				case errors.Is(err, agent.ErrUnauthorized):
+					// 401 path: token revoked at the token layer but agent
+					// record is still enrolled. Principals preserved; operator
+					// must intervene (re-issue agent token or remove agent).
+					fmt.Fprintln(cmd.ErrOrStderr(),
+						"agent: unauthorized; agent token revoked or rotated; operator intervention required")
 					return nil
 				}
 				return err

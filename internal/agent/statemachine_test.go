@@ -61,10 +61,14 @@ func TestServerClient_Do_Returns401AsErrUnauthorized(t *testing.T) {
 // TestOnRevoked_WipesPrincipals verifies that onRevoked() removes all files
 // from the principals directory.
 func TestOnRevoked_WipesPrincipals(t *testing.T) {
-	dir := t.TempDir()
-	// Write some principal files.
+	// Use two distinct dirs to model the real install layout (#46): config
+	// dir holds agent.toml + the .deprovisioned marker; principals dir lives
+	// in /etc/ssh/auth_principals. Pre-fix the marker was incorrectly
+	// derived from CAPubkey's dir; this test pins the new behaviour.
+	configDir := t.TempDir()
+	principalsDir := t.TempDir()
 	for _, name := range []string{"alice", "bob", "derek"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("caller_123\n"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(principalsDir, name), []byte("caller_123\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -72,11 +76,12 @@ func TestOnRevoked_WipesPrincipals(t *testing.T) {
 	a := &Agent{
 		cfg: Config{
 			ExpectedPaths: ExpectedPaths{
-				PrincipalsDir: dir,
-				CAPubkey:      filepath.Join(dir, "ca.pub"), // sets configDir = dir
+				PrincipalsDir: principalsDir,
+				CAPubkey:      "/etc/ssh/uncluster_ca.pub", // different dir on purpose
 			},
 		},
-		logger: testLogger(t),
+		configPath: filepath.Join(configDir, "agent.toml"),
+		logger:     testLogger(t),
 	}
 
 	err := a.onRevoked()
@@ -85,38 +90,49 @@ func TestOnRevoked_WipesPrincipals(t *testing.T) {
 	}
 
 	// All principal files should be gone.
-	entries, _ := os.ReadDir(dir)
+	entries, _ := os.ReadDir(principalsDir)
 	for _, e := range entries {
-		if !e.IsDir() && e.Name() != ".deprovisioned" {
-			// Only the marker should remain.
-			t.Errorf("unexpected file after revoke: %s", e.Name())
+		if !e.IsDir() {
+			t.Errorf("unexpected file after revoke in principals dir: %s", e.Name())
 		}
 	}
 
-	// .deprovisioned marker should exist.
-	marker := filepath.Join(dir, ".deprovisioned")
+	// .deprovisioned marker should exist NEXT TO agent.toml (the config dir),
+	// NOT next to the CA pubkey or in the principals dir.
+	marker := filepath.Join(configDir, ".deprovisioned")
 	if _, err := os.Stat(marker); os.IsNotExist(err) {
-		t.Error(".deprovisioned marker not written")
+		t.Errorf(".deprovisioned marker not at %s (this is the #46 regression)", marker)
+	}
+	// And NOT next to the CA pubkey.
+	if _, err := os.Stat("/etc/ssh/.deprovisioned"); err == nil {
+		t.Errorf(".deprovisioned marker leaked to /etc/ssh — the #46 bug")
+	}
+	// And NOT in the principals dir.
+	if _, err := os.Stat(filepath.Join(principalsDir, ".deprovisioned")); err == nil {
+		t.Errorf(".deprovisioned marker leaked into principals dir")
 	}
 }
 
-// TestOnRevoked_WritesDeprovisionedMarker verifies the marker content.
+// TestOnRevoked_WritesDeprovisionedMarker verifies the marker content lands
+// at the config-dir location.
 func TestOnRevoked_WritesDeprovisionedMarker(t *testing.T) {
-	dir := t.TempDir()
+	configDir := t.TempDir()
+	principalsDir := t.TempDir()
 	a := &Agent{
 		cfg: Config{
 			ExpectedPaths: ExpectedPaths{
-				PrincipalsDir: dir,
-				CAPubkey:      filepath.Join(dir, "ca.pub"),
+				PrincipalsDir: principalsDir,
+				CAPubkey:      "/etc/ssh/uncluster_ca.pub",
 			},
 		},
-		logger: testLogger(t),
+		configPath: filepath.Join(configDir, "agent.toml"),
+		logger:     testLogger(t),
 	}
 	_ = a.onRevoked()
 
-	content, err := os.ReadFile(filepath.Join(dir, ".deprovisioned"))
+	content, err := os.ReadFile(filepath.Join(configDir, ".deprovisioned"))
 	if err != nil {
-		t.Fatalf("marker not readable: %v", err)
+		t.Fatalf("marker not readable at config dir: %v", err)
 	}
 	if !strings.Contains(string(content), "deprovisioned") {
 		t.Errorf("marker content unexpected: %q", content)
