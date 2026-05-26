@@ -86,21 +86,44 @@ func LoadPrivateFromDisk(path string) (ssh.Signer, error) {
 }
 
 // WritePrivateToDisk writes marshaled private-key bytes to path with mode 0600.
-// Refuses to overwrite an existing file (so re-bootstrap is safe).
-// On Unix: mode 0600 is applied at write time.
-// On Windows: mode 0600 is set (no-op on Windows filesystem), then
-// restrictFileACL applies a DACL restricting access to SYSTEM + Administrators.
+//
+// Symlink-attack hardened (issue #38):
+//   - Uses O_CREATE|O_EXCL (plus O_NOFOLLOW on Unix) so the syscall fails
+//     atomically if any entry — file, dir, or symlink — already exists at path.
+//     Previously os.Stat+WriteFile let a dangling symlink redirect the write.
+//   - Refuses to write into a parent directory whose POSIX mode permits
+//     group/world access (a 0o600 file in a 0o755 dir is still replaceable
+//     by an attacker who controls the dir). MkdirAll(0o700) still creates the
+//     dir fresh if absent.
+//   - On Windows, parent-dir POSIX mode is meaningless; the DACL applied to
+//     the file via restrictFileACL is what restricts access.
 func WritePrivateToDisk(path string, marshaled []byte) error {
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("ca: %s already exists; refusing to overwrite", path)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("ca: stat %s: %w", path, err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("ca: mkdir %s: %w", dir, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("ca: mkdir %s: %w", filepath.Dir(path), err)
+	if err := ensureTightDir(dir); err != nil {
+		return err
 	}
-	if err := os.WriteFile(path, marshaled, 0o600); err != nil {
-		return fmt.Errorf("ca: write %s: %w", path, err)
+	// O_CREATE|O_EXCL: atomic create-or-fail. If anything already exists at
+	// path — regular file, directory, or symlink — Open fails with ErrExist.
+	// O_NOFOLLOW (Unix) makes the failure unambiguous even if a race plants a
+	// symlink between MkdirAll and Open.
+	f, err := openExclusiveNoFollow(path, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("ca: %s already exists; refusing to overwrite", path)
+		}
+		return fmt.Errorf("ca: open %s: %w", path, err)
+	}
+	if _, werr := f.Write(marshaled); werr != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("ca: write %s: %w", path, werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("ca: close %s: %w", path, cerr)
 	}
 	// On Windows, apply DACL to restrict to SYSTEM + Administrators only.
 	if err := restrictFileACL(path); err != nil {
