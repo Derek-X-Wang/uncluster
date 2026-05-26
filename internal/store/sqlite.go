@@ -427,20 +427,35 @@ func (s *sqliteStore) GetAgentPolicyState(ctx context.Context, agentID string) (
 func (s *sqliteStore) CreateACL(ctx context.Context, p CreateACLParams) (ACLEntry, error) {
 	id := "acl_" + shortID(24)
 	now := time.Now()
-	_, err := s.db.ExecContext(ctx,
+	// Transactional: ACL insert + policy version bump must commit together.
+	// Without this, a transient failure in the bump leaves an ACL row visible
+	// to /v1/certs (which signs based on the row) while the Agent's principals
+	// projection still reflects the old policy version — sshd then rejects
+	// the freshly-issued cert because the principal isn't in the file. See #40.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ACLEntry{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO acl(id, caller_token_id, agent_id, username, created_at, created_by)
 		 VALUES(?, ?, ?, ?, ?, ?)`,
 		id, p.CallerTokenID, p.AgentID, p.Username, now.Unix(), p.CreatedBy)
 	if err != nil {
 		if isUniqueViolation(err) {
-			// Idempotent: re-grant returns the existing entry.
+			// Idempotent: re-grant returns the existing entry. Release the tx
+			// before the second read — MaxOpenConns=1, so leaving the tx open
+			// while calling getACLByTriple (which uses s.db) deadlocks.
+			_ = tx.Rollback()
 			return s.getACLByTriple(ctx, p.CallerTokenID, p.AgentID, p.Username)
 		}
 		return ACLEntry{}, fmt.Errorf("insert acl: %w", err)
 	}
-	// Bump policy version for this agent.
-	if err := s.bumpPolicyVersion(ctx, p.AgentID); err != nil {
+	if err := s.bumpPolicyVersionTx(ctx, tx, p.AgentID); err != nil {
 		return ACLEntry{}, fmt.Errorf("bump policy version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ACLEntry{}, fmt.Errorf("commit acl create: %w", err)
 	}
 	return s.GetACL(ctx, id)
 }
@@ -477,20 +492,41 @@ func (s *sqliteStore) scanACL(r rowScanner) (ACLEntry, error) {
 }
 
 func (s *sqliteStore) DeleteACL(ctx context.Context, id string) error {
-	// Look up agent_id before deleting so we can bump the version.
-	entry, err := s.GetACL(ctx, id)
+	// Transactional: read the row's agent_id (to know which policy to bump),
+	// DELETE, and bump must all commit together. See CreateACL comment / #40.
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin tx: %w", err)
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM acl WHERE id = ?`, id)
+	defer func() { _ = tx.Rollback() }()
+	// Look up agent_id inside the tx so we read a consistent snapshot.
+	var agentID string
+	err = tx.QueryRowContext(ctx,
+		`SELECT agent_id FROM acl WHERE id = ?`, id).Scan(&agentID)
 	if err != nil {
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("lookup acl: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM acl WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete acl: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
+		// Race: row vanished between SELECT and DELETE (e.g. cascade from
+		// a concurrent agent deletion). The tx will roll back; report as not
+		// found so the caller sees a consistent answer.
 		return ErrNotFound
 	}
-	return s.bumpPolicyVersion(ctx, entry.AgentID)
+	if err := s.bumpPolicyVersionTx(ctx, tx, agentID); err != nil {
+		return fmt.Errorf("bump policy version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit acl delete: %w", err)
+	}
+	return nil
 }
 
 func (s *sqliteStore) ListACL(ctx context.Context, f ListACLFilter) ([]ACLEntry, error) {
@@ -524,35 +560,43 @@ func (s *sqliteStore) ListACL(ctx context.Context, f ListACLFilter) ([]ACLEntry,
 
 // bumpPolicyVersion increments the monotonic policy version for an agent and
 // recomputes the hash from current ACL rows. Upserts the row if absent.
+// Standalone callers (no existing tx) use this; it opens its own tx.
 func (s *sqliteStore) bumpPolicyVersion(ctx context.Context, agentID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPolicyVersionTx(ctx, tx, agentID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+// bumpPolicyVersionTx is the inner half: runs the bump statements within the
+// caller's transaction. Callers (CreateACL, DeleteACL) compose this with their
+// own ACL-row mutation so the whole operation is atomic — either both the ACL
+// row change and the version bump commit, or neither does. See #40.
+func (s *sqliteStore) bumpPolicyVersionTx(ctx context.Context, tx *sql.Tx, agentID string) error {
 	// Upsert version row.
-	_, err = tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO agent_policy_versions(agent_id, version, hash)
 		 VALUES(?, 1, '')
 		 ON CONFLICT(agent_id) DO UPDATE SET version = version + 1`,
-		agentID)
-	if err != nil {
+		agentID); err != nil {
 		return err
 	}
-
-	// Recompute hash from current ACL.
+	// Recompute hash from current ACL (must read the ACL within the same tx so
+	// the hash reflects the row-change in flight, not a pre-change snapshot).
 	h, err := computePolicyHash(ctx, tx, agentID)
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx,
-		`UPDATE agent_policy_versions SET hash = ? WHERE agent_id = ?`, h, agentID)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE agent_policy_versions SET hash = ? WHERE agent_id = ?`, h, agentID); err != nil {
 		return err
 	}
-
-	return tx.Commit()
+	return nil
 }
 
 // GetPolicySnapshot returns the current policy projection for an agent.
