@@ -1,0 +1,29 @@
+# Quarantine rule per ADR-0008.
+#
+# Scans recent main-branch runs of advisory-capable workflows; opens a
+# `needs-triage` issue when 3 consecutive runs are advisory failures.
+# Runs hourly so the lag between "rendezvous breaking" and "operator
+# notified" is short.
+
+name: quarantine-watchdog
+
+on:
+  schedule:
+    - cron: "17 * * * *"  # hourly, offset to avoid the top-of-hour rush
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  watch-e2e-compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: run quarantine rule for e2e-compose
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./scripts/ci/quarantine-rule.sh --workflow e2e-compose.yml --threshold 3

@@ -1,0 +1,93 @@
+# Uncluster E2E Compose stack for T1a (and reused by T1b cert-flow scenarios).
+#
+# Three roles on a user-defined bridge so the hostnames `cp`, `agent`,
+# `caller` resolve via Docker's embedded DNS. A shared named volume `shared`
+# is the rendezvous channel — CP writes CA pubkey + tokens, Agent/Caller poll.
+#
+# Build context is the repo root (../..) so the Dockerfiles can COPY go.mod
+# and the source tree from a single recognisable location.
+#
+# Run from this directory:
+#   docker compose up -d                  # boot
+#   docker compose ps                     # status
+#   docker compose logs -f                # follow logs
+#   docker compose exec caller uncluster …  # drive caller
+#   docker compose down -v                # tear down + drop volumes
+#
+# CI: the harness in test/e2e/harness/ orchestrates compose up/down and
+# scrapes artifacts on failure.
+
+name: uncluster-e2e
+
+services:
+  cp:
+    build:
+      context: ../..
+      dockerfile: test/e2e/compose/dockerfiles/cp.Dockerfile
+    hostname: cp
+    environment:
+      UNCLUSTER_ADDR: ":7777"
+      SHARED_DIR: /shared
+    volumes:
+      - shared:/shared
+      - cp-data:/var/lib/uncluster
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7777/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks:
+      - uncluster
+
+  agent:
+    build:
+      context: ../..
+      dockerfile: test/e2e/compose/dockerfiles/agent.Dockerfile
+    hostname: agent
+    environment:
+      CP_URL: http://cp:7777
+      SHARED_DIR: /shared
+      TARGET_USER: tester
+      AGENT_NAME: agent-1
+    depends_on:
+      cp:
+        condition: service_healthy
+    volumes:
+      - shared:/shared
+    healthcheck:
+      # The agent is "healthy" once sshd is accepting connections on 22.
+      test: ["CMD-SHELL", "ss -tln | grep -q ':22' || (exit 1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks:
+      - uncluster
+
+  caller:
+    build:
+      context: ../..
+      dockerfile: test/e2e/compose/dockerfiles/caller.Dockerfile
+    hostname: caller
+    environment:
+      CP_URL: http://cp:7777
+      SHARED_DIR: /shared
+      UNCLUSTER_CALLER_DIR: /var/lib/uncluster-caller
+    depends_on:
+      cp:
+        condition: service_healthy
+    volumes:
+      - shared:/shared
+      - caller-data:/var/lib/uncluster-caller
+    networks:
+      - uncluster
+
+networks:
+  uncluster:
+    driver: bridge
+
+volumes:
+  shared:
+  cp-data:
+  caller-data:
