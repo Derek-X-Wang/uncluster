@@ -1,0 +1,416 @@
+# T3 cross-machine E2E rendezvous (per ADR-0008).
+#
+# This is the FOUNDATION for T3b — it lands the Tailscale auth model,
+# failure-taxonomy classifier, retention policy, and quarantine wiring.
+# T3a smokes only the rendezvous itself: three ephemeral tailnet nodes can
+# discover and ping each other. T3b (#72) replaces the smoke steps with
+# real Control plane / Agent / Caller payloads.
+#
+# Triggers: `schedule` (nightly) + `workflow_dispatch`. **Never** runs on
+# `pull_request` — Tailscale auth + self-hosted-like cross-machine
+# orchestration is too privileged for untrusted PR code (matches the
+# T4 reasoning in ADR-0008's "T4 is HITL by nature" note).
+#
+# Failure taxonomy (the AI-agent guardrail from ADR-0008):
+#   * Steps named `bootstrap:*` → advisory failure (job's `continue-on-error`
+#     and the per-job classifier mark these non-blocking).
+#   * Steps named `rendezvous:*` → advisory failure (same).
+#   * Steps named `product:*` → required failure (blocks the gate).
+# The `enforce-taxonomy` aggregator job at the end inspects each role-job's
+# classified output and only fails the workflow when a product step failed.
+#
+# Quarantine: the workflow itself is gated by the quarantine-watchdog
+# (.github/workflows/quarantine.yml). After 3 consecutive advisory failures
+# on `main`, a `needs-triage` issue is opened and the workflow becomes
+# advisory-only until the issue is closed. This is the inverse of papering
+# over flakes — it surfaces them.
+#
+# Tailscale auth credential rotation (operator instructions):
+#   1. Provision a Tailscale OAuth client (Admin Console → Settings → OAuth
+#      clients) with the `auth_keys:write` scope and tag-owner permissions
+#      for `tag:ci`. Pick a 90-day or 365-day rotation cadence.
+#   2. `gh secret set TS_OAUTH_CLIENT_ID  --repo Derek-X-Wang/uncluster`
+#      `gh secret set TS_OAUTH_SECRET     --repo Derek-X-Wang/uncluster`
+#   3. (Alternative fallback) if WIF + OAuth are unavailable in the
+#      Tailscale tenant, use a reusable ephemeral auth key:
+#      `gh secret set TS_AUTHKEY --repo Derek-X-Wang/uncluster`
+#      The auth key MUST be reusable + ephemeral + tagged. Rotate ≤ 90d.
+#   4. The Tailscale Admin Console must have `tagOwners: { "tag:ci": [...] }`
+#      configured so this workflow can create tagged nodes.
+
+name: e2e-cross-machine
+
+on:
+  schedule:
+    - cron: "23 7 * * *"   # nightly 07:23 UTC
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Manual trigger reason (logged to audit trail)"
+        required: false
+        default: "manual smoke"
+
+# Workflow-level timeout cap so a hung tailnet handshake or rendezvous wait
+# cannot hold a GHA slot for 6h. The default per-job timeout (360 min) is
+# also too generous for an E2E.
+concurrency:
+  group: e2e-cross-machine-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write      # required for Tailscale WIF / OIDC if used
+  issues: write        # for the inline quarantine hook (if armed)
+  actions: read
+
+env:
+  TS_TAILNET_NAME: ci-uncluster
+  TS_TAG: tag:ci
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Three parallel role jobs. Each joins the same tailnet under a
+  # run-id-scoped hostname, pings the other two peers by magic-dns name,
+  # uploads its tailnet status as an artifact, and emits a classifier
+  # output that the aggregator below consumes.
+  # -----------------------------------------------------------------------
+  cp:
+    name: role-cp
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      class: ${{ steps.classify.outputs.class }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bootstrap:install-tailscale
+        id: ts-install
+        continue-on-error: true
+        # Tailscale ships a one-liner installer for Ubuntu. We pin nothing
+        # because the action below also installs; this step is a sanity
+        # smoke to surface broken mirrors as advisory rather than required.
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale version
+
+      - name: bootstrap:tailscale-up
+        id: ts-up
+        continue-on-error: true
+        uses: tailscale/github-action@v2
+        with:
+          # Prefer OAuth credentials. Falls back to authkey if OAuth secrets
+          # are absent — the action errors loudly when neither is set, which
+          # is what we want operator-wise.
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: ${{ env.TS_TAG }}
+          hostname: cp-ci-${{ github.run_id }}
+          # `--accept-routes=false` because we do not want this ephemeral
+          # node to advertise into operator-controlled subnets.
+          args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
+
+      - name: rendezvous:wait-for-peers
+        id: rdv-wait
+        continue-on-error: true
+        # Wait until both peers are reachable by magic-dns. Each tailscale
+        # ping has its own ~5s budget; we retry the outer loop for up to
+        # 5 minutes to tolerate slow peer registration.
+        run: |
+          set -euo pipefail
+          peers=("agent-linux-ci-${{ github.run_id }}" "caller-ci-${{ github.run_id }}")
+          deadline=$(( $(date +%s) + 300 ))
+          while [[ $(date +%s) -lt $deadline ]]; do
+              ok=1
+              for p in "${peers[@]}"; do
+                  if ! tailscale ping -c 1 --timeout 5s "$p" >/dev/null 2>&1; then
+                      ok=0
+                      echo "still waiting for $p ..."
+                  fi
+              done
+              if [[ $ok -eq 1 ]]; then
+                  echo "all peers reachable"
+                  exit 0
+              fi
+              sleep 10
+          done
+          echo "::error::peers never became reachable in 5 minutes"
+          exit 1
+
+      - name: rendezvous:ping-summary
+        id: rdv-ping
+        continue-on-error: true
+        if: steps.rdv-wait.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for p in agent-linux-ci-${{ github.run_id }} caller-ci-${{ github.run_id }}; do
+              echo "=== ping $p ==="
+              tailscale ping -c 3 --timeout 5s "$p"
+          done
+
+      - name: collect:tailnet-state
+        id: collect
+        if: always()
+        # Best-effort scrape: status, IPs, log buffer. Tagged `collect:*` to
+        # signal "diagnostic, not part of the gate".
+        run: |
+          mkdir -p artifacts
+          tailscale status --json > artifacts/status.json 2>&1 || true
+          tailscale ip -4 > artifacts/ipv4.txt 2>&1 || true
+          tailscale ip -6 > artifacts/ipv6.txt 2>&1 || true
+          journalctl -u tailscaled --no-pager --since "10 minutes ago" \
+              > artifacts/tailscaled.log 2>&1 || true
+          ip addr > artifacts/ip-addr.txt 2>&1 || true
+          ss -tlnp > artifacts/listening.txt 2>&1 || true
+
+      - name: classify
+        id: classify
+        if: always()
+        # Delegates to scripts/ci/classify-step.sh which implements the
+        # bootstrap/rendezvous/product/collect taxonomy from ADR-0008.
+        # T3b adds `product:*` steps here without re-plumbing the script.
+        run: |
+          ./scripts/ci/classify-step.sh \
+              "bootstrap:install-tailscale=${{ steps.ts-install.outcome }}" \
+              "bootstrap:tailscale-up=${{ steps.ts-up.outcome }}" \
+              "rendezvous:wait-for-peers=${{ steps.rdv-wait.outcome }}" \
+              "rendezvous:ping-summary=${{ steps.rdv-ping.outcome }}" \
+              >> "$GITHUB_OUTPUT"
+
+      - name: upload-artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cross-machine-cp-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  agent-linux:
+    name: role-agent-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      class: ${{ steps.classify.outputs.class }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bootstrap:install-tailscale
+        id: ts-install
+        continue-on-error: true
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale version
+
+      - name: bootstrap:tailscale-up
+        id: ts-up
+        continue-on-error: true
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: ${{ env.TS_TAG }}
+          hostname: agent-linux-ci-${{ github.run_id }}
+          args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
+
+      - name: rendezvous:wait-for-peers
+        id: rdv-wait
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          peers=("cp-ci-${{ github.run_id }}" "caller-ci-${{ github.run_id }}")
+          deadline=$(( $(date +%s) + 300 ))
+          while [[ $(date +%s) -lt $deadline ]]; do
+              ok=1
+              for p in "${peers[@]}"; do
+                  if ! tailscale ping -c 1 --timeout 5s "$p" >/dev/null 2>&1; then
+                      ok=0
+                  fi
+              done
+              if [[ $ok -eq 1 ]]; then exit 0; fi
+              sleep 10
+          done
+          echo "::error::peers never became reachable in 5 minutes"
+          exit 1
+
+      - name: rendezvous:ping-summary
+        id: rdv-ping
+        continue-on-error: true
+        if: steps.rdv-wait.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for p in cp-ci-${{ github.run_id }} caller-ci-${{ github.run_id }}; do
+              echo "=== ping $p ==="
+              tailscale ping -c 3 --timeout 5s "$p"
+          done
+
+      - name: collect:tailnet-state
+        if: always()
+        run: |
+          mkdir -p artifacts
+          tailscale status --json > artifacts/status.json 2>&1 || true
+          tailscale ip -4 > artifacts/ipv4.txt 2>&1 || true
+          journalctl -u tailscaled --no-pager --since "10 minutes ago" \
+              > artifacts/tailscaled.log 2>&1 || true
+          ip addr > artifacts/ip-addr.txt 2>&1 || true
+
+      - name: classify
+        id: classify
+        if: always()
+        run: |
+          ./scripts/ci/classify-step.sh \
+              "bootstrap:install-tailscale=${{ steps.ts-install.outcome }}" \
+              "bootstrap:tailscale-up=${{ steps.ts-up.outcome }}" \
+              "rendezvous:wait-for-peers=${{ steps.rdv-wait.outcome }}" \
+              "rendezvous:ping-summary=${{ steps.rdv-ping.outcome }}" \
+              >> "$GITHUB_OUTPUT"
+
+      - name: upload-artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cross-machine-agent-linux-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  caller:
+    name: role-caller
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      class: ${{ steps.classify.outputs.class }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bootstrap:install-tailscale
+        id: ts-install
+        continue-on-error: true
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale version
+
+      - name: bootstrap:tailscale-up
+        id: ts-up
+        continue-on-error: true
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: ${{ env.TS_TAG }}
+          hostname: caller-ci-${{ github.run_id }}
+          args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
+
+      - name: rendezvous:wait-for-peers
+        id: rdv-wait
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          peers=("cp-ci-${{ github.run_id }}" "agent-linux-ci-${{ github.run_id }}")
+          deadline=$(( $(date +%s) + 300 ))
+          while [[ $(date +%s) -lt $deadline ]]; do
+              ok=1
+              for p in "${peers[@]}"; do
+                  if ! tailscale ping -c 1 --timeout 5s "$p" >/dev/null 2>&1; then
+                      ok=0
+                  fi
+              done
+              if [[ $ok -eq 1 ]]; then exit 0; fi
+              sleep 10
+          done
+          echo "::error::peers never became reachable in 5 minutes"
+          exit 1
+
+      - name: rendezvous:ping-summary
+        id: rdv-ping
+        continue-on-error: true
+        if: steps.rdv-wait.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for p in cp-ci-${{ github.run_id }} agent-linux-ci-${{ github.run_id }}; do
+              echo "=== ping $p ==="
+              tailscale ping -c 3 --timeout 5s "$p"
+          done
+
+      - name: collect:tailnet-state
+        if: always()
+        run: |
+          mkdir -p artifacts
+          tailscale status --json > artifacts/status.json 2>&1 || true
+          tailscale ip -4 > artifacts/ipv4.txt 2>&1 || true
+          journalctl -u tailscaled --no-pager --since "10 minutes ago" \
+              > artifacts/tailscaled.log 2>&1 || true
+
+      - name: classify
+        id: classify
+        if: always()
+        run: |
+          ./scripts/ci/classify-step.sh \
+              "bootstrap:install-tailscale=${{ steps.ts-install.outcome }}" \
+              "bootstrap:tailscale-up=${{ steps.ts-up.outcome }}" \
+              "rendezvous:wait-for-peers=${{ steps.rdv-wait.outcome }}" \
+              "rendezvous:ping-summary=${{ steps.rdv-ping.outcome }}" \
+              >> "$GITHUB_OUTPUT"
+
+      - name: upload-artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cross-machine-caller-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # -----------------------------------------------------------------------
+  # Aggregator: enforces the failure taxonomy.
+  #
+  # Rules (per ADR-0008):
+  #   * If every role's classifier output is `success` → workflow succeeds.
+  #   * If any role's classifier output is `required` → workflow fails red.
+  #   * If at least one role is `advisory` and none are `required` →
+  #     workflow succeeds with a warning. The quarantine watchdog (separate
+  #     workflow, scheduled hourly) catches 3 consecutive advisory failures
+  #     and opens a needs-triage issue.
+  #
+  # T3a has no `product:*` steps, so the `required` branch is structurally
+  # unreachable from this slice. The branch is wired up so T3b can add
+  # product steps without re-plumbing the gate.
+  # -----------------------------------------------------------------------
+  enforce-taxonomy:
+    name: enforce-taxonomy
+    runs-on: ubuntu-latest
+    needs: [cp, agent-linux, caller]
+    if: always()
+    steps:
+      - name: classify workflow
+        run: |
+          set -euo pipefail
+          cp_class="${{ needs.cp.outputs.class }}"
+          agent_class="${{ needs.agent-linux.outputs.class }}"
+          caller_class="${{ needs.caller.outputs.class }}"
+          echo "cp=${cp_class} agent=${agent_class} caller=${caller_class}"
+
+          # `needs.X.result` reports the job-level outcome — it is `success`
+          # only when every step in that job succeeded. With continue-on-error
+          # on bootstrap+rendezvous steps the job result will be `success`
+          # even if those steps red; the classifier output is the source of
+          # truth for product-vs-advisory classification.
+          for c in "$cp_class" "$agent_class" "$caller_class"; do
+              if [[ "$c" == "required" ]]; then
+                  echo "::error::At least one role had a product-class (required) failure → failing the workflow"
+                  exit 1
+              fi
+          done
+
+          # No required failures. If any role is advisory, surface a warning
+          # but pass the workflow. Quarantine watchdog handles repeat-flake.
+          for c in "$cp_class" "$agent_class" "$caller_class"; do
+              if [[ "$c" == "advisory" ]]; then
+                  echo "::warning::Advisory-class failure(s) in tailnet rendezvous; quarantine watchdog will escalate after 3 consecutive."
+                  exit 0
+              fi
+          done
+
+          echo "All roles classified `success` — clean run."

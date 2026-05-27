@@ -45,6 +45,8 @@ jobs:
         run: docker version && docker compose version
       - name: verify artifact collector script (mocked docker)
         run: bash test/e2e/scripts/test-collect-artifacts.sh
+      - name: verify failure-taxonomy classifier (intentional-fail tests)
+        run: bash scripts/ci/test-classify-step.sh
       - name: run T1a smoke
         id: smoke
         continue-on-error: true
