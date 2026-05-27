@@ -410,13 +410,337 @@ jobs:
               *)        echo "::error::T2-linux unknown class=${class}"; exit 1 ;;
           esac
 
+  # T2-windows loopback install smoke per ADR-0008.
+  # Exercises the REAL `uncluster agent install` flow on a clean
+  # windows-latest runner: SCM service install, virtual-account ACLs,
+  # OpenSSH for Windows drop-in, heartbeat + doctor + deprovision.
+  #
+  # This is the per-PR catch for Windows SCM + icacls regressions
+  # (the equivalent of #50 on Windows). All steps are PowerShell-based.
+  #
+  # Like T2-linux, this hits the same agent.toml-path bug tracked in
+  # #77 — the service runs as `NT SERVICE\UnclusterAgent` whose
+  # USERPROFILE is `C:\Windows\System32\config\systemprofile`, but
+  # `agent join` writes to the operator's USERPROFILE. The mirror step
+  # is the same temporary workaround pattern as T2-linux and goes away
+  # with the same upstream fix.
+  t2-windows-install-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: bootstrap:build-binary
+        id: build
+        run: |
+          go build -trimpath -ldflags "-s -w" -o C:\uncluster\uncluster.exe .\cmd\uncluster
+          # Add to PATH so `uncluster` resolves directly.
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\uncluster"
+          # Smoke-check.
+          & C:\uncluster\uncluster.exe --help | Out-Null
+
+      - name: bootstrap:install-sshd
+        id: sshd
+        # OpenSSH.Server is preinstalled on windows-latest runners as of
+        # 2024; keep the install step idempotent in case the image changes.
+        run: |
+          $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*'
+          if ($cap.State -ne 'Installed') {
+              Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+          }
+          Set-Service -Name sshd -StartupType Automatic
+          Start-Service sshd
+          # Wait briefly for sshd to become ready.
+          $deadline = (Get-Date).AddSeconds(20)
+          while ((Get-Date) -lt $deadline) {
+              if ((Get-Service sshd).Status -eq 'Running') { break }
+              Start-Sleep -Seconds 1
+          }
+          if ((Get-Service sshd).Status -ne 'Running') {
+              throw "sshd never started"
+          }
+
+      - name: bootstrap:cp-bootstrap
+        id: cp-bs
+        run: |
+          $env:XDG_DATA_HOME = "C:\uncluster-data"
+          New-Item -ItemType Directory -Force -Path $env:XDG_DATA_HOME | Out-Null
+          $out = & C:\uncluster\uncluster.exe server bootstrap --label ci-bootstrap 2>&1
+          $out | Set-Content C:\bs.out
+          Write-Host $out
+          # Parse the caller token. Format: "caller token (shown ONCE...):\n  <token>"
+          $lines = Get-Content C:\bs.out
+          $idx = -1
+          for ($i = 0; $i -lt $lines.Length; $i++) {
+              if ($lines[$i] -match 'caller token \(shown ONCE') { $idx = $i + 1; break }
+          }
+          if ($idx -lt 0) { throw "caller token line not found in bootstrap output" }
+          $tok = $lines[$idx].Trim()
+          if (-not $tok) { throw "caller token was empty" }
+          Set-Content -Path C:\caller-token -Value $tok -NoNewline -Encoding ASCII
+
+      - name: bootstrap:cp-start
+        id: cp-start
+        run: |
+          $env:XDG_DATA_HOME = "C:\uncluster-data"
+          # Launch CP in background; PowerShell `Start-Process` returns immediately.
+          $proc = Start-Process -FilePath C:\uncluster\uncluster.exe `
+              -ArgumentList 'server','start','--addr','127.0.0.1:17777' `
+              -RedirectStandardOutput C:\cp.log `
+              -RedirectStandardError C:\cp.err `
+              -PassThru -WindowStyle Hidden
+          $proc.Id | Out-File C:\cp.pid
+          # Wait for healthz.
+          $deadline = (Get-Date).AddSeconds(30)
+          $healthy = $false
+          while ((Get-Date) -lt $deadline) {
+              try {
+                  $r = Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:17777/healthz -TimeoutSec 2
+                  if ($r.StatusCode -eq 200) { $healthy = $true; break }
+              } catch { }
+              Start-Sleep -Seconds 1
+          }
+          if (-not $healthy) {
+              Get-Content C:\cp.log -ErrorAction SilentlyContinue
+              Get-Content C:\cp.err -ErrorAction SilentlyContinue
+              throw "cp never became healthy"
+          }
+
+      - name: rendezvous:mint-join-token
+        id: mint-join
+        run: |
+          $tok = Get-Content C:\caller-token -Raw
+          $headers = @{ 'Authorization' = "Bearer $tok"; 'Content-Type' = 'application/json' }
+          $body = '{"kind":"join","label":"ci-join"}'
+          $r = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:17777/v1/tokens -Headers $headers -Body $body
+          $r.token | Set-Content C:\join-token -NoNewline -Encoding ASCII
+          if (-not (Get-Content C:\join-token -Raw)) { throw "join token empty" }
+
+      - name: product:agent-join
+        id: agent-join
+        run: |
+          $env:UNCLUSTER_TOKEN = Get-Content C:\join-token -Raw
+          & C:\uncluster\uncluster.exe agent join `
+              --server http://127.0.0.1:17777 `
+              --name ci-agent
+
+      - name: product:agent-install
+        id: agent-install
+        # windows-latest runners are Administrator by default per GH docs.
+        run: |
+          & C:\uncluster\uncluster.exe agent install
+
+      - name: bootstrap:mirror-config-for-service-user
+        id: mirror-cfg
+        # Same #77 workaround as T2-linux but for Windows. `agent join`
+        # writes agent.toml under the operator's USERPROFILE
+        # (`$env:USERPROFILE\.config\uncluster\agent.toml`, typically
+        # `C:\Users\runneradmin\...`). The SCM service runs as
+        # `NT SERVICE\UnclusterAgent` whose profile is at
+        # `C:\Windows\System32\config\systemprofile\.config\uncluster\`.
+        # Mirror so the service can read its config. Marked `bootstrap:*`
+        # so the classifier treats its own failure as advisory if the
+        # upstream fix changes the assumption.
+        run: |
+          $src = Join-Path $env:USERPROFILE '.config\uncluster\agent.toml'
+          if (-not (Test-Path $src)) {
+              Write-Host "agent.toml not found at $src; searching..."
+              Get-ChildItem -Path C:\ -Filter 'agent.toml' -Recurse -ErrorAction SilentlyContinue |
+                  Select-Object FullName | Format-Table -AutoSize
+              throw "agent.toml missing"
+          }
+          $dst_dir = 'C:\Windows\System32\config\systemprofile\.config\uncluster'
+          New-Item -ItemType Directory -Force -Path $dst_dir | Out-Null
+          Copy-Item -Force $src (Join-Path $dst_dir 'agent.toml')
+          # Grant the virtual service account read access to its own profile dir.
+          # The default SYSTEM-only ACL on systemprofile should already include
+          # NT SERVICE\* virtual accounts, but be explicit.
+          icacls $dst_dir /grant 'NT SERVICE\UnclusterAgent:(OI)(CI)R' | Out-Null
+          # Restart so the service re-reads its (now visible) config.
+          Restart-Service UnclusterAgent
+          Start-Sleep -Seconds 3
+
+      - name: product:assert-service-running
+        id: assert-svc
+        run: |
+          $svc = Get-Service UnclusterAgent
+          if ($svc.Status -ne 'Running') {
+              throw "UnclusterAgent not running: $($svc.Status)"
+          }
+          if ($svc.StartType -ne 'Automatic') {
+              throw "UnclusterAgent StartType=$($svc.StartType), want Automatic"
+          }
+          Get-Service UnclusterAgent | Format-Table -AutoSize
+
+      - name: product:assert-agent-online
+        id: assert-online
+        run: |
+          $tok = Get-Content C:\caller-token -Raw
+          $headers = @{ 'Authorization' = "Bearer $tok" }
+          $deadline = (Get-Date).AddSeconds(40)
+          while ((Get-Date) -lt $deadline) {
+              try {
+                  $agents = Invoke-RestMethod -Uri http://127.0.0.1:17777/v1/agents -Headers $headers
+                  $ci = $agents | Where-Object { $_.name -eq 'ci-agent' } | Select-Object -First 1
+                  if ($ci -and $ci.last_seen_at) {
+                      $age = [int]((Get-Date -UFormat %s) - $ci.last_seen_at)
+                      if ($age -lt 30) {
+                          Write-Host "agent online (last seen $age s ago)"
+                          exit 0
+                      }
+                  }
+              } catch { }
+              Start-Sleep -Seconds 1
+          }
+          throw "agent never reported online"
+
+      - name: product:assert-doctor
+        id: assert-doctor
+        run: |
+          & C:\uncluster\uncluster.exe agent doctor
+          if ($LASTEXITCODE -ne 0) { throw "doctor exit=$LASTEXITCODE" }
+
+      - name: product:assert-sshd-drop-in
+        id: assert-drop-in
+        run: |
+          $p = 'C:\ProgramData\ssh\sshd_config.d\uncluster.conf'
+          if (-not (Test-Path $p)) { throw "drop-in not found at $p" }
+          $content = Get-Content $p -Raw
+          if ($content -notmatch 'TrustedUserCAKeys') { throw "missing TrustedUserCAKeys" }
+          if ($content -notmatch 'AuthorizedPrincipalsFile') { throw "missing AuthorizedPrincipalsFile" }
+
+      - name: product:assert-principals-acl
+        id: assert-acl
+        run: |
+          $dir = 'C:\ProgramData\ssh\auth_principals'
+          if (-not (Test-Path $dir)) { throw "principals dir not found at $dir" }
+          $acl = icacls $dir 2>&1 | Out-String
+          Write-Host $acl
+          # Expect an entry granting UnclusterAgent virtual account write.
+          if ($acl -notmatch 'UnclusterAgent') {
+              throw "principals dir ACL missing UnclusterAgent virtual account"
+          }
+
+      - name: product:deprovision-and-marker
+        id: deprov
+        run: |
+          $tok = Get-Content C:\caller-token -Raw
+          $headers = @{ 'Authorization' = "Bearer $tok" }
+          Invoke-RestMethod -Method Delete -Uri http://127.0.0.1:17777/v1/agents/ci-agent -Headers $headers | Out-Null
+          # Marker lands next to the agent.toml the service loaded from —
+          # under the #77 workaround that is the systemprofile path.
+          $marker = 'C:\Windows\System32\config\systemprofile\.config\uncluster\.deprovisioned'
+          $deadline = (Get-Date).AddSeconds(15)
+          $found = $false
+          while ((Get-Date) -lt $deadline) {
+              if (Test-Path $marker) { $found = $true; break }
+              Start-Sleep -Seconds 1
+          }
+          if (-not $found) {
+              Write-Host "marker not found at $marker; searching"
+              Get-ChildItem -Path C:\ -Filter '.deprovisioned' -Recurse -ErrorAction SilentlyContinue |
+                  Select-Object FullName | Format-Table -AutoSize
+              throw "marker missing"
+          }
+          # Principals dir should be empty.
+          $remaining = (Get-ChildItem -File -Path 'C:\ProgramData\ssh\auth_principals' -ErrorAction SilentlyContinue | Measure-Object).Count
+          if ($remaining -ne 0) {
+              Write-Host "principals not empty: $remaining files remain"
+              Get-ChildItem -Path 'C:\ProgramData\ssh\auth_principals' | Format-Table -AutoSize
+              throw "principals not wiped"
+          }
+
+      - name: collect:artifacts
+        if: always()
+        # Best-effort scrape. Robust against missing files (any step may
+        # have failed before its data landed).
+        run: |
+          New-Item -ItemType Directory -Force -Path t2-windows-artifacts | Out-Null
+          $ErrorActionPreference = 'Continue'
+          # Event Viewer logs filtered to our service + sshd.
+          try {
+              Get-WinEvent -LogName 'Application' -MaxEvents 200 -ErrorAction SilentlyContinue |
+                  Where-Object { $_.ProviderName -match 'Uncluster|UnclusterAgent|sshd|OpenSSH' } |
+                  Format-List | Out-File t2-windows-artifacts\events-application.txt
+          } catch { }
+          try {
+              Get-WinEvent -LogName 'System' -MaxEvents 200 -ErrorAction SilentlyContinue |
+                  Where-Object { $_.ProviderName -match 'Service Control Manager' } |
+                  Format-List | Out-File t2-windows-artifacts\events-system.txt
+          } catch { }
+          Get-Content C:\cp.log -ErrorAction SilentlyContinue | Out-File t2-windows-artifacts\cp.log
+          Get-Content C:\cp.err -ErrorAction SilentlyContinue | Out-File t2-windows-artifacts\cp.err
+          Get-Content 'C:\ProgramData\ssh\sshd_config.d\uncluster.conf' -ErrorAction SilentlyContinue | Out-File t2-windows-artifacts\sshd-drop-in.conf
+          Get-Content 'C:\ProgramData\ssh\uncluster_ca.pub' -ErrorAction SilentlyContinue | Out-File t2-windows-artifacts\ca.pub
+          icacls 'C:\ProgramData\ssh\auth_principals' 2>&1 | Out-File t2-windows-artifacts\principals-acl.txt
+          Get-ChildItem -Force 'C:\ProgramData\ssh\auth_principals' -ErrorAction SilentlyContinue |
+              Format-Table -AutoSize | Out-File t2-windows-artifacts\principals-listing.txt
+          sc.exe qc UnclusterAgent | Out-File t2-windows-artifacts\sc-qc.txt
+          Get-Service UnclusterAgent | Format-List | Out-File t2-windows-artifacts\service-detail.txt
+          Get-ChildItem -Force -Recurse -Path 'C:\Users\runneradmin\.config\uncluster' -ErrorAction SilentlyContinue |
+              Format-Table | Out-File t2-windows-artifacts\cfg-runneradmin.txt
+          Get-Content 'C:\Users\runneradmin\.config\uncluster\agent.toml' -ErrorAction SilentlyContinue |
+              Out-File t2-windows-artifacts\agent-toml-runneradmin.txt
+          Get-ChildItem -Force -Recurse -Path 'C:\Windows\System32\config\systemprofile\.config\uncluster' -ErrorAction SilentlyContinue |
+              Format-Table | Out-File t2-windows-artifacts\cfg-systemprofile.txt
+          Get-Content 'C:\Windows\System32\config\systemprofile\.config\uncluster\agent.toml' -ErrorAction SilentlyContinue |
+              Out-File t2-windows-artifacts\agent-toml-systemprofile.txt
+          Get-ChildItem t2-windows-artifacts | Format-Table -AutoSize
+
+      - name: collect:upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t2-windows-${{ github.run_id }}
+          path: t2-windows-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: enforce-taxonomy
+        if: always()
+        shell: bash
+        # Use bash for the classifier script (it's bash). The runner has
+        # bash via git bash.
+        run: |
+          ./scripts/ci/classify-step.sh \
+              "bootstrap:build-binary=${{ steps.build.outcome }}" \
+              "bootstrap:install-sshd=${{ steps.sshd.outcome }}" \
+              "bootstrap:cp-bootstrap=${{ steps.cp-bs.outcome }}" \
+              "bootstrap:cp-start=${{ steps.cp-start.outcome }}" \
+              "rendezvous:mint-join-token=${{ steps.mint-join.outcome }}" \
+              "product:agent-join=${{ steps.agent-join.outcome }}" \
+              "product:agent-install=${{ steps.agent-install.outcome }}" \
+              "bootstrap:mirror-config-for-service-user=${{ steps.mirror-cfg.outcome }}" \
+              "product:assert-service-running=${{ steps.assert-svc.outcome }}" \
+              "product:assert-agent-online=${{ steps.assert-online.outcome }}" \
+              "product:assert-doctor=${{ steps.assert-doctor.outcome }}" \
+              "product:assert-sshd-drop-in=${{ steps.assert-drop-in.outcome }}" \
+              "product:assert-principals-acl=${{ steps.assert-acl.outcome }}" \
+              "product:deprovision-and-marker=${{ steps.deprov.outcome }}" \
+              > /tmp/classify.out
+          cat /tmp/classify.out
+          class="$(grep -E '^class=' /tmp/classify.out | cut -d= -f2)"
+          case "${class}" in
+              success)  exit 0 ;;
+              advisory) echo "::warning::T2-windows advisory failure"; exit 0 ;;
+              required) echo "::error::T2-windows REQUIRED failure. Block merge."; exit 1 ;;
+              *)        echo "::error::T2-windows unknown class=${class}"; exit 1 ;;
+          esac
+
   # Aggregator job: creates a single "all-tests-pass" check that can be marked
   # as required in branch protection. This ensures ALL matrix OS variants AND
-  # the E2E Compose smoke AND the per-OS install smoke must pass before a PR
+  # the E2E Compose smoke AND the per-OS install smokes must pass before a PR
   # can merge.
   all-tests-pass:
     runs-on: ubuntu-latest
-    needs: [test, e2e-compose-smoke, t2-linux-install-smoke]
+    needs: [test, e2e-compose-smoke, t2-linux-install-smoke, t2-windows-install-smoke]
     if: always()
     steps:
       - name: fail if any required job failed
@@ -431,6 +755,10 @@ jobs:
           fi
           if [[ "${{ needs.t2-linux-install-smoke.result }}" != "success" ]]; then
             echo "t2-linux-install-smoke result: ${{ needs.t2-linux-install-smoke.result }}"
+            exit 1
+          fi
+          if [[ "${{ needs.t2-windows-install-smoke.result }}" != "success" ]]; then
+            echo "t2-windows-install-smoke result: ${{ needs.t2-windows-install-smoke.result }}"
             exit 1
           fi
 
