@@ -25,18 +25,95 @@ jobs:
       - name: go test
         run: go test ./... ${{ matrix.race }} -count=1
 
+  # T1a Compose smoke per ADR-0008. Failure-taxonomy:
+  #   * [REQUIRED] markers in test output → red gate (product failure)
+  #   * [ADVISORY] markers (rendezvous/bootstrap) → warning only, quarantine
+  #     rule escalates after 3 consecutive on main.
+  # Uses `continue-on-error: true` on the test step + an explicit classifier
+  # step so the gate decision is computed deliberately rather than from raw
+  # exit code (the classifier is the AI-agent guardrail per ADR-0008).
+  e2e-compose-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: docker info
+        run: docker version && docker compose version
+      - name: verify artifact collector script (mocked docker)
+        run: bash test/e2e/scripts/test-collect-artifacts.sh
+      - name: run T1a smoke
+        id: smoke
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          go test -tags e2e ./test/e2e/ -v -count=1 -timeout 10m 2>&1 \
+              | tee /tmp/e2e-smoke.log
+      - name: classify failure
+        id: classify
+        if: always()
+        run: |
+          set -euo pipefail
+          log=/tmp/e2e-smoke.log
+          if [[ ! -f "$log" ]]; then
+              echo "no log produced — treating as required"
+              echo "class=required" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          if grep -q '\[REQUIRED\]' "$log"; then
+              echo "found [REQUIRED] marker — product-class failure"
+              echo "class=required" >> "$GITHUB_OUTPUT"
+          elif grep -q '\[ADVISORY\]' "$log"; then
+              echo "found [ADVISORY] marker only — bootstrap/rendezvous-class failure"
+              echo "class=advisory" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.smoke.outcome }}" == "success" ]]; then
+              echo "no failure markers and smoke succeeded — clean"
+              echo "class=success" >> "$GITHUB_OUTPUT"
+          else
+              echo "no markers but test failed — defaulting to required"
+              echo "class=required" >> "$GITHUB_OUTPUT"
+          fi
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-compose-${{ github.run_id }}
+          path: |
+            test/e2e/_artifacts/
+            /tmp/e2e-smoke.log
+          if-no-files-found: warn
+          retention-days: 14
+      - name: enforce taxonomy
+        if: always()
+        run: |
+          class="${{ steps.classify.outputs.class }}"
+          echo "classification: ${class}"
+          case "${class}" in
+              success)  exit 0 ;;
+              advisory) echo "::warning::e2e-compose advisory failure (rendezvous/bootstrap); see uploaded artifacts. Quarantine rule will escalate after 3 consecutive."; exit 0 ;;
+              required) echo "::error::e2e-compose REQUIRED failure (product). Block merge."; exit 1 ;;
+              *)        echo "::error::e2e-compose classifier produced unknown class=${class}"; exit 1 ;;
+          esac
+
   # Aggregator job: creates a single "all-tests-pass" check that can be marked
-  # as required in branch protection. This ensures ALL matrix OS variants must
-  # pass before a PR can merge — not just the first successful variant.
+  # as required in branch protection. This ensures ALL matrix OS variants AND
+  # the E2E Compose smoke must pass before a PR can merge — not just one.
   all-tests-pass:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, e2e-compose-smoke]
     if: always()
     steps:
-      - name: fail if any test matrix job failed
+      - name: fail if any required job failed
         run: |
           if [[ "${{ needs.test.result }}" != "success" ]]; then
             echo "test matrix result: ${{ needs.test.result }}"
+            exit 1
+          fi
+          if [[ "${{ needs.e2e-compose-smoke.result }}" != "success" ]]; then
+            echo "e2e-compose-smoke result: ${{ needs.e2e-compose-smoke.result }}"
             exit 1
           fi
 
