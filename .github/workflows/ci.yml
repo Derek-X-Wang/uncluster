@@ -12,6 +12,7 @@ jobs:
         include:
           - { os: ubuntu-latest,  race: "-race" }
           - { os: windows-latest, race: ""       }
+          - { os: macos-latest,   race: "-race" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
