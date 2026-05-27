@@ -100,12 +100,284 @@ jobs:
               *)        echo "::error::e2e-compose classifier produced unknown class=${class}"; exit 1 ;;
           esac
 
+  # T2-linux loopback install smoke per ADR-0008.
+  # Exercises the REAL `uncluster agent install` flow on a clean
+  # ubuntu-latest runner: bootstraps a local Control plane on loopback,
+  # joins+installs an Agent on the same host, asserts systemd unit + sshd
+  # drop-in + principals dir + doctor pass, then deprovisions cleanly.
+  #
+  # This is the per-PR catch for systemd-unit-name-style install drift
+  # (e.g. the `113b747` hotfix that escaped because no smoke tested the
+  # actual install path). Steps follow the bootstrap/rendezvous/product
+  # taxonomy from ADR-0008 — failures here are required (product class).
+  t2-linux-install-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: bootstrap:build-binary
+        id: build
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
+          # Place it on a system path so `sudo uncluster agent install` finds it.
+          sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+          uncluster --help >/dev/null
+
+      - name: bootstrap:install-sshd
+        id: sshd
+        # openssh-server is pre-installed on ubuntu-latest runners as of
+        # 2024, but keep the apt step idempotent in case the image changes.
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null; then
+              sudo apt-get update -y
+              sudo apt-get install -y --no-install-recommends openssh-server
+          fi
+          sudo systemctl enable --now ssh
+          sudo systemctl is-active --quiet ssh
+
+      - name: bootstrap:cp-bootstrap
+        id: cp-bs
+        run: |
+          set -euo pipefail
+          # Use a runner-local data dir so we do not collide with whatever
+          # the action runner might persist between jobs (we run on
+          # ubuntu-latest which is fresh per-job, but defensive).
+          export XDG_DATA_HOME=/tmp/uncluster-ci/data
+          mkdir -p "${XDG_DATA_HOME}"
+          uncluster server bootstrap --label ci-bootstrap > /tmp/bs.out
+          cat /tmp/bs.out
+          # Stash the caller token for later steps.
+          awk '/caller token \(shown ONCE/{getline; gsub(/^[[:space:]]+/,""); print; exit}' \
+              /tmp/bs.out > /tmp/caller-token
+          test -s /tmp/caller-token
+
+      - name: bootstrap:cp-start
+        id: cp-start
+        # Background the CP. The trap on the surrounding step is implicit:
+        # job teardown kills runner processes. We track the pid so the
+        # collect step can scrape it.
+        run: |
+          set -euo pipefail
+          export XDG_DATA_HOME=/tmp/uncluster-ci/data
+          nohup uncluster server start --addr 127.0.0.1:17777 \
+              > /tmp/cp.log 2>&1 &
+          echo $! > /tmp/cp.pid
+          # Wait for healthz.
+          for _ in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:17777/healthz >/dev/null 2>&1; then
+                  echo "cp up"
+                  exit 0
+              fi
+              sleep 1
+          done
+          echo "cp never became healthy"
+          tail -50 /tmp/cp.log || true
+          exit 1
+
+      - name: rendezvous:mint-join-token
+        id: mint-join
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          resp="$(curl -fsS -X POST http://127.0.0.1:17777/v1/tokens \
+              -H "Authorization: Bearer ${CALLER_TOK}" \
+              -H "Content-Type: application/json" \
+              -d '{"kind":"join","label":"ci-join"}')"
+          echo "${resp}" | jq -r '.token' > /tmp/join-token
+          test -s /tmp/join-token
+
+      - name: product:agent-join
+        id: agent-join
+        run: |
+          set -euo pipefail
+          sudo env UNCLUSTER_TOKEN="$(cat /tmp/join-token)" \
+              uncluster agent join \
+                  --server http://127.0.0.1:17777 \
+                  --name ci-agent
+
+      - name: product:agent-install
+        id: agent-install
+        run: |
+          set -euo pipefail
+          sudo uncluster agent install
+
+      - name: bootstrap:mirror-config-for-service-user
+        id: mirror-cfg
+        # TEMPORARY workaround for issue #77 — install lands agent.toml at
+        # /root/.config/uncluster/ (operator's $HOME under sudo), but the
+        # systemd unit runs as the unprivileged `uncluster` service account
+        # whose $HOME is /home/uncluster. The agent.toml is unreadable from
+        # there, so the service flap-fails. Mirror the config to the service
+        # account's $HOME until the upstream fix (system-wide /etc/uncluster
+        # path or equivalent) lands. Marked `bootstrap:*` so it can be
+        # removed without re-plumbing the taxonomy classifier below.
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /home/uncluster/.config/uncluster
+          sudo cp /root/.config/uncluster/agent.toml /home/uncluster/.config/uncluster/agent.toml
+          sudo chown -R uncluster:uncluster /home/uncluster
+          sudo chmod 0700 /home/uncluster/.config /home/uncluster/.config/uncluster
+          sudo chmod 0600 /home/uncluster/.config/uncluster/agent.toml
+          # Restart so the service can re-read its (now visible) config.
+          sudo systemctl restart com.uncluster.agent
+          sleep 2
+
+      - name: product:assert-service-active
+        id: assert-svc
+        run: |
+          set -euo pipefail
+          # The unit name is `com.uncluster.agent` per gatekeeper/install_unix.go.
+          sudo systemctl is-active --quiet com.uncluster.agent
+          sudo systemctl status com.uncluster.agent --no-pager || true
+
+      - name: product:assert-agent-online
+        id: assert-online
+        # Heartbeat fires immediately on startup; second one 10s later.
+        # status=online when LastSeen < 30s. Allow up to 40s for the first
+        # heartbeat to land (cold start of the service).
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          for _ in $(seq 1 40); do
+              status="$(curl -fsS http://127.0.0.1:17777/v1/agents \
+                  -H "Authorization: Bearer ${CALLER_TOK}" \
+                  | jq -r '.[] | select(.name=="ci-agent") | .last_seen_at // empty')"
+              if [[ -n "${status}" && "${status}" != "null" ]]; then
+                  age=$(( $(date +%s) - ${status} ))
+                  if [[ "${age}" -lt 30 ]]; then
+                      echo "agent online (last seen ${age}s ago)"
+                      exit 0
+                  fi
+              fi
+              sleep 1
+          done
+          echo "agent never reported online"
+          exit 1
+
+      - name: product:assert-doctor
+        id: assert-doctor
+        run: |
+          set -euo pipefail
+          sudo uncluster agent doctor
+
+      - name: product:assert-sshd-drop-in
+        id: assert-drop-in
+        run: |
+          set -euo pipefail
+          test -f /etc/ssh/sshd_config.d/uncluster.conf
+          sudo grep -q 'TrustedUserCAKeys' /etc/ssh/sshd_config.d/uncluster.conf
+          sudo grep -q 'AuthorizedPrincipalsFile' /etc/ssh/sshd_config.d/uncluster.conf
+
+      - name: product:assert-principals-dir-perms
+        id: assert-perms
+        run: |
+          set -euo pipefail
+          # Owner root, group uncluster, mode 0775 per install_unix.go.
+          stat -c '%U:%G %a' /etc/ssh/auth_principals
+          owner="$(stat -c '%U' /etc/ssh/auth_principals)"
+          group="$(stat -c '%G' /etc/ssh/auth_principals)"
+          mode="$(stat -c '%a' /etc/ssh/auth_principals)"
+          if [[ "${owner}" != "root" || "${group}" != "uncluster" || "${mode}" != "775" ]]; then
+              echo "principals dir perms wrong: ${owner}:${group} ${mode}"
+              ls -la /etc/ssh/auth_principals
+              exit 1
+          fi
+
+      - name: product:deprovision-and-marker
+        id: deprov
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          curl -fsS -X DELETE http://127.0.0.1:17777/v1/agents/ci-agent \
+              -H "Authorization: Bearer ${CALLER_TOK}"
+          # Marker lands next to agent.toml under /root/.config/uncluster/.
+          # Allow up to 15s for the agent to heartbeat, see 410, wipe, write
+          # the marker, and exit.
+          for _ in $(seq 1 15); do
+              if sudo test -f /root/.config/uncluster/.deprovisioned; then
+                  echo "marker present"
+                  break
+              fi
+              sleep 1
+          done
+          sudo test -f /root/.config/uncluster/.deprovisioned
+          # Principals dir should be empty (all per-user files wiped).
+          remaining="$(sudo find /etc/ssh/auth_principals -mindepth 1 -maxdepth 1 -type f | wc -l)"
+          if [[ "${remaining}" -ne 0 ]]; then
+              echo "expected empty principals after deprovision; found ${remaining} files"
+              sudo ls -la /etc/ssh/auth_principals
+              exit 1
+          fi
+
+      - name: collect:artifacts
+        if: always()
+        run: |
+          set +e
+          mkdir -p t2-linux-artifacts
+          sudo journalctl -u com.uncluster.agent --no-pager > t2-linux-artifacts/agent-journal.txt 2>&1
+          sudo journalctl -u ssh --no-pager --since "10 minutes ago" > t2-linux-artifacts/ssh-journal.txt 2>&1
+          cp /tmp/cp.log t2-linux-artifacts/cp.log 2>/dev/null || true
+          sudo cat /etc/ssh/sshd_config.d/uncluster.conf > t2-linux-artifacts/sshd-drop-in.conf 2>&1
+          sudo cat /etc/ssh/uncluster_ca.pub > t2-linux-artifacts/ca.pub 2>&1
+          sudo ls -la /etc/ssh/auth_principals > t2-linux-artifacts/principals-listing.txt 2>&1
+          sudo sshd -T > t2-linux-artifacts/sshd-T.txt 2>&1
+          sudo systemctl status com.uncluster.agent --no-pager > t2-linux-artifacts/svc-status.txt 2>&1
+          sudo find /root/.config/uncluster -type f > t2-linux-artifacts/agent-config-listing.txt 2>&1
+          sudo cat /root/.config/uncluster/agent.toml > t2-linux-artifacts/agent-toml.txt 2>&1 || true
+          ls -la t2-linux-artifacts
+        continue-on-error: true
+
+      - name: collect:classify-and-upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t2-linux-${{ github.run_id }}
+          path: t2-linux-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: enforce-taxonomy
+        if: always()
+        run: |
+          ./scripts/ci/classify-step.sh \
+              "bootstrap:build-binary=${{ steps.build.outcome }}" \
+              "bootstrap:install-sshd=${{ steps.sshd.outcome }}" \
+              "bootstrap:cp-bootstrap=${{ steps.cp-bs.outcome }}" \
+              "bootstrap:cp-start=${{ steps.cp-start.outcome }}" \
+              "rendezvous:mint-join-token=${{ steps.mint-join.outcome }}" \
+              "product:agent-join=${{ steps.agent-join.outcome }}" \
+              "product:agent-install=${{ steps.agent-install.outcome }}" \
+              "bootstrap:mirror-config-for-service-user=${{ steps.mirror-cfg.outcome }}" \
+              "product:assert-service-active=${{ steps.assert-svc.outcome }}" \
+              "product:assert-agent-online=${{ steps.assert-online.outcome }}" \
+              "product:assert-doctor=${{ steps.assert-doctor.outcome }}" \
+              "product:assert-sshd-drop-in=${{ steps.assert-drop-in.outcome }}" \
+              "product:assert-principals-dir-perms=${{ steps.assert-perms.outcome }}" \
+              "product:deprovision-and-marker=${{ steps.deprov.outcome }}" \
+              > /tmp/classify.out
+          cat /tmp/classify.out
+          class="$(grep -E '^class=' /tmp/classify.out | cut -d= -f2)"
+          case "${class}" in
+              success)  exit 0 ;;
+              advisory) echo "::warning::T2-linux advisory failure (bootstrap/rendezvous); see artifacts"; exit 0 ;;
+              required) echo "::error::T2-linux REQUIRED failure (product). Block merge."; exit 1 ;;
+              *)        echo "::error::T2-linux unknown class=${class}"; exit 1 ;;
+          esac
+
   # Aggregator job: creates a single "all-tests-pass" check that can be marked
   # as required in branch protection. This ensures ALL matrix OS variants AND
-  # the E2E Compose smoke must pass before a PR can merge — not just one.
+  # the E2E Compose smoke AND the per-OS install smoke must pass before a PR
+  # can merge.
   all-tests-pass:
     runs-on: ubuntu-latest
-    needs: [test, e2e-compose-smoke]
+    needs: [test, e2e-compose-smoke, t2-linux-install-smoke]
     if: always()
     steps:
       - name: fail if any required job failed
@@ -116,6 +388,10 @@ jobs:
           fi
           if [[ "${{ needs.e2e-compose-smoke.result }}" != "success" ]]; then
             echo "e2e-compose-smoke result: ${{ needs.e2e-compose-smoke.result }}"
+            exit 1
+          fi
+          if [[ "${{ needs.t2-linux-install-smoke.result }}" != "success" ]]; then
+            echo "t2-linux-install-smoke result: ${{ needs.t2-linux-install-smoke.result }}"
             exit 1
           fi
 
