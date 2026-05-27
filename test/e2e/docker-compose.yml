@@ -28,6 +28,11 @@ services:
     environment:
       UNCLUSTER_ADDR: ":7777"
       SHARED_DIR: /shared
+    # 7777 in-container, exposed on the host as 47777 so the Go test harness
+    # can talk to the CP directly from the test process. Picked > 32k to
+    # minimise collision risk on shared CI runners.
+    ports:
+      - "127.0.0.1:47777:7777"
     volumes:
       - shared:/shared
       - cp-data:/var/lib/uncluster

@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"net/url"
 )
 
 // MintJoinToken POSTs /v1/tokens with kind=join and returns the plaintext
@@ -62,17 +63,27 @@ func (c *Client) EnrollAgent(ctx context.Context, joinToken, name string) (strin
 }
 
 // GrantACL POSTs /v1/acl to allow a Caller token to SSH into an Agent as
-// the given Unix usernames. Used by T1b cert-flow scenarios.
-func (c *Client) GrantACL(ctx context.Context, callerTokenID, agent string, usernames []string) error {
+// the given Unix username. One row per (caller, agent, username) tuple —
+// to grant multiple usernames, call this once per username (the server
+// shape is intentionally narrow; see internal/api/types.go).
+//
+// Returns the new ACL row's id so the caller can later RevokeACL.
+func (c *Client) GrantACL(ctx context.Context, callerTokenID, agent, username string) (string, error) {
 	body := map[string]any{
-		"caller_token_id": callerTokenID,
-		"agent":           agent,
-		"usernames":       usernames,
+		"caller":   callerTokenID,
+		"agent":    agent,
+		"username": username,
 	}
-	if err := c.Do(ctx, "POST", "/v1/acl", body, nil); err != nil {
-		return fmt.Errorf("grant acl: %w", err)
+	var resp struct {
+		ID            string `json:"id"`
+		CallerTokenID string `json:"caller_token_id"`
+		AgentID       string `json:"agent_id"`
+		Username      string `json:"username"`
 	}
-	return nil
+	if err := c.Do(ctx, "POST", "/v1/acl", body, &resp); err != nil {
+		return "", fmt.Errorf("grant acl: %w", err)
+	}
+	return resp.ID, nil
 }
 
 // RequestCert POSTs /v1/certs and returns the issued cert in
@@ -112,4 +123,47 @@ func (c *Client) DeprovisionAgent(ctx context.Context, agent string) error {
 		return fmt.Errorf("deprovision agent: %w", err)
 	}
 	return nil
+}
+
+// RevokeACL DELETEs /v1/acl/<id>. The id is the value returned by GrantACL.
+func (c *Client) RevokeACL(ctx context.Context, aclID string) error {
+	if err := c.Do(ctx, "DELETE", "/v1/acl/"+aclID, nil, nil); err != nil {
+		return fmt.Errorf("revoke acl: %w", err)
+	}
+	return nil
+}
+
+// CertEvent mirrors api.CertEventSummary but local to the harness so test
+// code does not depend on internal/api.
+type CertEvent struct {
+	RequestID     string `json:"request_id"`
+	TS            int64  `json:"ts"`
+	CallerTokenID string `json:"caller_token_id"`
+	TargetAgentID string `json:"target_agent_id,omitempty"`
+	Username      string `json:"username,omitempty"`
+	CertPrincipal string `json:"cert_principal,omitempty"`
+	Outcome       string `json:"outcome"`
+	DenialReason  string `json:"denial_reason,omitempty"`
+}
+
+// ListCertEvents GETs /v1/audit/certs. Optional `filters` map appends query
+// params (caller, agent, user, outcome, since, limit).
+//
+// The query is built and url-encoded here rather than concatenated into the
+// path passed to Client.Do, because Client.Do uses url.JoinPath which
+// percent-encodes `?` (treating it as a literal path char).
+func (c *Client) ListCertEvents(ctx context.Context, filters map[string]string) ([]CertEvent, error) {
+	q := url.Values{}
+	for k, v := range filters {
+		q.Set(k, v)
+	}
+	path := "/v1/audit/certs"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var resp []CertEvent
+	if err := c.doRaw(ctx, "GET", path, nil, &resp); err != nil {
+		return nil, fmt.Errorf("list cert events: %w", err)
+	}
+	return resp, nil
 }

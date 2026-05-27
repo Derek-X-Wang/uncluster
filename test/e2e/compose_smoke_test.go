@@ -133,7 +133,7 @@ func TestSmoke_RolesBoot(t *testing.T) {
 	}
 
 	// Verify sshd is configured: drop-in file present, CA pubkey installed.
-	if out, err := composeCmd(t, "exec", "-T", "agent", "test", "-f", "/etc/ssh/uncluster-ca.pub").CombinedOutput(); err != nil {
+	if out, err := composeCmd(t, "exec", "-T", "agent", "test", "-f", "/etc/ssh/uncluster_ca.pub").CombinedOutput(); err != nil {
 		t.Fatalf("[REQUIRED] CA pubkey not installed on agent: %v\n%s", err, out)
 	}
 	if out, err := composeCmd(t, "exec", "-T", "agent", "grep", "-q", "TrustedUserCAKeys", "/etc/ssh/sshd_config.d/uncluster.conf").CombinedOutput(); err != nil {

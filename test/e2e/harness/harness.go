@@ -39,8 +39,25 @@ func NewClient(baseURL, token string) *Client {
 }
 
 // Do issues an HTTP request and unmarshals the JSON response body into `out`.
-// Returns a typed httpError on non-2xx for assertion ergonomics.
+// `path` must not contain a `?` (use doRaw for paths that carry a query
+// string — Do percent-encodes any `?` via url.JoinPath which breaks query
+// dispatch). Returns a typed HTTPError on non-2xx for assertion ergonomics.
 func (c *Client) Do(ctx context.Context, method, path string, body any, out any) error {
+	u, err := url.JoinPath(c.BaseURL, path)
+	if err != nil {
+		return fmt.Errorf("join url: %w", err)
+	}
+	return c.execute(ctx, method, u, body, out)
+}
+
+// doRaw is the query-string-aware variant of Do: it concatenates the path
+// directly so the query separator `?` is not percent-encoded. Used by
+// helpers that pass through a built query string.
+func (c *Client) doRaw(ctx context.Context, method, pathWithQuery string, body any, out any) error {
+	return c.execute(ctx, method, c.BaseURL+pathWithQuery, body, out)
+}
+
+func (c *Client) execute(ctx context.Context, method, fullURL string, body any, out any) error {
 	var reqBody io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
@@ -49,11 +66,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, out any)
 		}
 		reqBody = bytes.NewReader(buf)
 	}
-	u, err := url.JoinPath(c.BaseURL, path)
-	if err != nil {
-		return fmt.Errorf("join url: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, reqBody)
 	if err != nil {
 		return fmt.Errorf("new request: %w", err)
 	}

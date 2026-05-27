@@ -3,7 +3,7 @@
 #
 # Boot order:
 #   1. Wait for /shared/ca.pub and /shared/join-token (CP rendezvous).
-#   2. Configure sshd: install the CA pubkey at /etc/ssh/uncluster-ca.pub,
+#   2. Configure sshd: install the CA pubkey at /etc/ssh/uncluster_ca.pub,
 #      write a sshd drop-in with TrustedUserCAKeys and AuthorizedPrincipalsFile.
 #      Pre-create the principals file for $TARGET_USER, empty for now — the
 #      Agent populates it later when ACLs sync.
@@ -39,12 +39,12 @@ fi
 log "rendezvous ok"
 
 # --- 2. configure sshd ---
-install -m 0644 "${SHARED_DIR}/ca.pub" /etc/ssh/uncluster-ca.pub
+install -m 0644 "${SHARED_DIR}/ca.pub" /etc/ssh/uncluster_ca.pub
 
 mkdir -p /etc/ssh/sshd_config.d
 cat >/etc/ssh/sshd_config.d/uncluster.conf <<'EOF'
 # Installed by uncluster e2e agent container.
-TrustedUserCAKeys /etc/ssh/uncluster-ca.pub
+TrustedUserCAKeys /etc/ssh/uncluster_ca.pub
 AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u
 EOF
 chmod 0644 /etc/ssh/sshd_config.d/uncluster.conf
