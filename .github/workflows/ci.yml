@@ -210,18 +210,40 @@ jobs:
 
       - name: bootstrap:mirror-config-for-service-user
         id: mirror-cfg
-        # TEMPORARY workaround for issue #77 — install lands agent.toml at
-        # /root/.config/uncluster/ (operator's $HOME under sudo), but the
-        # systemd unit runs as the unprivileged `uncluster` service account
-        # whose $HOME is /home/uncluster. The agent.toml is unreadable from
-        # there, so the service flap-fails. Mirror the config to the service
-        # account's $HOME until the upstream fix (system-wide /etc/uncluster
-        # path or equivalent) lands. Marked `bootstrap:*` so it can be
-        # removed without re-plumbing the taxonomy classifier below.
+        # TEMPORARY workaround for issue #77 — `agent install` writes
+        # agent.toml at the operator's $HOME-relative path
+        # ($HOME/.config/uncluster/agent.toml). With `sudo -E` on GitHub
+        # ubuntu-latest the operator-of-record is the runner user
+        # (HOME=/home/runner), not root. But the systemd unit runs as
+        # `uncluster` (HOME=/home/uncluster), where the config does not
+        # exist. The service then flap-fails. Mirror the config to the
+        # service account's $HOME until the upstream fix (system-wide
+        # /etc/uncluster path or equivalent) lands. Marked `bootstrap:*`
+        # so it can be removed without re-plumbing the taxonomy classifier.
+        #
+        # We pick up the source from whichever path `agent join` actually
+        # used (sudo -E preserves the caller's HOME; sudo without -E uses
+        # root's HOME). Either way the file is named the same — we just
+        # search both.
         run: |
           set -euo pipefail
+          src=""
+          for candidate in \
+              "${HOME}/.config/uncluster/agent.toml" \
+              /root/.config/uncluster/agent.toml; do
+              if sudo test -f "${candidate}"; then
+                  src="${candidate}"
+                  break
+              fi
+          done
+          if [[ -z "${src}" ]]; then
+              echo "agent.toml not found in any known location"
+              sudo find / -name agent.toml -path '*uncluster*' 2>/dev/null || true
+              exit 1
+          fi
+          echo "found agent.toml at ${src}"
           sudo mkdir -p /home/uncluster/.config/uncluster
-          sudo cp /root/.config/uncluster/agent.toml /home/uncluster/.config/uncluster/agent.toml
+          sudo cp "${src}" /home/uncluster/.config/uncluster/agent.toml
           sudo chown -R uncluster:uncluster /home/uncluster
           sudo chmod 0700 /home/uncluster/.config /home/uncluster/.config/uncluster
           sudo chmod 0600 /home/uncluster/.config/uncluster/agent.toml
@@ -297,17 +319,25 @@ jobs:
           CALLER_TOK="$(cat /tmp/caller-token)"
           curl -fsS -X DELETE http://127.0.0.1:17777/v1/agents/ci-agent \
               -H "Authorization: Bearer ${CALLER_TOK}"
-          # Marker lands next to agent.toml under /root/.config/uncluster/.
-          # Allow up to 15s for the agent to heartbeat, see 410, wipe, write
-          # the marker, and exit.
+          # Marker lands next to whichever agent.toml the service process
+          # actually loaded from. Under the #77 workaround the service
+          # reads /home/uncluster/.config/uncluster/agent.toml, so the
+          # marker lands at /home/uncluster/.config/uncluster/.deprovisioned.
+          # Allow up to 15s for the agent to heartbeat, see 410, wipe,
+          # write the marker, and exit.
+          marker="/home/uncluster/.config/uncluster/.deprovisioned"
           for _ in $(seq 1 15); do
-              if sudo test -f /root/.config/uncluster/.deprovisioned; then
-                  echo "marker present"
+              if sudo test -f "${marker}"; then
+                  echo "marker present at ${marker}"
                   break
               fi
               sleep 1
           done
-          sudo test -f /root/.config/uncluster/.deprovisioned
+          if ! sudo test -f "${marker}"; then
+              echo "marker not found at ${marker}; searching"
+              sudo find / -name ".deprovisioned" 2>/dev/null || true
+              exit 1
+          fi
           # Principals dir should be empty (all per-user files wiped).
           remaining="$(sudo find /etc/ssh/auth_principals -mindepth 1 -maxdepth 1 -type f | wc -l)"
           if [[ "${remaining}" -ne 0 ]]; then
@@ -329,8 +359,17 @@ jobs:
           sudo ls -la /etc/ssh/auth_principals > t2-linux-artifacts/principals-listing.txt 2>&1
           sudo sshd -T > t2-linux-artifacts/sshd-T.txt 2>&1
           sudo systemctl status com.uncluster.agent --no-pager > t2-linux-artifacts/svc-status.txt 2>&1
-          sudo find /root/.config/uncluster -type f > t2-linux-artifacts/agent-config-listing.txt 2>&1
-          sudo cat /root/.config/uncluster/agent.toml > t2-linux-artifacts/agent-toml.txt 2>&1 || true
+          # Scrape agent.toml from every known location since the install
+          # path can land it under sudo-with-E ($HOME/.config), pristine sudo
+          # (/root/.config), or the post-mirror service path
+          # (/home/uncluster/.config).
+          for d in "${HOME}/.config/uncluster" "/root/.config/uncluster" "/home/uncluster/.config/uncluster"; do
+              if sudo test -d "${d}"; then
+                  safe="$(echo "${d}" | tr '/' '_')"
+                  sudo ls -la "${d}" > "t2-linux-artifacts/cfg${safe}.txt" 2>&1 || true
+                  sudo cat "${d}/agent.toml" > "t2-linux-artifacts/agent-toml${safe}.txt" 2>&1 || true
+              fi
+          done
           ls -la t2-linux-artifacts
         continue-on-error: true
 
