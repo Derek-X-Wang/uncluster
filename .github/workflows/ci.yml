@@ -488,15 +488,18 @@ jobs:
 
       - name: bootstrap:cp-start
         id: cp-start
+        # Critical: PowerShell's `Start-Process` does NOT detach the child
+        # from the step's job object. When the step ends, GH Actions reaps
+        # the child via job-object semantics and the CP dies before the next
+        # step runs. Use `cmd /c start /B` with file-redirected I/O, which
+        # creates a detached process not tied to the step's job tree.
         run: |
           $env:XDG_DATA_HOME = "C:\uncluster-data"
-          # Launch CP in background; PowerShell `Start-Process` returns immediately.
-          $proc = Start-Process -FilePath C:\uncluster\uncluster.exe `
-              -ArgumentList 'server','start','--addr','127.0.0.1:17777' `
-              -RedirectStandardOutput C:\cp.log `
-              -RedirectStandardError C:\cp.err `
-              -PassThru -WindowStyle Hidden
-          $proc.Id | Out-File C:\cp.pid
+          # `start /B` runs in background without a new window; `""` is the
+          # required-but-unused title argument. Redirects use cmd's shell
+          # operators so the file handles are owned by the CP itself, not
+          # by the spawning PowerShell process.
+          cmd /c "start /B "" C:\uncluster\uncluster.exe server start --addr 127.0.0.1:17777 > C:\cp.log 2> C:\cp.err"
           # Wait for healthz.
           $deadline = (Get-Date).AddSeconds(30)
           $healthy = $false
@@ -682,8 +685,15 @@ jobs:
           icacls 'C:\ProgramData\ssh\auth_principals' 2>&1 | Out-File t2-windows-artifacts\principals-acl.txt
           Get-ChildItem -Force 'C:\ProgramData\ssh\auth_principals' -ErrorAction SilentlyContinue |
               Format-Table -AutoSize | Out-File t2-windows-artifacts\principals-listing.txt
-          sc.exe qc UnclusterAgent | Out-File t2-windows-artifacts\sc-qc.txt
-          Get-Service UnclusterAgent | Format-List | Out-File t2-windows-artifacts\service-detail.txt
+          sc.exe qc UnclusterAgent | Out-File t2-windows-artifacts\sc-qc.txt 2>$null
+          # Get-Service throws if the service does not exist; wrap so a
+          # pre-install failure (where the service was never created) does
+          # not cause collect:artifacts itself to error.
+          try {
+              Get-Service UnclusterAgent | Format-List | Out-File t2-windows-artifacts\service-detail.txt
+          } catch {
+              "UnclusterAgent service not present: $_" | Out-File t2-windows-artifacts\service-detail.txt
+          }
           Get-ChildItem -Force -Recurse -Path 'C:\Users\runneradmin\.config\uncluster' -ErrorAction SilentlyContinue |
               Format-Table | Out-File t2-windows-artifacts\cfg-runneradmin.txt
           Get-Content 'C:\Users\runneradmin\.config\uncluster\agent.toml' -ErrorAction SilentlyContinue |
