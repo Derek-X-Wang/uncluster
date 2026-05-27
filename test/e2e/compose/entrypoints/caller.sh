@@ -45,6 +45,20 @@ ssh_key_path = "${CALLER_DIR}/keys/id_ed25519"
 EOF
 chmod 0600 /root/.config/uncluster/cli.toml
 
+# 3b. ssh client config: disable host-key prompting since the Agent container's
+# host key is regenerated on every stack boot. This is E2E-only — real Callers
+# rely on TOFU or pinned known_hosts. Without this, ssh would prompt and the
+# `uncluster ssh ...` exec would block in CI.
+mkdir -p /root/.ssh
+chmod 0700 /root/.ssh
+cat >/root/.ssh/config <<'EOF'
+Host *
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+EOF
+chmod 0600 /root/.ssh/config
+
 log "caller ready (cp=${CP_URL}, key=${CALLER_DIR}/keys/id_ed25519)"
 
 # 4. idle

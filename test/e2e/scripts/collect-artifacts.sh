@@ -57,7 +57,7 @@ scrape_role cp \
 scrape_role agent \
     "sshd-T.txt:::sshd -T 2>/dev/null" \
     "sshd-drop-in.conf:::cat /etc/ssh/sshd_config.d/uncluster.conf 2>/dev/null" \
-    "ca.pub:::cat /etc/ssh/uncluster-ca.pub 2>/dev/null" \
+    "ca.pub:::cat /etc/ssh/uncluster_ca.pub 2>/dev/null" \
     "auth_principals-listing.txt:::ls -la /etc/ssh/auth_principals 2>/dev/null" \
     "auth_principals-contents.txt:::find /etc/ssh/auth_principals -type f -exec sh -c 'echo === \$1 ===; cat \$1' _ {} \;" \
     "ip-addr.txt:::ip addr 2>/dev/null || ifconfig 2>/dev/null" \

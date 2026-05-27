@@ -163,22 +163,63 @@ func TestGrantACL(t *testing.T) {
 			}
 			var req map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			if req["caller_token_id"] != "ct_1" {
-				t.Errorf("caller_token_id=%v", req["caller_token_id"])
+			// V2 server shape is one-row-per-tuple: (caller, agent, username).
+			if req["caller"] != "ct_1" {
+				t.Errorf("caller=%v, want ct_1", req["caller"])
 			}
 			if req["agent"] != "agent-1" {
 				t.Errorf("agent=%v", req["agent"])
 			}
-			users, _ := req["usernames"].([]any)
-			if len(users) != 2 || users[0] != "alice" || users[1] != "bob" {
-				t.Errorf("usernames=%v", users)
+			if req["username"] != "alice" {
+				t.Errorf("username=%v, want alice", req["username"])
+			}
+			_, _ = w.Write([]byte(`{"id":"acl_42","caller_token_id":"ct_1","agent_id":"a_001","username":"alice","created_at":0}`))
+		},
+	})
+	c := NewClient(srv.URL, "admin")
+	id, err := c.GrantACL(context.Background(), "ct_1", "agent-1", "alice")
+	if err != nil {
+		t.Fatalf("GrantACL: %v", err)
+	}
+	if id != "acl_42" {
+		t.Errorf("acl id=%q, want acl_42", id)
+	}
+}
+
+func TestRevokeACL(t *testing.T) {
+	srv := newTestServer(t, map[string]http.HandlerFunc{
+		"/v1/acl/acl_42": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != "DELETE" {
+				t.Errorf("method=%s, want DELETE", r.Method)
 			}
 			w.WriteHeader(http.StatusNoContent)
 		},
 	})
 	c := NewClient(srv.URL, "admin")
-	if err := c.GrantACL(context.Background(), "ct_1", "agent-1", []string{"alice", "bob"}); err != nil {
-		t.Fatalf("GrantACL: %v", err)
+	if err := c.RevokeACL(context.Background(), "acl_42"); err != nil {
+		t.Fatalf("RevokeACL: %v", err)
+	}
+}
+
+func TestListCertEvents(t *testing.T) {
+	srv := newTestServer(t, map[string]http.HandlerFunc{
+		"/v1/audit/certs": func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("outcome") != "denied" {
+				t.Errorf("outcome filter missing or wrong: %q", r.URL.Query().Get("outcome"))
+			}
+			_, _ = w.Write([]byte(`[{"request_id":"rq_1","ts":1700000000,"caller_token_id":"ct_1","outcome":"denied","denial_reason":"acl_miss"}]`))
+		},
+	})
+	c := NewClient(srv.URL, "admin")
+	events, err := c.ListCertEvents(context.Background(), map[string]string{"outcome": "denied"})
+	if err != nil {
+		t.Fatalf("ListCertEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	if events[0].Outcome != "denied" || events[0].DenialReason != "acl_miss" {
+		t.Errorf("event=%+v", events[0])
 	}
 }
 
