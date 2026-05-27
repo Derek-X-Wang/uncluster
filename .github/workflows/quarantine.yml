@@ -22,8 +22,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: run quarantine rule for e2e-compose
+      - name: run quarantine rule for ci (T1 compose smoke)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ./scripts/ci/quarantine-rule.sh --workflow e2e-compose.yml --threshold 3
+          # The T1 smoke now lives inside ci.yml's e2e-compose-smoke job. The
+          # quarantine rule reads run history at workflow granularity, so the
+          # workflow argument is the file name. A run's overall conclusion is
+          # what we classify; a failure rolls up from the e2e-compose-smoke job.
+          ./scripts/ci/quarantine-rule.sh --workflow ci.yml --threshold 3
+
+  watch-e2e-cross-machine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: run quarantine rule for e2e-cross-machine (T3a)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./scripts/ci/quarantine-rule.sh --workflow e2e-cross-machine.yml --threshold 3
