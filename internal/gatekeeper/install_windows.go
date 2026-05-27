@@ -59,14 +59,19 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 		return fmt.Errorf("create principals dir: %w", err)
 	}
 
-	// 5. Grant service account write access to principals dir via icacls.
-	if err := grantPrincipalsAccessWindows(paths.PrincipalsDir); err != nil {
-		return fmt.Errorf("grant principals dir access: %w", err)
-	}
-
-	// 6. Install SCM service.
+	// 5. Install SCM service. MUST happen before grantPrincipalsAccessWindows
+	// (#83): the `NT SERVICE\UnclusterAgent` virtual account is created
+	// lazily by SCM when the service is registered. Granting an ACL to a
+	// not-yet-existing SID returns icacls error 1332 ("No mapping between
+	// account names and security IDs was done.").
 	if err := installService(ctx, cfg, serviceExe); err != nil {
 		return fmt.Errorf("install service: %w", err)
+	}
+
+	// 6. Grant service account write access to principals dir via icacls.
+	// Safe to call now that the virtual account SID exists.
+	if err := grantPrincipalsAccessWindows(paths.PrincipalsDir); err != nil {
+		return fmt.Errorf("grant principals dir access: %w", err)
 	}
 
 	// 7. Start service.
