@@ -157,29 +157,17 @@ Re-running is safe — install is idempotent and self-heals drift.`,
 				return fmt.Errorf("resolve executable: %w", err)
 			}
 
-			// Copy agent.toml to the system-wide path BEFORE installing the
-			// service. Otherwise the service starts, can't read its
-			// config, and the supervisor reports "service not responding"
-			// (Windows SCM) or flap-fails (systemd).
-			//
-			// First pass uses SaveConfigSystem which can NOT yet grant
-			// service-account read access — the account does not exist
-			// until gatekeeper.Install registers it. Second pass after
-			// install re-applies the ACL so the now-existing service
-			// account SID gets its read ACE.
-			sysPath := agent.SystemConfigPath()
-			if err := agent.SaveConfigSystem(sysPath, cfg); err != nil {
-				return fmt.Errorf("copy config to %s: %w", sysPath, err)
-			}
-
+			// gatekeeper.Install handles copying agent.toml to the
+			// system-wide path at the right sequenced step (after the
+			// service account/SID exists, before the service starts).
+			// Previous design did this from the CLI layer in two passes
+			// flanking Install — but Install's `startService` ran
+			// between the two passes, so the service tried to start
+			// with the wrong-ownership file and entered systemd's
+			// restart backoff before the second pass could fix it. See
+			// the hotfix on #77 for the bug rationale.
 			if err := gatekeeper.Install(cmd.Context(), cfg, exe); err != nil {
 				return fmt.Errorf("install: %w", err)
-			}
-
-			// Re-save now that the service account exists — this attaches
-			// the read ACL grant that the first pass had to skip.
-			if err := agent.SaveConfigSystem(sysPath, cfg); err != nil {
-				return fmt.Errorf("re-apply config ACL post-install: %w", err)
 			}
 
 			fmt.Fprintln(cmd.OutOrStdout(), "install complete — run `uncluster agent doctor` to verify")

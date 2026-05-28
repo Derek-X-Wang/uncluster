@@ -74,12 +74,30 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 		return fmt.Errorf("grant principals dir access: %w", err)
 	}
 
-	// 7. Start service.
+	// 7. Save agent.toml to the system path. MUST happen AFTER
+	// installService (step 5) so the `NT SERVICE\UnclusterAgent` SID is
+	// resolvable for the file ACL grant, and BEFORE startServiceWindows
+	// (step 8) so the service can read the file on first start.
+	//
+	// Hotfix for #77: previously SaveConfigSystem was called from the CLI
+	// install command BEFORE gatekeeper.Install ran — so the first pass
+	// produced an ACL without the UnclusterAgent ACE (SID didn't exist
+	// yet), and the second pass (after Install returned) was too late:
+	// `net start UnclusterAgent` had already failed with exit 2 ("service
+	// did not respond") because the service couldn't read its config.
+	// Putting the save here, AFTER the SID exists and BEFORE start,
+	// means the file lands with the right ACL on first try.
+	sysPath := agent.SystemConfigPath()
+	if err := agent.SaveConfigSystem(sysPath, cfg); err != nil {
+		return fmt.Errorf("save system config to %s: %w", sysPath, err)
+	}
+
+	// 8. Start service.
 	if err := startServiceWindows(ctx); err != nil {
 		return fmt.Errorf("start service: %w", err)
 	}
 
-	// 8. Restart sshd so it picks up the new config.
+	// 9. Restart sshd so it picks up the new config.
 	if err := reloadSSHDWindows(ctx); err != nil {
 		return fmt.Errorf("restart sshd: %w", err)
 	}
