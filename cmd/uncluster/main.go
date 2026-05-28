@@ -14,6 +14,21 @@ type exitCoder interface {
 }
 
 func main() {
+	// On Windows, if launched by the Service Control Manager, the binary
+	// must complete the SCM control-handler handshake before SCM's 30s
+	// timeout or `net start UnclusterAgent` returns exit 2 ("service did
+	// not respond"). runAsWindowsService detects that context, routes the
+	// agent run loop through svc.Run, and exits when SCM tells it to.
+	// On non-Windows (or Windows but not under SCM), it is a no-op
+	// returning false — control falls through to the cobra path below.
+	// See #88.
+	if handled, err := runAsWindowsService(); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := cli.NewRoot().Execute(); err != nil {
 		// Check for typed exit codes first (e.g., doctor warn/fail).
 		if ec, ok := err.(exitCoder); ok {

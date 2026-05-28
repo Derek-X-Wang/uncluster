@@ -27,9 +27,14 @@ func buildService(cfg agent.Config, serviceExe string) (service.Service, error) 
 	return service.New(prg, svcCfg)
 }
 
-// agentSvcProgram satisfies service.Interface. The agent logic runs via the
-// uncluster agent run sub-process; this program is a no-op shell used only
-// when kardianos/service needs to call Start/Stop directly.
+// agentSvcProgram satisfies service.Interface. On Windows it is only
+// passed to service.New so kardianos can construct the install metadata
+// (it requires a non-nil program even for install-only use). The runtime
+// SCM control-handler handshake is owned by cmd/uncluster/agent_run_windows.go's
+// svc.Run path — NOT by this program — because kardianos's stub Start/Stop
+// reports nothing to SCM, which made `net start` time out after 30s
+// before #88. Keep this struct as a no-op so svc.Install/Uninstall continue
+// to work; never expect Start/Stop to be called at runtime on Windows.
 type agentSvcProgram struct{}
 
 func (p *agentSvcProgram) Start(service.Service) error { return nil }
