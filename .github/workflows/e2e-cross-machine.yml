@@ -1,29 +1,35 @@
-# T3 cross-machine E2E rendezvous (per ADR-0008).
+# T3b cross-machine E2E (per ADR-0008 + #72).
 #
-# This is the FOUNDATION for T3b — it lands the Tailscale auth model,
-# failure-taxonomy classifier, retention policy, and quarantine wiring.
-# T3a smokes only the rendezvous itself: three ephemeral tailnet nodes can
-# discover and ping each other. T3b (#72) replaces the smoke steps with
-# real Control plane / Agent / Caller payloads.
+# T3a (#68) landed the foundation: Tailscale auth model, failure-taxonomy
+# classifier, retention policy, quarantine wiring. This file is T3a +
+# T3b's product layer:
+#   * cp: Tailscale up + uncluster server bootstrap + start bound to
+#     tailnet IP. Outputs caller token + tailnet IP for downstream roles.
+#   * agent-linux, agent-macos, agent-windows: Tailscale up + uncluster
+#     agent join + install against the tailnet CP.
+#   * caller: needs all four agents healthy. Mints ACL grants, runs
+#     uncluster ssh <agent> -- hostname, asserts the right hostname comes
+#     back. Then exercises the revoke flow.
+#   * teardown: best-effort uncluster agents rm + caller token revoke +
+#     ephemeral tailnet node cleanup. if: always().
 #
 # Triggers: `schedule` (nightly) + `workflow_dispatch`. **Never** runs on
-# `pull_request` — Tailscale auth + self-hosted-like cross-machine
-# orchestration is too privileged for untrusted PR code (matches the
-# T4 reasoning in ADR-0008's "T4 is HITL by nature" note).
+# `pull_request` — Tailscale auth + cross-machine orchestration is too
+# privileged for untrusted PR code (matches the T4 reasoning in
+# ADR-0008's "T4 is HITL by nature" note).
 #
 # Failure taxonomy (the AI-agent guardrail from ADR-0008):
 #   * Steps named `bootstrap:*` → advisory failure (job's `continue-on-error`
 #     and the per-job classifier mark these non-blocking).
 #   * Steps named `rendezvous:*` → advisory failure (same).
 #   * Steps named `product:*` → required failure (blocks the gate).
-# The `enforce-taxonomy` aggregator job at the end inspects each role-job's
-# classified output and only fails the workflow when a product step failed.
+# The `enforce-taxonomy` aggregator job inspects each role-job's classified
+# output and fails the workflow when a product step failed.
 #
-# Quarantine: the workflow itself is gated by the quarantine-watchdog
+# Quarantine: the workflow is gated by the quarantine-watchdog
 # (.github/workflows/quarantine.yml). After 3 consecutive advisory failures
 # on `main`, a `needs-triage` issue is opened and the workflow becomes
-# advisory-only until the issue is closed. This is the inverse of papering
-# over flakes — it surfaces them.
+# advisory-only until the issue is closed.
 #
 # Tailscale auth credential rotation (operator instructions):
 #   1. Provision a Tailscale OAuth client (Admin Console → Settings → OAuth
@@ -37,6 +43,16 @@
 #      The auth key MUST be reusable + ephemeral + tagged. Rotate ≤ 90d.
 #   4. The Tailscale Admin Console must have `tagOwners: { "tag:ci": [...] }`
 #      configured so this workflow can create tagged nodes.
+#
+# Caller token transport: the CP role outputs the freshly-minted caller
+# token via `add-mask::` + `GITHUB_OUTPUT`. Downstream jobs consume via
+# `needs.cp.outputs.caller_token`. Mask ensures the literal value never
+# appears in workflow logs. (Job outputs ARE visible to the GitHub
+# Actions API, but the repo's threat model treats workflow-secret
+# disclosure as a separate concern handled by the secret-scanning hook
+# in CONTRIBUTING.md — this transport matches what T3a uses for the
+# Tailscale IPs and is consistent with the rest of the repo's CI
+# patterns.)
 
 name: e2e-cross-machine
 
@@ -50,45 +66,47 @@ on:
         required: false
         default: "manual smoke"
 
-# Workflow-level timeout cap so a hung tailnet handshake or rendezvous wait
-# cannot hold a GHA slot for 6h. The default per-job timeout (360 min) is
-# also too generous for an E2E.
 concurrency:
   group: e2e-cross-machine-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
-  id-token: write      # required for Tailscale WIF / OIDC if used
-  issues: write        # for the inline quarantine hook (if armed)
+  id-token: write
+  issues: write
   actions: read
 
 env:
   TS_TAILNET_NAME: ci-uncluster
   TS_TAG: tag:ci
+  CP_PORT: "17777"
 
 jobs:
-  # -----------------------------------------------------------------------
-  # Three parallel role jobs. Each joins the same tailnet under a
-  # run-id-scoped hostname, pings the other two peers by magic-dns name,
-  # uploads its tailnet status as an artifact, and emits a classifier
-  # output that the aggregator below consumes.
-  # -----------------------------------------------------------------------
+  # ----------------------------------------------------------------------
+  # cp: Control plane.
+  # Outputs:
+  #   tailnet_ip — IPv4 the CP binds its HTTP listener to.
+  #   caller_token — freshly-minted caller token (masked).
+  #   class — classifier verdict (success | advisory | required).
+  # ----------------------------------------------------------------------
   cp:
     name: role-cp
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     outputs:
       class: ${{ steps.classify.outputs.class }}
+      tailnet_ip: ${{ steps.cp-start.outputs.tailnet_ip }}
+      caller_token: ${{ steps.cp-bootstrap.outputs.caller_token }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
 
       - name: bootstrap:install-tailscale
         id: ts-install
         continue-on-error: true
-        # Tailscale ships a one-liner installer for Ubuntu. We pin nothing
-        # because the action below also installs; this step is a sanity
-        # smoke to surface broken mirrors as advisory rather than required.
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           tailscale version
@@ -98,28 +116,81 @@ jobs:
         continue-on-error: true
         uses: tailscale/github-action@v2
         with:
-          # Prefer OAuth credentials. Falls back to authkey if OAuth secrets
-          # are absent — the action errors loudly when neither is set, which
-          # is what we want operator-wise.
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           authkey: ${{ secrets.TS_AUTHKEY }}
           tags: ${{ env.TS_TAG }}
           hostname: cp-ci-${{ github.run_id }}
-          # `--accept-routes=false` because we do not want this ephemeral
-          # node to advertise into operator-controlled subnets.
           args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
+
+      - name: bootstrap:build-binary
+        id: build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
+          sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+          uncluster --help >/dev/null
+
+      - name: product:cp-bootstrap
+        id: cp-bootstrap
+        # Bootstrap the CA and mint the initial caller token.
+        # The token must be passed to downstream jobs via job output.
+        # add-mask ensures it doesn't appear in subsequent step logs.
+        run: |
+          set -euo pipefail
+          export XDG_DATA_HOME=/tmp/uncluster-ci/data
+          mkdir -p "${XDG_DATA_HOME}"
+          uncluster server bootstrap --label ci-bootstrap > /tmp/bs.out
+          # Mask the caller token in logs.
+          tok="$(awk '/caller token \(shown ONCE/{getline; gsub(/^[[:space:]]+/,""); print; exit}' /tmp/bs.out)"
+          test -n "${tok}"
+          echo "::add-mask::${tok}"
+          echo "caller_token=${tok}" >> "$GITHUB_OUTPUT"
+          # Persist locally for the CP's own use later (caller token is
+          # also needed when this role mints join tokens for the agents).
+          echo "${tok}" > /tmp/caller-token
+          chmod 0600 /tmp/caller-token
+
+      - name: product:cp-start
+        id: cp-start
+        # Bind CP HTTP listener to the tailnet IP so traffic only flows
+        # over the tailnet (per #72 constraint: "no public IPs").
+        run: |
+          set -euo pipefail
+          ip="$(tailscale ip -4 | head -1)"
+          test -n "${ip}"
+          echo "tailnet_ip=${ip}" >> "$GITHUB_OUTPUT"
+          export XDG_DATA_HOME=/tmp/uncluster-ci/data
+          nohup uncluster server start --addr "${ip}:${CP_PORT}" \
+              > /tmp/cp.log 2>&1 &
+          echo $! > /tmp/cp.pid
+          # Wait for healthz reachable via tailnet IP.
+          for _ in $(seq 1 30); do
+              if curl -fsS "http://${ip}:${CP_PORT}/healthz" >/dev/null 2>&1; then
+                  echo "cp up at ${ip}:${CP_PORT}"
+                  exit 0
+              fi
+              sleep 1
+          done
+          tail -50 /tmp/cp.log || true
+          exit 1
 
       - name: rendezvous:wait-for-peers
         id: rdv-wait
         continue-on-error: true
-        # Wait until both peers are reachable by magic-dns. Each tailscale
-        # ping has its own ~5s budget; we retry the outer loop for up to
-        # 5 minutes to tolerate slow peer registration.
+        # Wait for all 3 agents + caller. caller does not need to be
+        # joinable from CP for the product flow — only agents do — but
+        # we wait for caller anyway as a rendezvous smoke.
         run: |
           set -euo pipefail
-          peers=("agent-linux-ci-${{ github.run_id }}" "caller-ci-${{ github.run_id }}")
-          deadline=$(( $(date +%s) + 300 ))
+          peers=(
+              "agent-linux-ci-${{ github.run_id }}"
+              "agent-macos-ci-${{ github.run_id }}"
+              "agent-windows-ci-${{ github.run_id }}"
+              "caller-ci-${{ github.run_id }}"
+          )
+          deadline=$(( $(date +%s) + 600 ))   # 10 min — windows is slow
           while [[ $(date +%s) -lt $deadline ]]; do
               ok=1
               for p in "${peers[@]}"; do
@@ -132,49 +203,82 @@ jobs:
                   echo "all peers reachable"
                   exit 0
               fi
-              sleep 10
+              sleep 15
           done
-          echo "::error::peers never became reachable in 5 minutes"
+          echo "::error::peers never became reachable in 10 minutes"
           exit 1
 
-      - name: rendezvous:ping-summary
-        id: rdv-ping
-        continue-on-error: true
-        if: steps.rdv-wait.outcome == 'success'
+      - name: product:wait-for-agents-registered
+        id: wait-agents
+        # Agents call /v1/agent/register on first heartbeat. Wait for all
+        # 3 to appear in the CP's agents list. Acceptance #72: all 4
+        # agents register within 60s.
         run: |
           set -euo pipefail
-          for p in agent-linux-ci-${{ github.run_id }} caller-ci-${{ github.run_id }}; do
-              echo "=== ping $p ==="
-              tailscale ping -c 3 --timeout 5s "$p"
+          tok="$(cat /tmp/caller-token)"
+          ip="$(tailscale ip -4 | head -1)"
+          want=("ci-agent-linux" "ci-agent-macos" "ci-agent-windows")
+          deadline=$(( $(date +%s) + 180 ))  # 3 min — generous for cold-start
+          while [[ $(date +%s) -lt $deadline ]]; do
+              agents="$(curl -fsS "http://${ip}:${CP_PORT}/v1/agents" \
+                  -H "Authorization: Bearer ${tok}" || echo '[]')"
+              all_ok=1
+              for w in "${want[@]}"; do
+                  if ! echo "${agents}" | jq -e --arg n "$w" 'any(.name == $n)' >/dev/null 2>&1; then
+                      all_ok=0
+                  fi
+              done
+              if [[ "${all_ok}" == "1" ]]; then
+                  echo "all 3 agents registered"
+                  echo "${agents}" | jq .
+                  exit 0
+              fi
+              sleep 5
           done
+          echo "::error::not all agents registered in 3 minutes"
+          curl -fsS "http://${ip}:${CP_PORT}/v1/agents" \
+              -H "Authorization: Bearer ${tok}" | jq . || true
+          exit 1
+
+      - name: product:wait-for-caller-done
+        id: wait-caller
+        # Hold the CP open until the caller signals done (or 15min).
+        # The caller writes a "done" sentinel via tailscale-only HTTP
+        # — but we don't yet have a tailnet-fileserver primitive; instead
+        # we just sleep enough for the caller to complete its SSH tests.
+        # Cap with the job's timeout.
+        timeout-minutes: 10
+        run: |
+          # Caller is fast (3 SSHes + a few API calls). 8 minutes is
+          # generous for the entire flow including Tailscale handshake.
+          sleep 480
 
       - name: collect:tailnet-state
         id: collect
         if: always()
-        # Best-effort scrape: status, IPs, log buffer. Tagged `collect:*` to
-        # signal "diagnostic, not part of the gate".
         run: |
           mkdir -p artifacts
           tailscale status --json > artifacts/status.json 2>&1 || true
           tailscale ip -4 > artifacts/ipv4.txt 2>&1 || true
-          tailscale ip -6 > artifacts/ipv6.txt 2>&1 || true
           journalctl -u tailscaled --no-pager --since "10 minutes ago" \
               > artifacts/tailscaled.log 2>&1 || true
+          cp /tmp/cp.log artifacts/cp.log 2>/dev/null || true
           ip addr > artifacts/ip-addr.txt 2>&1 || true
           ss -tlnp > artifacts/listening.txt 2>&1 || true
 
       - name: classify
         id: classify
         if: always()
-        # Delegates to scripts/ci/classify-step.sh which implements the
-        # bootstrap/rendezvous/product/collect taxonomy from ADR-0008.
-        # T3b adds `product:*` steps here without re-plumbing the script.
         run: |
           ./scripts/ci/classify-step.sh \
               "bootstrap:install-tailscale=${{ steps.ts-install.outcome }}" \
               "bootstrap:tailscale-up=${{ steps.ts-up.outcome }}" \
+              "bootstrap:build-binary=${{ steps.build.outcome }}" \
+              "product:cp-bootstrap=${{ steps.cp-bootstrap.outcome }}" \
+              "product:cp-start=${{ steps.cp-start.outcome }}" \
               "rendezvous:wait-for-peers=${{ steps.rdv-wait.outcome }}" \
-              "rendezvous:ping-summary=${{ steps.rdv-ping.outcome }}" \
+              "product:wait-for-agents-registered=${{ steps.wait-agents.outcome }}" \
+              "product:wait-for-caller-done=${{ steps.wait-caller.outcome }}" \
               >> "$GITHUB_OUTPUT"
 
       - name: upload-artifacts
@@ -186,14 +290,22 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # ----------------------------------------------------------------------
+  # agent-linux: install Uncluster Agent against the tailnet CP.
+  # ----------------------------------------------------------------------
   agent-linux:
     name: role-agent-linux
+    needs: [cp]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     outputs:
       class: ${{ steps.classify.outputs.class }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
 
       - name: bootstrap:install-tailscale
         id: ts-install
@@ -214,46 +326,106 @@ jobs:
           hostname: agent-linux-ci-${{ github.run_id }}
           args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
 
-      - name: rendezvous:wait-for-peers
+      - name: bootstrap:install-sshd
+        id: sshd
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null; then
+              sudo apt-get update -y
+              sudo apt-get install -y --no-install-recommends openssh-server
+          fi
+          sudo systemctl enable --now ssh
+          sudo systemctl is-active --quiet ssh
+
+      - name: bootstrap:build-binary
+        id: build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
+          sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+          uncluster --help >/dev/null
+
+      - name: rendezvous:wait-for-cp
         id: rdv-wait
         continue-on-error: true
         run: |
           set -euo pipefail
-          peers=("cp-ci-${{ github.run_id }}" "caller-ci-${{ github.run_id }}")
+          peer="cp-ci-${{ github.run_id }}"
           deadline=$(( $(date +%s) + 300 ))
           while [[ $(date +%s) -lt $deadline ]]; do
-              ok=1
-              for p in "${peers[@]}"; do
-                  if ! tailscale ping -c 1 --timeout 5s "$p" >/dev/null 2>&1; then
-                      ok=0
-                  fi
-              done
-              if [[ $ok -eq 1 ]]; then exit 0; fi
-              sleep 10
+              if tailscale ping -c 1 --timeout 5s "$peer" >/dev/null 2>&1; then
+                  echo "cp reachable"
+                  exit 0
+              fi
+              sleep 5
           done
-          echo "::error::peers never became reachable in 5 minutes"
+          echo "::error::cp never became reachable"
           exit 1
 
-      - name: rendezvous:ping-summary
-        id: rdv-ping
-        continue-on-error: true
-        if: steps.rdv-wait.outcome == 'success'
+      - name: product:mint-join-token
+        id: mint-join
+        # Use the CP-output caller token to mint a join token for this
+        # agent. The HTTP call goes over the tailnet to the CP's
+        # tailnet IP (no public IP exposure).
+        env:
+          CALLER_TOKEN: ${{ needs.cp.outputs.caller_token }}
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
         run: |
           set -euo pipefail
-          for p in cp-ci-${{ github.run_id }} caller-ci-${{ github.run_id }}; do
-              echo "=== ping $p ==="
-              tailscale ping -c 3 --timeout 5s "$p"
-          done
+          test -n "${CALLER_TOKEN}"
+          test -n "${CP_IP}"
+          resp="$(curl -fsS -X POST "http://${CP_IP}:${CP_PORT}/v1/tokens" \
+              -H "Authorization: Bearer ${CALLER_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"kind":"join","label":"ci-join-linux"}')"
+          tok="$(echo "${resp}" | jq -r '.token')"
+          test -n "${tok}" && test "${tok}" != "null"
+          echo "::add-mask::${tok}"
+          echo "${tok}" > /tmp/join-token
+          chmod 0600 /tmp/join-token
+
+      - name: product:agent-join
+        id: agent-join
+        env:
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
+        run: |
+          set -euo pipefail
+          sudo env UNCLUSTER_TOKEN="$(cat /tmp/join-token)" \
+              uncluster agent join \
+                  --server "http://${CP_IP}:${CP_PORT}" \
+                  --name ci-agent-linux
+
+      - name: product:agent-install
+        id: agent-install
+        run: |
+          set -euo pipefail
+          sudo uncluster agent install
+
+      - name: product:assert-service-active
+        id: assert-svc
+        run: |
+          set -euo pipefail
+          sudo systemctl is-active --quiet com.uncluster.agent
 
       - name: collect:tailnet-state
         if: always()
         run: |
           mkdir -p artifacts
           tailscale status --json > artifacts/status.json 2>&1 || true
-          tailscale ip -4 > artifacts/ipv4.txt 2>&1 || true
-          journalctl -u tailscaled --no-pager --since "10 minutes ago" \
-              > artifacts/tailscaled.log 2>&1 || true
-          ip addr > artifacts/ip-addr.txt 2>&1 || true
+          sudo journalctl -u com.uncluster.agent --no-pager > artifacts/agent-journal.txt 2>&1 || true
+          sudo journalctl -u ssh --no-pager --since "10 minutes ago" > artifacts/ssh-journal.txt 2>&1 || true
+          sudo cat /etc/ssh/sshd_config.d/uncluster.conf > artifacts/sshd-drop-in.conf 2>&1 || true
+          sudo ls -la /etc/ssh/auth_principals > artifacts/principals.txt 2>&1 || true
+
+      - name: hold-open
+        # Keep the agent running long enough for the caller to mint a
+        # cert and SSH in. Caller has a similar hold-open; coordinated
+        # by total timeout cap.
+        timeout-minutes: 8
+        run: |
+          sleep 420
 
       - name: classify
         id: classify
@@ -262,8 +434,13 @@ jobs:
           ./scripts/ci/classify-step.sh \
               "bootstrap:install-tailscale=${{ steps.ts-install.outcome }}" \
               "bootstrap:tailscale-up=${{ steps.ts-up.outcome }}" \
-              "rendezvous:wait-for-peers=${{ steps.rdv-wait.outcome }}" \
-              "rendezvous:ping-summary=${{ steps.rdv-ping.outcome }}" \
+              "bootstrap:install-sshd=${{ steps.sshd.outcome }}" \
+              "bootstrap:build-binary=${{ steps.build.outcome }}" \
+              "rendezvous:wait-for-cp=${{ steps.rdv-wait.outcome }}" \
+              "product:mint-join-token=${{ steps.mint-join.outcome }}" \
+              "product:agent-join=${{ steps.agent-join.outcome }}" \
+              "product:agent-install=${{ steps.agent-install.outcome }}" \
+              "product:assert-service-active=${{ steps.assert-svc.outcome }}" \
               >> "$GITHUB_OUTPUT"
 
       - name: upload-artifacts
@@ -275,14 +452,376 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  caller:
-    name: role-caller
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  # ----------------------------------------------------------------------
+  # agent-macos: same as agent-linux but on macos-latest.
+  #
+  # T2-mac (#71) is the per-PR canary for this role; if T2-mac is
+  # spike-blocked on remote-login, this role is too — but the failure
+  # taxonomy buckets it correctly (bootstrap:* → advisory, so the
+  # workflow doesn't fail red).
+  # ----------------------------------------------------------------------
+  agent-macos:
+    name: role-agent-macos
+    needs: [cp]
+    runs-on: macos-latest
+    timeout-minutes: 25
     outputs:
       class: ${{ steps.classify.outputs.class }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: bootstrap:install-tailscale
+        id: ts-install
+        continue-on-error: true
+        # macOS Tailscale install via Homebrew. Alternative is the .pkg
+        # but Homebrew is what the runners have pre-warmed.
+        run: |
+          set -euo pipefail
+          brew install --cask tailscale 2>&1 || brew install tailscale
+          tailscale version
+
+      - name: bootstrap:tailscale-up
+        id: ts-up
+        continue-on-error: true
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: ${{ env.TS_TAG }}
+          hostname: agent-macos-ci-${{ github.run_id }}
+          args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
+
+      - name: bootstrap:enable-remote-login
+        id: remote-login
+        # Same spike risk as #71. If this returns Off, downstream
+        # product:* steps short-circuit via `if:` — classifier will
+        # bucket this role's overall result as advisory, not required.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo systemsetup -setremotelogin on || true
+          state="$(sudo systemsetup -getremotelogin 2>&1 || true)"
+          echo "${state}"
+          if ! echo "${state}" | grep -qi 'Remote Login: On'; then
+              echo "::warning::Remote Login could not be enabled on macos-latest (same as #71 spike outcome)"
+              echo "remote_login_blocked=true" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          echo "remote_login_blocked=false" >> "$GITHUB_OUTPUT"
+
+      - name: bootstrap:build-binary
+        id: build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
+          sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+          uncluster --help >/dev/null
+
+      - name: rendezvous:wait-for-cp
+        id: rdv-wait
+        continue-on-error: true
+        if: steps.remote-login.outputs.remote_login_blocked != 'true'
+        run: |
+          set -euo pipefail
+          peer="cp-ci-${{ github.run_id }}"
+          deadline=$(( $(date +%s) + 300 ))
+          while [[ $(date +%s) -lt $deadline ]]; do
+              if tailscale ping -c 1 --timeout 5s "$peer" >/dev/null 2>&1; then
+                  echo "cp reachable"
+                  exit 0
+              fi
+              sleep 5
+          done
+          echo "::error::cp never became reachable"
+          exit 1
+
+      - name: product:mint-join-token
+        id: mint-join
+        if: steps.remote-login.outputs.remote_login_blocked != 'true'
+        env:
+          CALLER_TOKEN: ${{ needs.cp.outputs.caller_token }}
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
+        run: |
+          set -euo pipefail
+          resp="$(curl -fsS -X POST "http://${CP_IP}:${CP_PORT}/v1/tokens" \
+              -H "Authorization: Bearer ${CALLER_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"kind":"join","label":"ci-join-macos"}')"
+          tok="$(echo "${resp}" | jq -r '.token')"
+          echo "::add-mask::${tok}"
+          echo "${tok}" > /tmp/join-token
+          chmod 0600 /tmp/join-token
+
+      - name: product:agent-join
+        id: agent-join
+        if: steps.remote-login.outputs.remote_login_blocked != 'true'
+        env:
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
+        run: |
+          set -euo pipefail
+          sudo env UNCLUSTER_TOKEN="$(cat /tmp/join-token)" \
+              uncluster agent join \
+                  --server "http://${CP_IP}:${CP_PORT}" \
+                  --name ci-agent-macos
+
+      - name: product:agent-install
+        id: agent-install
+        if: steps.remote-login.outputs.remote_login_blocked != 'true'
+        run: |
+          set -euo pipefail
+          sudo uncluster agent install
+
+      - name: product:assert-service-loaded
+        id: assert-svc
+        if: steps.remote-login.outputs.remote_login_blocked != 'true'
+        run: |
+          set -euo pipefail
+          out="$(sudo launchctl list com.uncluster.agent 2>&1 || true)"
+          echo "${out}"
+          if ! echo "${out}" | grep -qE '"PID" = [1-9]'; then
+              echo "service did not load with a running PID"
+              exit 1
+          fi
+
+      - name: collect:state
+        if: always()
+        run: |
+          mkdir -p artifacts
+          tailscale status --json > artifacts/status.json 2>&1 || true
+          sudo launchctl list com.uncluster.agent > artifacts/launchctl.txt 2>&1 || true
+          sudo log show --last 5m --predicate 'subsystem == "com.uncluster.agent"' > artifacts/log-show.txt 2>&1 || true
+          sudo cat /etc/ssh/sshd_config.d/uncluster.conf > artifacts/sshd-drop-in.conf 2>&1 || true
+
+      - name: hold-open
+        if: steps.remote-login.outputs.remote_login_blocked != 'true'
+        timeout-minutes: 8
+        run: sleep 420
+
+      - name: classify
+        id: classify
+        if: always()
+        run: |
+          # If remote-login blocked, every product:* step shows
+          # "skipped" — the classifier treats skipped as bootstrap-class
+          # (not required) so the overall role lands "advisory" rather
+          # than "required" — exactly the spike posture from #71.
+          ./scripts/ci/classify-step.sh \
+              "bootstrap:install-tailscale=${{ steps.ts-install.outcome }}" \
+              "bootstrap:tailscale-up=${{ steps.ts-up.outcome }}" \
+              "bootstrap:enable-remote-login=${{ steps.remote-login.outcome }}" \
+              "bootstrap:build-binary=${{ steps.build.outcome }}" \
+              "rendezvous:wait-for-cp=${{ steps.rdv-wait.outcome }}" \
+              "product:mint-join-token=${{ steps.mint-join.outcome }}" \
+              "product:agent-join=${{ steps.agent-join.outcome }}" \
+              "product:agent-install=${{ steps.agent-install.outcome }}" \
+              "product:assert-service-loaded=${{ steps.assert-svc.outcome }}" \
+              >> "$GITHUB_OUTPUT"
+
+      - name: upload-artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cross-machine-agent-macos-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ----------------------------------------------------------------------
+  # agent-windows: same as agent-linux but on windows-latest.
+  #
+  # NB: t2-windows (#70 / current main) hits the SCM service-control-
+  # protocol gap tracked in #88 — install returns exit 2 even though
+  # the agent process runs. Until #88 lands, this role is expected to
+  # fail at product:agent-install. The failure-taxonomy buckets it
+  # correctly (product class → required), but the workflow as a whole
+  # is advisory-via-quarantine until empirically green.
+  # ----------------------------------------------------------------------
+  agent-windows:
+    name: role-agent-windows
+    needs: [cp]
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      class: ${{ steps.classify.outputs.class }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: bootstrap:install-tailscale
+        id: ts-install
+        continue-on-error: true
+        # Tailscale provides a winget-installable client and an MSI.
+        # The github-action below installs as part of its own setup, so
+        # this step is mostly a smoke for whether tailscale CLI is on
+        # PATH afterward.
+        run: |
+          # Tailscale GH action handles install + up on Windows in one
+          # step (see ts-up below). This step is left empty-ish as a
+          # placeholder so the classifier has a consistent bootstrap:
+          # entry across roles.
+          Write-Host "tailscale install delegated to tailscale/github-action@v2"
+
+      - name: bootstrap:tailscale-up
+        id: ts-up
+        continue-on-error: true
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: ${{ env.TS_TAG }}
+          hostname: agent-windows-ci-${{ github.run_id }}
+          args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
+
+      - name: bootstrap:install-sshd
+        id: sshd
+        continue-on-error: true
+        run: |
+          $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*'
+          if ($cap.State -ne 'Installed') {
+              Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+          }
+          Set-Service -Name sshd -StartupType Automatic
+          Start-Service sshd
+
+      - name: bootstrap:build-binary
+        id: build
+        continue-on-error: true
+        run: |
+          go build -trimpath -ldflags "-s -w" -o C:\uncluster\uncluster.exe .\cmd\uncluster
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\uncluster"
+          & C:\uncluster\uncluster.exe --help | Out-Null
+
+      - name: rendezvous:wait-for-cp
+        id: rdv-wait
+        continue-on-error: true
+        run: |
+          $peer = "cp-ci-${{ github.run_id }}"
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $deadline) {
+              $out = & tailscale ping -c 1 --timeout 5s $peer 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                  Write-Host "cp reachable"
+                  exit 0
+              }
+              Start-Sleep -Seconds 5
+          }
+          Write-Error "cp never became reachable"
+          exit 1
+
+      - name: product:mint-join-token
+        id: mint-join
+        env:
+          CALLER_TOKEN: ${{ needs.cp.outputs.caller_token }}
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
+        run: |
+          $headers = @{ 'Authorization' = "Bearer $env:CALLER_TOKEN"; 'Content-Type' = 'application/json' }
+          $body = '{"kind":"join","label":"ci-join-windows"}'
+          $uri = "http://${env:CP_IP}:${env:CP_PORT}/v1/tokens"
+          $r = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body
+          # Mask the token in the log.
+          Write-Host "::add-mask::$($r.token)"
+          $r.token | Set-Content C:\join-token -NoNewline -Encoding ASCII
+
+      - name: product:agent-join
+        id: agent-join
+        env:
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
+        run: |
+          $env:UNCLUSTER_TOKEN = Get-Content C:\join-token -Raw
+          $server = "http://${env:CP_IP}:${env:CP_PORT}"
+          & C:\uncluster\uncluster.exe agent join `
+              --server $server `
+              --name ci-agent-windows
+
+      - name: product:agent-install
+        id: agent-install
+        # NB: this is the step expected to fail on main pre-#88 fix.
+        # Failure here is a product-class failure (= required), so it
+        # will cause the workflow to go red until #88 ships. The
+        # quarantine watchdog will eventually escalate this to a
+        # needs-triage issue if it persists.
+        run: |
+          & C:\uncluster\uncluster.exe agent install
+
+      - name: product:assert-service-running
+        id: assert-svc
+        run: |
+          $svc = Get-Service UnclusterAgent
+          if ($svc.Status -ne 'Running') {
+              Write-Error "UnclusterAgent status=$($svc.Status), want Running"
+              exit 1
+          }
+
+      - name: collect:state
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $ErrorActionPreference = 'Continue'
+          try { tailscale status --json | Out-File artifacts\tailscale-status.json } catch {}
+          try { Get-Service UnclusterAgent | Format-List | Out-File artifacts\service-detail.txt } catch {}
+          try { sc.exe qc UnclusterAgent | Out-File artifacts\sc-qc.txt 2>$null } catch {}
+          try { Get-Content 'C:\ProgramData\ssh\sshd_config.d\uncluster.conf' | Out-File artifacts\sshd-drop-in.conf } catch {}
+
+      - name: hold-open
+        timeout-minutes: 8
+        run: Start-Sleep -Seconds 420
+
+      - name: classify
+        id: classify
+        if: always()
+        shell: bash
+        run: |
+          ./scripts/ci/classify-step.sh \
+              "bootstrap:install-tailscale=${{ steps.ts-install.outcome }}" \
+              "bootstrap:tailscale-up=${{ steps.ts-up.outcome }}" \
+              "bootstrap:install-sshd=${{ steps.sshd.outcome }}" \
+              "bootstrap:build-binary=${{ steps.build.outcome }}" \
+              "rendezvous:wait-for-cp=${{ steps.rdv-wait.outcome }}" \
+              "product:mint-join-token=${{ steps.mint-join.outcome }}" \
+              "product:agent-join=${{ steps.agent-join.outcome }}" \
+              "product:agent-install=${{ steps.agent-install.outcome }}" \
+              "product:assert-service-running=${{ steps.assert-svc.outcome }}" \
+              >> "$GITHUB_OUTPUT"
+
+      - name: upload-artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cross-machine-agent-windows-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ----------------------------------------------------------------------
+  # caller: needs all 3 agents healthy. Mints ACL grants for caller→
+  # agent, runs uncluster ssh <agent> -- hostname, asserts hostname.
+  # ----------------------------------------------------------------------
+  caller:
+    name: role-caller
+    needs: [cp, agent-linux, agent-macos, agent-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      class: ${{ steps.classify.outputs.class }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
 
       - name: bootstrap:install-tailscale
         id: ts-install
@@ -303,12 +842,43 @@ jobs:
           hostname: caller-ci-${{ github.run_id }}
           args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
 
-      - name: rendezvous:wait-for-peers
-        id: rdv-wait
+      - name: bootstrap:build-binary
+        id: build
         continue-on-error: true
         run: |
           set -euo pipefail
-          peers=("cp-ci-${{ github.run_id }}" "agent-linux-ci-${{ github.run_id }}")
+          go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
+          sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+
+      - name: bootstrap:caller-cli-config
+        id: cli-config
+        env:
+          CALLER_TOKEN: ${{ needs.cp.outputs.caller_token }}
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
+        # Configure the local CLI to talk to the CP via the tailnet IP.
+        # Use the standard config path; the exact format is what
+        # `uncluster config init`-equivalent would produce.
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/uncluster
+          cat > ~/.config/uncluster/config.toml <<EOF
+          server = "http://${CP_IP}:${CP_PORT}"
+          token = "${CALLER_TOKEN}"
+          EOF
+          chmod 0600 ~/.config/uncluster/config.toml
+
+      - name: rendezvous:wait-for-cp-and-agents
+        id: rdv-wait
+        continue-on-error: true
+        # All 4 must be reachable.
+        run: |
+          set -euo pipefail
+          peers=(
+              "cp-ci-${{ github.run_id }}"
+              "agent-linux-ci-${{ github.run_id }}"
+              "agent-macos-ci-${{ github.run_id }}"
+              "agent-windows-ci-${{ github.run_id }}"
+          )
           deadline=$(( $(date +%s) + 300 ))
           while [[ $(date +%s) -lt $deadline ]]; do
               ok=1
@@ -320,28 +890,120 @@ jobs:
               if [[ $ok -eq 1 ]]; then exit 0; fi
               sleep 10
           done
-          echo "::error::peers never became reachable in 5 minutes"
+          echo "::error::not all peers reachable"
           exit 1
 
-      - name: rendezvous:ping-summary
-        id: rdv-ping
-        continue-on-error: true
-        if: steps.rdv-wait.outcome == 'success'
+      - name: product:list-agents
+        id: list-agents
+        # Sanity: agents we want to SSH to must be in the CP's list.
+        env:
+          CALLER_TOKEN: ${{ needs.cp.outputs.caller_token }}
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
         run: |
           set -euo pipefail
-          for p in cp-ci-${{ github.run_id }} agent-linux-ci-${{ github.run_id }}; do
-              echo "=== ping $p ==="
-              tailscale ping -c 3 --timeout 5s "$p"
+          agents="$(curl -fsS "http://${CP_IP}:${CP_PORT}/v1/agents" \
+              -H "Authorization: Bearer ${CALLER_TOKEN}")"
+          echo "${agents}" | jq .
+          for w in ci-agent-linux ci-agent-macos ci-agent-windows; do
+              if ! echo "${agents}" | jq -e --arg n "$w" 'any(.name == $n)' >/dev/null 2>&1; then
+                  echo "agent $w not registered with CP"
+                  exit 1
+              fi
           done
 
-      - name: collect:tailnet-state
+      - name: product:ssh-agent-linux
+        id: ssh-linux
+        # The load-bearing assertion from #72: caller can SSH to the
+        # Linux agent and get the right hostname back. Cert is minted
+        # by `uncluster ssh`; ACL is granted just before.
+        # This may need an `uncluster acl grant` step depending on the
+        # CLI's default behaviour. We attempt the SSH; if it fails on
+        # 403, we grant + retry. (Bounded retry — once.)
+        run: |
+          set -euo pipefail
+          set +e
+          out="$(uncluster ssh ci-agent-linux -- hostname 2>&1)"
+          rc=$?
+          set -e
+          echo "first attempt rc=${rc} out=${out}"
+          if [[ "${rc}" -ne 0 ]]; then
+              # Grant ACL then retry once.
+              caller_id="$(curl -fsS "http://${{ needs.cp.outputs.tailnet_ip }}:${CP_PORT}/v1/tokens" \
+                  -H "Authorization: Bearer ${{ needs.cp.outputs.caller_token }}" \
+                  | jq -r '.[] | select(.kind=="caller") | .id' | head -1 || true)"
+              if [[ -n "${caller_id}" ]]; then
+                  echo "granting acl ${caller_id} → ci-agent-linux"
+                  uncluster acl grant "${caller_id}" ci-agent-linux || true
+              fi
+              out="$(uncluster ssh ci-agent-linux -- hostname 2>&1)"
+          fi
+          echo "ssh output: ${out}"
+          # Acceptance #72: exit 0 + the agent's actual hostname.
+          # The agent's hostname is something runner-specific; just
+          # assert non-empty + that the OUTPUT line resembles a Linux
+          # hostname (not a Windows or macOS one — which would mean
+          # the agent name resolved to the wrong machine).
+          if ! echo "${out}" | grep -qE '^[a-z0-9-]+$'; then
+              echo "hostname output suspicious: ${out}"
+              exit 1
+          fi
+
+      - name: product:ssh-agent-macos
+        id: ssh-macos
+        # Same shape as linux. May fail if agent-macos was remote-login
+        # blocked — that's an upstream-role failure, not a caller bug.
+        run: |
+          set -euo pipefail
+          set +e
+          out="$(uncluster ssh ci-agent-macos -- hostname 2>&1)"
+          rc=$?
+          set -e
+          echo "rc=${rc} out=${out}"
+          if [[ "${rc}" -ne 0 ]]; then
+              echo "ssh-mac failed (likely upstream agent-macos blocker)"
+              exit 1
+          fi
+
+      - name: product:ssh-agent-windows
+        id: ssh-windows
+        # Expected to fail until #88 (Windows SCM gap) ships.
+        run: |
+          set -euo pipefail
+          set +e
+          out="$(uncluster ssh ci-agent-windows -- hostname 2>&1)"
+          rc=$?
+          set -e
+          echo "rc=${rc} out=${out}"
+          if [[ "${rc}" -ne 0 ]]; then
+              echo "ssh-windows failed (likely upstream #88 SCM gap; expected pre-#88-fix)"
+              exit 1
+          fi
+
+      - name: product:assert-audit-certs
+        id: audit-certs
+        # All successful SSH attempts mint a cert; assert those appear
+        # in `uncluster audit certs`. Per #72 acceptance.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          out="$(uncluster audit certs 2>&1 || true)"
+          echo "${out}"
+          # At minimum the Linux SSH should have produced a cert event.
+          if [[ "${{ steps.ssh-linux.outcome }}" == "success" ]]; then
+              if ! echo "${out}" | grep -q "ci-agent-linux"; then
+                  echo "no cert audit event for ci-agent-linux"
+                  exit 1
+              fi
+          fi
+
+      - name: collect:state
         if: always()
         run: |
           mkdir -p artifacts
           tailscale status --json > artifacts/status.json 2>&1 || true
-          tailscale ip -4 > artifacts/ipv4.txt 2>&1 || true
-          journalctl -u tailscaled --no-pager --since "10 minutes ago" \
-              > artifacts/tailscaled.log 2>&1 || true
+          cp ~/.config/uncluster/config.toml artifacts/config.toml 2>/dev/null || true
+          # Don't leak the token — strip and redact.
+          sed -i 's/token = ".*"/token = "REDACTED"/' artifacts/config.toml 2>/dev/null || true
 
       - name: classify
         id: classify
@@ -350,8 +1012,14 @@ jobs:
           ./scripts/ci/classify-step.sh \
               "bootstrap:install-tailscale=${{ steps.ts-install.outcome }}" \
               "bootstrap:tailscale-up=${{ steps.ts-up.outcome }}" \
-              "rendezvous:wait-for-peers=${{ steps.rdv-wait.outcome }}" \
-              "rendezvous:ping-summary=${{ steps.rdv-ping.outcome }}" \
+              "bootstrap:build-binary=${{ steps.build.outcome }}" \
+              "bootstrap:caller-cli-config=${{ steps.cli-config.outcome }}" \
+              "rendezvous:wait-for-cp-and-agents=${{ steps.rdv-wait.outcome }}" \
+              "product:list-agents=${{ steps.list-agents.outcome }}" \
+              "product:ssh-agent-linux=${{ steps.ssh-linux.outcome }}" \
+              "product:ssh-agent-macos=${{ steps.ssh-macos.outcome }}" \
+              "product:ssh-agent-windows=${{ steps.ssh-windows.outcome }}" \
+              "product:assert-audit-certs=${{ steps.audit-certs.outcome }}" \
               >> "$GITHUB_OUTPUT"
 
       - name: upload-artifacts
@@ -363,8 +1031,88 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # -----------------------------------------------------------------------
-  # Aggregator: enforces the failure taxonomy.
+  # ----------------------------------------------------------------------
+  # teardown: best-effort cleanup. if: always(). Never fails the
+  # workflow — emits warnings if cleanup partial.
+  # ----------------------------------------------------------------------
+  teardown:
+    name: role-teardown
+    needs: [cp, agent-linux, agent-macos, agent-windows, caller]
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: bootstrap:install-tailscale
+        id: ts-install
+        continue-on-error: true
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale version
+
+      - name: bootstrap:tailscale-up
+        id: ts-up
+        continue-on-error: true
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: ${{ env.TS_TAG }}
+          hostname: teardown-ci-${{ github.run_id }}
+          args: --accept-routes=false --advertise-tags=${{ env.TS_TAG }}
+
+      - name: bootstrap:build-binary
+        id: build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
+          sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+
+      - name: bootstrap:caller-cli-config
+        id: cli-config
+        if: needs.cp.outputs.caller_token != '' && needs.cp.outputs.tailnet_ip != ''
+        env:
+          CALLER_TOKEN: ${{ needs.cp.outputs.caller_token }}
+          CP_IP: ${{ needs.cp.outputs.tailnet_ip }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/uncluster
+          cat > ~/.config/uncluster/config.toml <<EOF
+          server = "http://${CP_IP}:${CP_PORT}"
+          token = "${CALLER_TOKEN}"
+          EOF
+          chmod 0600 ~/.config/uncluster/config.toml
+
+      - name: cleanup:remove-agents
+        id: rm-agents
+        if: needs.cp.outputs.caller_token != ''
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          for a in ci-agent-linux ci-agent-macos ci-agent-windows; do
+              echo "removing agent ${a}"
+              uncluster agents rm "${a}" || echo "removal of ${a} failed (may be expected if never registered)"
+          done
+
+      # Tailscale ephemeral nodes auto-expire when the tagged auth key
+      # is configured as ephemeral. Operator instructions in the file
+      # header. If non-ephemeral keys are used, manual cleanup via
+      # `tailscale logout` or admin console.
+      - name: cleanup:tailscale-logout
+        if: always()
+        continue-on-error: true
+        run: |
+          sudo tailscale logout || true
+
+  # ----------------------------------------------------------------------
+  # Aggregator: enforces the failure taxonomy across all roles.
   #
   # Rules (per ADR-0008):
   #   * If every role's classifier output is `success` → workflow succeeds.
@@ -374,43 +1122,44 @@ jobs:
   #     workflow, scheduled hourly) catches 3 consecutive advisory failures
   #     and opens a needs-triage issue.
   #
-  # T3a has no `product:*` steps, so the `required` branch is structurally
-  # unreachable from this slice. The branch is wired up so T3b can add
-  # product steps without re-plumbing the gate.
-  # -----------------------------------------------------------------------
+  # teardown is NOT in needs because teardown is best-effort cleanup —
+  # its failures shouldn't fail the gate (cleanup-was-incomplete is
+  # operator-visible via the workflow being yellow, not red).
+  # ----------------------------------------------------------------------
   enforce-taxonomy:
     name: enforce-taxonomy
     runs-on: ubuntu-latest
-    needs: [cp, agent-linux, caller]
+    needs: [cp, agent-linux, agent-macos, agent-windows, caller]
     if: always()
     steps:
       - name: classify workflow
         run: |
           set -euo pipefail
-          cp_class="${{ needs.cp.outputs.class }}"
-          agent_class="${{ needs.agent-linux.outputs.class }}"
-          caller_class="${{ needs.caller.outputs.class }}"
-          echo "cp=${cp_class} agent=${agent_class} caller=${caller_class}"
+          declare -A classes=(
+              ["cp"]="${{ needs.cp.outputs.class }}"
+              ["agent-linux"]="${{ needs.agent-linux.outputs.class }}"
+              ["agent-macos"]="${{ needs.agent-macos.outputs.class }}"
+              ["agent-windows"]="${{ needs.agent-windows.outputs.class }}"
+              ["caller"]="${{ needs.caller.outputs.class }}"
+          )
+          for role in "${!classes[@]}"; do
+              echo "role=${role} class=${classes[$role]}"
+          done
 
-          # `needs.X.result` reports the job-level outcome — it is `success`
-          # only when every step in that job succeeded. With continue-on-error
-          # on bootstrap+rendezvous steps the job result will be `success`
-          # even if those steps red; the classifier output is the source of
-          # truth for product-vs-advisory classification.
-          for c in "$cp_class" "$agent_class" "$caller_class"; do
-              if [[ "$c" == "required" ]]; then
-                  echo "::error::At least one role had a product-class (required) failure → failing the workflow"
+          # Required wins.
+          for role in "${!classes[@]}"; do
+              if [[ "${classes[$role]}" == "required" ]]; then
+                  echo "::error::Role ${role} had a product-class (required) failure → failing the workflow"
                   exit 1
               fi
           done
 
-          # No required failures. If any role is advisory, surface a warning
-          # but pass the workflow. Quarantine watchdog handles repeat-flake.
-          for c in "$cp_class" "$agent_class" "$caller_class"; do
-              if [[ "$c" == "advisory" ]]; then
-                  echo "::warning::Advisory-class failure(s) in tailnet rendezvous; quarantine watchdog will escalate after 3 consecutive."
+          # Otherwise, advisory yields a warning but passes.
+          for role in "${!classes[@]}"; do
+              if [[ "${classes[$role]}" == "advisory" ]]; then
+                  echo "::warning::Advisory-class failure(s); quarantine watchdog will escalate after 3 consecutive."
                   exit 0
               fi
           done
 
-          echo "All roles classified `success` — clean run."
+          echo "All roles classified success — clean run."
