@@ -217,7 +217,7 @@ func installService(ctx context.Context, cfg agent.Config, serviceExe string) er
 		return err
 	}
 	// Already installed. Probe for drift via sc qc.
-	out, qcErr := exec.CommandContext(ctx, "sc", "qc", "UnclusterAgent").CombinedOutput()
+	out, qcErr := exec.CommandContext(ctx, "sc", "qc", agent.WindowsServiceName).CombinedOutput()
 	if qcErr != nil {
 		// Couldn't query; preserve pre-fix idempotent behaviour.
 		return nil
@@ -227,7 +227,7 @@ func installService(ctx context.Context, cfg agent.Config, serviceExe string) er
 		return nil
 	}
 	// Drift detected — rebuild.
-	_ = exec.CommandContext(ctx, "net", "stop", "UnclusterAgent").Run()
+	_ = exec.CommandContext(ctx, "net", "stop", agent.WindowsServiceName).Run()
 	if err := svc.Uninstall(); err != nil {
 		return fmt.Errorf("uninstall drifted service (%s): %w", drift, err)
 	}
@@ -240,10 +240,10 @@ func installService(ctx context.Context, cfg agent.Config, serviceExe string) er
 // startServiceWindows starts (or restarts) the UnclusterAgent SCM service.
 func startServiceWindows(ctx context.Context) error {
 	// Stop first (idempotent — ignore errors from not-running).
-	_ = exec.CommandContext(ctx, "net", "stop", "UnclusterAgent").Run()
-	out, err := exec.CommandContext(ctx, "net", "start", "UnclusterAgent").CombinedOutput()
+	_ = exec.CommandContext(ctx, "net", "stop", agent.WindowsServiceName).Run()
+	out, err := exec.CommandContext(ctx, "net", "start", agent.WindowsServiceName).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("net start UnclusterAgent: %w\noutput: %s", err, string(out))
+		return fmt.Errorf("net start %s: %w\noutput: %s", agent.WindowsServiceName, err, string(out))
 	}
 	return nil
 }

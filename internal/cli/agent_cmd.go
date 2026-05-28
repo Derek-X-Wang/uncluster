@@ -82,7 +82,7 @@ func RunAgent(ctx context.Context, stderrW io.Writer) error {
 					// checks (config-loaded-path, update-host-allowlist)
 					// because the message IS the payload — the OK
 					// status alone tells the operator nothing useful.
-					if r.Message != "" && (r.Status != gatekeeper.CheckOK || r.Name == "config-loaded-path" || r.Name == "update-host-allowlist") {
+					if r.Message != "" && (r.Informational || r.Status != gatekeeper.CheckOK) {
 						msg := r.Message
 						hc.Message = &msg
 					}

@@ -10,13 +10,9 @@ import (
 
 	"golang.org/x/sys/windows/svc"
 
+	"github.com/derek-x-wang/uncluster/internal/agent"
 	"github.com/derek-x-wang/uncluster/internal/cli"
 )
-
-// windowsServiceName must match the service Name registered by
-// internal/gatekeeper/service_windows.go's buildService. SCM looks the
-// handler up by this string when dispatching control requests.
-const windowsServiceName = "UnclusterAgent"
 
 // runAsWindowsService detects whether the binary is running under the
 // Windows Service Control Manager. If so — and only if argv indicates
@@ -26,9 +22,13 @@ const windowsServiceName = "UnclusterAgent"
 // service as Running.
 //
 // Pre-#88 the binary returned from main with no svc.Run call: SCM never
-// got the "started" status word, hit its 30s timeout, and `net start
-// UnclusterAgent` returned exit 2 even though the agent process was
-// alive and heartbeating to the CP. See #88 for the full trace.
+// got the "started" status word, hit its 30s timeout, and `net start`
+// returned exit 2 even though the agent process was alive and heartbeating
+// to the CP. See #88 for the full trace.
+//
+// The SCM-registered service name is agent.WindowsServiceName, shared with
+// the installer and restart paths so the name SCM dispatches on cannot
+// drift from the name it was registered under.
 //
 // Returns:
 //   - handled=true with err=nil  → SCM lifecycle completed; main exits 0.
@@ -51,8 +51,8 @@ func runAsWindowsService() (handled bool, err error) {
 	if !argvIsAgentRun(os.Args) {
 		return false, nil
 	}
-	if runErr := svc.Run(windowsServiceName, &agentService{}); runErr != nil {
-		return true, fmt.Errorf("svc.Run %s: %w", windowsServiceName, runErr)
+	if runErr := svc.Run(agent.WindowsServiceName, &agentService{}); runErr != nil {
+		return true, fmt.Errorf("svc.Run %s: %w", agent.WindowsServiceName, runErr)
 	}
 	return true, nil
 }
@@ -73,6 +73,22 @@ func argvIsAgentRun(argv []string) bool {
 // a goroutine; svc.Run's caller (Windows) blocks waiting for Execute to
 // return, so we cannot run the agent inline.
 type agentService struct{}
+
+// reportStopped tells SCM the service has stopped and returns the
+// (ssec, errno) pair Execute must return. Both terminal paths in Execute
+// (operator-initiated Stop/Shutdown and the run loop exiting on its own)
+// converge here. A non-nil err is logged and surfaced to SCM as a
+// service-specific error (ssec=true, errno=1) so it lands in the
+// Application Event Log; a nil err is a clean stop (false, 0).
+func reportStopped(status chan<- svc.Status, err error) (ssec bool, errno uint32) {
+	if err != nil {
+		slog.Error("agent: run loop returned error under SCM", "error", err)
+		status <- svc.Status{State: svc.Stopped}
+		return true, 1
+	}
+	status <- svc.Status{State: svc.Stopped}
+	return false, 0
+}
 
 // Execute is invoked by svc.Run once SCM has connected. The handler
 // contract (per the [Service Control Handler protocol]):
@@ -121,23 +137,11 @@ func (s *agentService) Execute(args []string, r <-chan svc.ChangeRequest, status
 				status <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
 				// Drain path: tell SCM we're stopping, cancel the
-				// agent's context to start its shutdown, wait for
-				// the run loop to finish, then report Stopped.
+				// agent's context to start its shutdown, then wait for
+				// the run loop to finish and report Stopped.
 				status <- svc.Status{State: svc.StopPending}
 				cancel()
-				err := <-runErr
-				if err != nil {
-					// Service-specific exit code path. Per svc docs:
-					// returning ssec=true tells SCM to surface the
-					// errno as a service-specific error rather than
-					// a Win32 error. Log first so the failure is
-					// preserved in the Event Log.
-					slog.Error("agent: run loop returned error under SCM", "error", err)
-					status <- svc.Status{State: svc.Stopped}
-					return true, 1
-				}
-				status <- svc.Status{State: svc.Stopped}
-				return false, 0
+				return reportStopped(status, <-runErr)
 			default:
 				slog.Warn("agent: unexpected SCM control request", "cmd", c.Cmd)
 			}
@@ -145,13 +149,7 @@ func (s *agentService) Execute(args []string, r <-chan svc.ChangeRequest, status
 			// RunAgent returned on its own (graceful deprovision,
 			// fatal error, etc.) — tell SCM we're done.
 			status <- svc.Status{State: svc.StopPending}
-			if err != nil {
-				slog.Error("agent: run loop returned error under SCM", "error", err)
-				status <- svc.Status{State: svc.Stopped}
-				return true, 1
-			}
-			status <- svc.Status{State: svc.Stopped}
-			return false, 0
+			return reportStopped(status, err)
 		}
 	}
 }

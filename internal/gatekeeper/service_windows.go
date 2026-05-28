@@ -9,13 +9,15 @@ import (
 )
 
 // windowsServiceAccountName is the Windows virtual account for the service.
-// NT SERVICE\UnclusterAgent has limited privileges and is the preferred choice.
-const windowsServiceAccountName = `NT SERVICE\UnclusterAgent`
+// Windows derives a service's virtual account as NT SERVICE\<ServiceName>, so
+// this is built from agent.WindowsServiceName to stay in lockstep with it.
+// The account has limited privileges and is the preferred choice.
+const windowsServiceAccountName = `NT SERVICE\` + agent.WindowsServiceName
 
 // buildService constructs a kardianos/service.Service for Windows SCM.
 func buildService(cfg agent.Config, serviceExe string) (service.Service, error) {
 	svcCfg := &service.Config{
-		Name:        "UnclusterAgent",
+		Name:        agent.WindowsServiceName,
 		DisplayName: "Uncluster Agent",
 		Description: "Uncluster node agent (SSH certificate gatekeeper)",
 		Executable:  serviceExe,

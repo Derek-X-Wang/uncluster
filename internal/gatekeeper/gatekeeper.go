@@ -26,6 +26,12 @@ type CheckResult struct {
 	Name    string
 	Status  CheckStatus
 	Message string
+	// Informational marks a check whose Message is the payload even when
+	// Status is CheckOK (e.g. "which config path loaded", "which update
+	// hosts are allowed"). Consumers that suppress OK-status messages
+	// should still surface the Message for these. Avoids enumerating
+	// such checks by Name at every consumer.
+	Informational bool
 }
 
 // DoctorResults is the collection of all check results.
@@ -43,15 +49,17 @@ type DoctorResults []CheckResult
 func CheckConfigLoadedPath(path string) CheckResult {
 	if path == "" {
 		return CheckResult{
-			Name:    "config-loaded-path",
-			Status:  CheckWarn,
-			Message: "no config path resolved",
+			Name:          "config-loaded-path",
+			Status:        CheckWarn,
+			Message:       "no config path resolved",
+			Informational: true,
 		}
 	}
 	return CheckResult{
-		Name:    "config-loaded-path",
-		Status:  CheckOK,
-		Message: path,
+		Name:          "config-loaded-path",
+		Status:        CheckOK,
+		Message:       path,
+		Informational: true,
 	}
 }
 
@@ -69,15 +77,17 @@ func CheckConfigLoadedPath(path string) CheckResult {
 func CheckUpdateHostAllowlist(allowlist []string) CheckResult {
 	if len(allowlist) == 0 {
 		return CheckResult{
-			Name:    "update-host-allowlist",
-			Status:  CheckOK,
-			Message: "updates disabled (empty allowlist)",
+			Name:          "update-host-allowlist",
+			Status:        CheckOK,
+			Message:       "updates disabled (empty allowlist)",
+			Informational: true,
 		}
 	}
 	return CheckResult{
-		Name:    "update-host-allowlist",
-		Status:  CheckOK,
-		Message: strings.Join(allowlist, ", "),
+		Name:          "update-host-allowlist",
+		Status:        CheckOK,
+		Message:       strings.Join(allowlist, ", "),
+		Informational: true,
 	}
 }
 

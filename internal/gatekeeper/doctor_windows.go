@@ -95,7 +95,7 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 	}
 
 	// 6. UnclusterAgent service installed.
-	svcOut, svcErr := exec.Command("sc.exe", "query", "UnclusterAgent").CombinedOutput()
+	svcOut, svcErr := exec.Command("sc.exe", "query", agent.WindowsServiceName).CombinedOutput()
 	if svcErr != nil {
 		results = append(results, CheckResult{
 			Name: "service-installed", Status: CheckFail,
