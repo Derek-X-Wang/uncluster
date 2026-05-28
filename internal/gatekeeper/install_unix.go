@@ -254,16 +254,27 @@ func ensureServiceAccountDarwin(username string) error {
 	return nil
 }
 
+// findFreeSystemIDDarwin scans 200-499 (Apple's documented operator-
+// system-account window per System User Accounts) downward and returns
+// the first UID/GID pair where neither is in use. Iterating high-first
+// keeps low IDs free for future Apple-reserved expansion and reduces
+// collision risk with operator-created accounts.
+//
+// Range rationale: 0-199 is Apple-reserved; 200-499 is the operator
+// system-account window; 500+ is reserved for regular users. The prior
+// 200-300 bound was conservative without a documented reason and was
+// exhausted on hosted macos-latest runners where Apple's preinstalled
+// accounts plus the GitHub runner's own bootstrap accounts pack the
+// low end densely (see #92).
 func findFreeSystemIDDarwin() (uid, gid int, err error) {
-	// Scan from 300 downward to find an unused UID/GID pair.
-	for id := 300; id >= 200; id-- {
+	for id := 499; id >= 200; id-- {
 		checkUID := exec.Command("dscl", ".", "-search", "/Users", "UniqueID", fmt.Sprintf("%d", id))
 		checkGID := exec.Command("dscl", ".", "-search", "/Groups", "PrimaryGroupID", fmt.Sprintf("%d", id))
 		if checkUID.Run() != nil && checkGID.Run() != nil {
 			return id, id, nil
 		}
 	}
-	return 0, 0, fmt.Errorf("no free system UID/GID found in 200-300 range")
+	return 0, 0, fmt.Errorf("no free system UID/GID found in 200-499 range")
 }
 
 // grantConfigDirAccess grants the service account write access to the
