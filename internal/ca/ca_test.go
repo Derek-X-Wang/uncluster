@@ -257,6 +257,13 @@ func TestLoadPrivateRejectsLoosePerms(t *testing.T) {
 		t.Skip("POSIX mode bits not enforced on Windows; ACL path tested via fileacl_windows_test.go")
 	}
 	dir := t.TempDir()
+	// Tighten the parent dir to 0700 so the load path's parent-dir check
+	// passes (post-#48 hardening). The test is exercising the FILE mode
+	// rejection, not the dir mode rejection — dir-mode is covered by its
+	// own test below.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod parent: %v", err)
+	}
 	path := filepath.Join(dir, "ca")
 	priv, _, _ := Generate()
 	bytes, _ := MarshalPrivate(priv)

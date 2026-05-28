@@ -21,6 +21,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,17 +69,99 @@ func ParsePrivate(data []byte) (ssh.Signer, error) {
 }
 
 // LoadPrivateFromDisk reads the CA private key at path and returns a Signer.
-// On Unix: refuses the file if its POSIX mode has any group or world bits set.
-// On Windows: checks the DACL via GetNamedSecurityInfo; refuses if the file is
-// accessible to accounts other than SYSTEM and Administrators.
+//
+// ============================================================================
+// FUTURE-READER STOP SIGN — DO NOT SIMPLIFY THIS LOAD PATH (#48)
+// ============================================================================
+//
+// What this protects: the CA private key is the highest-value secret in the
+// entire system. Whoever holds it can forge any SSH certificate as any user
+// for any Agent. Compromise = total system takeover. There is no rotation
+// flow today (deferred per ADR-0005), so the at-rest file is the entire
+// trust anchor for the V2 lifetime of a deployment.
+//
+// What the code below defends against:
+//
+//  1. TOCTOU (Time-Of-Check / Time-Of-Use) on the file.
+//     Pre-fix shape was `os.Stat(path) → checkFileACL(path) → os.ReadFile(path)`.
+//     Each call re-resolves the path. An attacker with write access to the
+//     parent directory can swap the file (rename, unlink+recreate) between
+//     the perm-check and the read. We instead open exactly ONCE, then call
+//     `f.Stat()` on the open fd to read mode bits — the fd is bound to the
+//     inode of the file we'll read, so the check and the read can no longer
+//     diverge.
+//
+//  2. Symlink follow.
+//     Even without a race, a pre-planted symlink at `path` pointing at
+//     attacker-controlled bytes would defeat any path-based check. We use
+//     `O_NOFOLLOW` (Unix) so the open fails with ELOOP if `path` is a
+//     symlink. On Windows the file-level DACL (SYSTEM + Administrators
+//     only) is the equivalent guard.
+//
+//  3. Loose parent directory.
+//     A 0600 file inside a 0755 directory is still replaceable by anyone
+//     with write access to that directory. Critically, `MkdirAll(dir, 0o700)`
+//     does NOT chmod a pre-existing directory — if the dir was created
+//     before bootstrap by an installer or stray `mkdir`, it keeps its
+//     looser mode and silently undermines the file-level protection. We
+//     verify the parent dir's mode is 0700 AND that its owner is the
+//     current process's effective UID; refuse to load otherwise.
+//
+// FORBIDDEN shapes — DO NOT replace this function with any of:
+//   - `os.ReadFile(path)` alone (no perm check, no symlink defense).
+//   - `os.Stat(path) → checkFileACL(path) → os.ReadFile(path)` (the original
+//     racy shape — three separate name lookups, file checked is not
+//     necessarily the file read).
+//   - Any shape that calls `os.Stat(path)` or `checkFileACL(path)` BEFORE
+//     opening the file. The fd-stat is authoritative; path-based checks
+//     are advisory only.
+//
+// References:
+//   - ADR-0001 — why the CA matters (cert authority trust model).
+//   - ADR-0005 — CA key at-rest threat model (operator responsibility scope).
+//   - Issue #48 — original TOCTOU report and operator triage rationale.
+//   - Issue #38 / PR #52 — companion `safewrite_*.go` hardening (write side).
+//
+// The happy path (bootstrap-created 0700 dir owned by the process user,
+// 0600 regular file, no symlinks) loads in a single call with no operator-
+// visible change. Validation failures return errors that name what failed
+// so the operator can diagnose without strace.
+// ============================================================================
 func LoadPrivateFromDisk(path string) (ssh.Signer, error) {
-	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("ca: stat %s: %w", path, err)
+	// (1) Validate the parent directory FIRST. If the directory is loose
+	// or owned by someone else, refuse — even opening a file inside an
+	// untrusted directory is a TOCTOU-prone proposition.
+	if err := checkParentDirSafe(path); err != nil {
+		return nil, err
 	}
+
+	// (2) Open the file ONCE with O_NOFOLLOW (Unix; symlink → ELOOP).
+	// All subsequent checks operate on this fd, NOT the path.
+	f, err := openReadOnlyNoFollow(path)
+	if err != nil {
+		return nil, fmt.Errorf("ca: open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	// (3) Validate mode bits FROM THE OPEN FD. This is the TOCTOU-proof
+	// part: a path-based stat could be looking at a different inode by
+	// now, but f.Stat() returns the metadata of the file we hold open
+	// and are about to read.
+	if err := checkFileModeFromFD(f); err != nil {
+		return nil, err
+	}
+
+	// (4) Defense-in-depth: also run the existing path-based ACL check.
+	// On Windows this is the authoritative DACL check (since POSIX mode
+	// bits don't gate NTFS access). On Unix it's redundant with (3) but
+	// catches any future regression in checkFileModeFromFD. Cheap.
 	if err := checkFileACL(path); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(path)
+
+	// (5) Read from the open fd — NEVER re-open by path. ReadAll consumes
+	// the file we already validated.
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("ca: read %s: %w", path, err)
 	}
