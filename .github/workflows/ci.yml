@@ -662,6 +662,267 @@ jobs:
               *)        echo "::error::T2-windows unknown class=${class}"; exit 1 ;;
           esac
 
+  # T2-mac SPIKE per ADR-0008 + #71.
+  #
+  # ADVISORY job — NOT a merge gate. `continue-on-error: true` at the job
+  # level converts any failure to a warning. NOT added to
+  # `all-tests-pass`'s needs list. Promote to required (flip
+  # continue-on-error to false + add to all-tests-pass) only after N
+  # consecutive empirical greens — operator's call, suggested N=20
+  # (separate one-line follow-up issue when ready).
+  #
+  # Why advisory: hosted macos-latest is arm64 and the install path
+  # mutates sshd (`launchctl`), /etc/ssh, system users via dscl,
+  # ACLs — exactly the surface Apple's privacy + SIP machinery may
+  # gate even when normal builds pass. If install steps hit interactive
+  # Full Disk Access / Privacy prompts that can't be automated, the
+  # spike itself becomes the data point: file a follow-up issue titled
+  # "T2-mac blocker: <root cause>" and STOP — DO NOT loop retry.
+  t2-mac-install-smoke:
+    runs-on: macos-latest
+    timeout-minutes: 12
+    continue-on-error: true  # spike posture; failures are warnings, not gates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: bootstrap:build-binary
+        id: build
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
+          sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+          uncluster --help >/dev/null
+
+      - name: bootstrap:enable-remote-login
+        id: remote-login
+        # The spike-blocker step. On hosted macos-latest, enabling Remote
+        # Login via `systemsetup -setremotelogin on` may require
+        # interactive Full Disk Access — a TCC privacy prompt that
+        # cannot be answered headlessly. If this step fails with the
+        # "Remote Login: Off" output or a TCC-style error, the comment
+        # below documents the expected blocker and the job stops here
+        # advisory-style.
+        run: |
+          set -euo pipefail
+          # Try the official path. If it errors with TCC / privacy, the
+          # follow-up step's grep on `getremotelogin` will surface the
+          # blocker without the workflow needing to interpret arbitrary
+          # error text.
+          sudo systemsetup -setremotelogin on || true
+          # Verify. If still Off, we hit the spike blocker.
+          state="$(sudo systemsetup -getremotelogin 2>&1 || true)"
+          echo "${state}"
+          if ! echo "${state}" | grep -qi 'Remote Login: On'; then
+              echo "::warning::T2-mac SPIKE BLOCKED: Remote Login could not be enabled headlessly on macos-latest."
+              echo "::warning::This is the documented spike outcome (#71). Falling out of the smoke without further retries; the gap itself is the data point."
+              echo "spike_blocked=true" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          echo "spike_blocked=false" >> "$GITHUB_OUTPUT"
+
+      - name: bootstrap:cp-bootstrap
+        id: cp-bs
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        run: |
+          set -euo pipefail
+          export XDG_DATA_HOME=/tmp/uncluster-ci/data
+          mkdir -p "${XDG_DATA_HOME}"
+          uncluster server bootstrap --label ci-bootstrap > /tmp/bs.out
+          cat /tmp/bs.out
+          awk '/caller token \(shown ONCE/{getline; gsub(/^[[:space:]]+/,""); print; exit}' \
+              /tmp/bs.out > /tmp/caller-token
+          test -s /tmp/caller-token
+
+      - name: bootstrap:cp-start
+        id: cp-start
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        run: |
+          set -euo pipefail
+          export XDG_DATA_HOME=/tmp/uncluster-ci/data
+          nohup uncluster server start --addr 127.0.0.1:17777 \
+              > /tmp/cp.log 2>&1 &
+          echo $! > /tmp/cp.pid
+          for _ in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:17777/healthz >/dev/null 2>&1; then
+                  echo "cp up"
+                  exit 0
+              fi
+              sleep 1
+          done
+          tail -50 /tmp/cp.log || true
+          exit 1
+
+      - name: rendezvous:mint-join-token
+        id: mint-join
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          resp="$(curl -fsS -X POST http://127.0.0.1:17777/v1/tokens \
+              -H "Authorization: Bearer ${CALLER_TOK}" \
+              -H "Content-Type: application/json" \
+              -d '{"kind":"join","label":"ci-join"}')"
+          echo "${resp}" | jq -r '.token' > /tmp/join-token
+          test -s /tmp/join-token
+
+      - name: product:agent-join
+        id: agent-join
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        run: |
+          set -euo pipefail
+          sudo env UNCLUSTER_TOKEN="$(cat /tmp/join-token)" \
+              uncluster agent join \
+                  --server http://127.0.0.1:17777 \
+                  --name ci-agent
+
+      - name: product:agent-install
+        id: agent-install
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        # The other spike-pressure point: `sudo uncluster agent install`
+        # creates `_uncluster` via dscl, writes /Library/LaunchDaemons,
+        # mutates /etc/ssh, calls launchctl. Any of these may need
+        # privileges hosted macos-latest does not grant headlessly.
+        run: |
+          set -euo pipefail
+          sudo uncluster agent install
+
+      - name: product:assert-service-loaded
+        id: assert-svc
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        run: |
+          set -euo pipefail
+          out="$(sudo launchctl list com.uncluster.agent 2>&1 || true)"
+          echo "${out}"
+          # Expect launchctl-list output to include "PID" with a non-zero value.
+          if ! echo "${out}" | grep -qE '"PID" = [1-9]'; then
+              echo "service launchd plist did not load with running PID"
+              exit 1
+          fi
+
+      - name: product:assert-agent-online
+        id: assert-online
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          for _ in $(seq 1 40); do
+              status="$(curl -fsS http://127.0.0.1:17777/v1/agents \
+                  -H "Authorization: Bearer ${CALLER_TOK}" \
+                  | jq -r '.[] | select(.name=="ci-agent") | .last_seen_at // empty')"
+              if [[ -n "${status}" && "${status}" != "null" ]]; then
+                  age=$(( $(date +%s) - ${status} ))
+                  if [[ "${age}" -lt 30 ]]; then
+                      echo "agent online (last seen ${age}s ago)"
+                      exit 0
+                  fi
+              fi
+              sleep 1
+          done
+          echo "agent never reported online"
+          exit 1
+
+      - name: product:assert-doctor
+        id: assert-doctor
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        run: |
+          set -euo pipefail
+          sudo uncluster agent doctor
+
+      - name: product:assert-sshd-drop-in
+        id: assert-drop-in
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        run: |
+          set -euo pipefail
+          # Sonoma+ supports sshd_config.d directly; pre-Sonoma needs
+          # an Include shim in /etc/ssh/sshd_config. The install step
+          # adds the Include line on pre-Sonoma; either path should
+          # leave the drop-in readable.
+          test -f /etc/ssh/sshd_config.d/uncluster.conf
+          sudo grep -q 'TrustedUserCAKeys' /etc/ssh/sshd_config.d/uncluster.conf
+          sudo grep -q 'AuthorizedPrincipalsFile' /etc/ssh/sshd_config.d/uncluster.conf
+
+      - name: product:assert-service-user
+        id: assert-user
+        if: steps.remote-login.outputs.spike_blocked != 'true'
+        # macOS service-account convention is `_uncluster` (underscore-
+        # prefix system accounts). Verify it exists with no shell.
+        run: |
+          set -euo pipefail
+          out="$(dscl . -read /Users/_uncluster 2>&1 || true)"
+          echo "${out}"
+          if ! echo "${out}" | grep -qE 'RecordName.*_uncluster'; then
+              echo "service user _uncluster missing"
+              exit 1
+          fi
+          # Confirm shell is /usr/bin/false (or similar non-login).
+          if ! echo "${out}" | grep -qiE 'UserShell.*(false|nologin)'; then
+              echo "service user _uncluster has interactive shell"
+              exit 1
+          fi
+
+      - name: collect:artifacts
+        if: always()
+        run: |
+          set +e
+          mkdir -p t2-mac-artifacts
+          sudo launchctl list com.uncluster.agent > t2-mac-artifacts/launchctl.txt 2>&1
+          sudo log show --last 5m --predicate 'subsystem == "com.uncluster.agent" OR senderImagePath CONTAINS "uncluster"' > t2-mac-artifacts/log-show.txt 2>&1
+          cp /tmp/cp.log t2-mac-artifacts/cp.log 2>/dev/null || true
+          sudo cat /etc/ssh/sshd_config.d/uncluster.conf > t2-mac-artifacts/sshd-drop-in.conf 2>&1
+          sudo cat /etc/ssh/uncluster_ca.pub > t2-mac-artifacts/ca.pub 2>&1
+          sudo ls -la /etc/ssh/auth_principals > t2-mac-artifacts/principals-listing.txt 2>&1
+          sudo sshd -T > t2-mac-artifacts/sshd-T.txt 2>&1
+          sudo dscl . -read /Users/_uncluster > t2-mac-artifacts/dscl-user.txt 2>&1
+          ls -la t2-mac-artifacts
+
+      - name: collect:upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t2-mac-${{ github.run_id }}
+          path: t2-mac-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: spike-status
+        if: always()
+        # NOT enforce-taxonomy — we are explicitly advisory. This step
+        # just records what happened so a future operator deciding
+        # promote-to-required has a single line to read per run.
+        run: |
+          if [[ "${{ steps.remote-login.outputs.spike_blocked }}" == "true" ]]; then
+              echo "::notice::T2-mac SPIKE: BLOCKED at Remote Login enablement step (#71)."
+              echo "Follow-up issue should be filed if this persists across multiple runs."
+              exit 0
+          fi
+          # Aggregate the product steps. Any failure → warning (advisory).
+          fail=0
+          for step in \
+              "${{ steps.cp-bs.outcome }}" \
+              "${{ steps.cp-start.outcome }}" \
+              "${{ steps.mint-join.outcome }}" \
+              "${{ steps.agent-join.outcome }}" \
+              "${{ steps.agent-install.outcome }}" \
+              "${{ steps.assert-svc.outcome }}" \
+              "${{ steps.assert-online.outcome }}" \
+              "${{ steps.assert-doctor.outcome }}" \
+              "${{ steps.assert-drop-in.outcome }}" \
+              "${{ steps.assert-user.outcome }}"; do
+              if [[ "${step}" == "failure" ]]; then
+                  fail=1
+              fi
+          done
+          if [[ "${fail}" == "1" ]]; then
+              echo "::warning::T2-mac SPIKE: at least one product step failed. See uploaded artifacts. Until empirically green for N consecutive runs (operator's call) this stays advisory."
+          else
+              echo "::notice::T2-mac SPIKE: all product steps passed. Green run logged."
+          fi
+          exit 0
+
   # Aggregator job: creates a single "all-tests-pass" check that can be marked
   # as required in branch protection. This ensures ALL matrix OS variants AND
   # the E2E Compose smoke AND the per-OS install smokes must pass before a PR
