@@ -61,17 +61,34 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 		return fmt.Errorf("grant principals dir access: %w", err)
 	}
 
-	// 8. Install system service (kardianos/service: launchd or systemd).
+	// 8. Save agent.toml to the system path with the correct ownership.
+	// MUST happen AFTER ensureServiceAccount (step 6) so the `uncluster`
+	// group exists for the chown root:uncluster, and BEFORE startService
+	// (step 10) so the service can read the file on first start.
+	//
+	// Hotfix for #77: previously SaveConfigSystem was called from the CLI
+	// install command BEFORE gatekeeper.Install ran — so the first pass
+	// produced a root:root file (no group to chown to), and the second
+	// pass (after Install returned) was too late: the service had already
+	// crashed with "permission denied" and systemd was in its restart
+	// backoff. Putting the save here makes the file land with correct
+	// ownership BEFORE the service ever starts.
+	sysPath := agent.SystemConfigPath()
+	if err := agent.SaveConfigSystem(sysPath, cfg); err != nil {
+		return fmt.Errorf("save system config to %s: %w", sysPath, err)
+	}
+
+	// 9. Install system service (kardianos/service: launchd or systemd).
 	if err := installService(ctx, cfg, serviceExe); err != nil {
 		return fmt.Errorf("install service: %w", err)
 	}
 
-	// 9. Start service.
+	// 10. Start service.
 	if err := startService(ctx); err != nil {
 		return fmt.Errorf("start service: %w", err)
 	}
 
-	// 10. Reload sshd.
+	// 11. Reload sshd.
 	if err := reloadSSHD(); err != nil {
 		return fmt.Errorf("reload sshd: %w", err)
 	}
