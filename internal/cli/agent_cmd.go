@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -24,7 +25,11 @@ func newAgentCmd() *cobra.Command {
 		Use:   "run",
 		Short: "Run the agent in the foreground (used by service units)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			p, err := agent.DefaultConfigPath()
+			// Prefer the system-wide path so the service account (which has
+			// a different HOME than the operator who ran `agent join`) can
+			// read it. Falls back to per-user for ad-hoc / pre-install runs.
+			// See #77 for the original bug.
+			p, err := agent.ResolveConfigPath()
 			if err != nil {
 				return err
 			}
@@ -35,11 +40,25 @@ func newAgentCmd() *cobra.Command {
 			if cfg.Server == "" || cfg.AgentToken == "" {
 				return fmt.Errorf("agent not joined; run `uncluster agent join` first")
 			}
+			// Log the resolved path at startup so the operator can grep
+			// journalctl/Event Viewer to confirm which file the service
+			// actually loaded (#77 acceptance).
+			slog.Info("agent: loaded config", "path", p)
 			a := agent.New(cfg, nil).
 				WithConfigPath(p).
 				WithHealthProvider(
 					func(ctx context.Context) []api.AgentHealthCheck {
-						results := gatekeeper.Doctor(ctx, cfg)
+						// Surface the loaded config path first so the
+						// operator can confirm via the agent's heartbeat
+						// that the service is reading the system path,
+						// not silently falling back to a stale per-user
+						// copy.
+						results := append(
+							gatekeeper.DoctorResults{
+								gatekeeper.CheckConfigLoadedPath(p),
+							},
+							gatekeeper.Doctor(ctx, cfg)...,
+						)
 						checks := make([]api.AgentHealthCheck, 0, len(results))
 						for _, r := range results {
 							hc := api.AgentHealthCheck{
@@ -47,7 +66,11 @@ func newAgentCmd() *cobra.Command {
 								Check:     gatekeeperCheck(r.Name),
 								State:     gatekeeperState(r.Status),
 							}
-							if r.Message != "" && r.Status != gatekeeper.CheckOK {
+							// Always include the message for the
+							// config-loaded-path check so the resolved
+							// path is visible in the heartbeat (it is OK
+							// status but the message *is* the payload).
+							if r.Message != "" && (r.Status != gatekeeper.CheckOK || r.Name == "config-loaded-path") {
 								msg := r.Message
 								hc.Message = &msg
 							}
@@ -111,6 +134,9 @@ and reloads sshd. Must run as root (sudo).
 
 Re-running is safe — install is idempotent and self-heals drift.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Source of truth for install is the per-user path (where
+			// `agent join` wrote it). After install we copy it to the
+			// system path so the service can read it (#77).
 			cfgPath, err := agent.DefaultConfigPath()
 			if err != nil {
 				return err
@@ -131,8 +157,29 @@ Re-running is safe — install is idempotent and self-heals drift.`,
 				return fmt.Errorf("resolve executable: %w", err)
 			}
 
+			// Copy agent.toml to the system-wide path BEFORE installing the
+			// service. Otherwise the service starts, can't read its
+			// config, and the supervisor reports "service not responding"
+			// (Windows SCM) or flap-fails (systemd).
+			//
+			// First pass uses SaveConfigSystem which can NOT yet grant
+			// service-account read access — the account does not exist
+			// until gatekeeper.Install registers it. Second pass after
+			// install re-applies the ACL so the now-existing service
+			// account SID gets its read ACE.
+			sysPath := agent.SystemConfigPath()
+			if err := agent.SaveConfigSystem(sysPath, cfg); err != nil {
+				return fmt.Errorf("copy config to %s: %w", sysPath, err)
+			}
+
 			if err := gatekeeper.Install(cmd.Context(), cfg, exe); err != nil {
 				return fmt.Errorf("install: %w", err)
+			}
+
+			// Re-save now that the service account exists — this attaches
+			// the read ACL grant that the first pass had to skip.
+			if err := agent.SaveConfigSystem(sysPath, cfg); err != nil {
+				return fmt.Errorf("re-apply config ACL post-install: %w", err)
 			}
 
 			fmt.Fprintln(cmd.OutOrStdout(), "install complete — run `uncluster agent doctor` to verify")
@@ -146,7 +193,9 @@ func newAgentDoctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "Check gatekeeper configuration state (no mutations). Exit 0=ok, 1=warn, 2=fail.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfgPath, err := agent.DefaultConfigPath()
+			// Doctor reads — prefer the system path so a post-install run
+			// reflects what the service sees.
+			cfgPath, err := agent.ResolveConfigPath()
 			if err != nil {
 				return err
 			}
@@ -155,7 +204,15 @@ func newAgentDoctorCmd() *cobra.Command {
 				return fmt.Errorf("load agent config: %w", err)
 			}
 
-			results := gatekeeper.Doctor(cmd.Context(), cfg)
+			// Prepend the loaded-path check so the operator sees up-front
+			// which file doctor is reasoning about. Especially useful
+			// post-install to confirm the system path was populated (#77).
+			results := append(
+				gatekeeper.DoctorResults{
+					gatekeeper.CheckConfigLoadedPath(cfgPath),
+				},
+				gatekeeper.Doctor(cmd.Context(), cfg)...,
+			)
 
 			statusLabel := map[gatekeeper.CheckStatus]string{
 				gatekeeper.CheckOK:   "ok  ",
@@ -270,6 +327,8 @@ func gatekeeperComponent(name string) string {
 		return "service_account"
 	case "service-running":
 		return "service"
+	case "config-loaded-path":
+		return "config"
 	default:
 		return name
 	}
@@ -294,6 +353,8 @@ func gatekeeperCheck(name string) string {
 		return "exists"
 	case "macos-include":
 		return "include_directive"
+	case "config-loaded-path":
+		return "loaded_path"
 	default:
 		return name
 	}

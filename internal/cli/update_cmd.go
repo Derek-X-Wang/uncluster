@@ -79,7 +79,11 @@ func newAgentUpdateCmd() *cobra.Command {
 			if pin != "" && unpin {
 				return fmt.Errorf("--pin and --unpin are mutually exclusive")
 			}
-			cfgPath, err := agent.DefaultConfigPath()
+			// Read+write the canonical path the service uses (system if
+			// installed, per-user otherwise). Pinning the per-user path
+			// when the service reads from the system path would silently
+			// have no effect.
+			cfgPath, err := agent.ResolveConfigPath()
 			if err != nil {
 				return err
 			}
@@ -87,16 +91,20 @@ func newAgentUpdateCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load agent config: %w", err)
 			}
+			saveFn := agent.SaveConfig
+			if cfgPath == agent.SystemConfigPath() {
+				saveFn = agent.SaveConfigSystem
+			}
 			switch {
 			case unpin:
 				cfg.PinnedVersion = ""
-				if err := agent.SaveConfig(cfgPath, cfg); err != nil {
+				if err := saveFn(cfgPath, cfg); err != nil {
 					return err
 				}
 				fmt.Fprintln(cmd.OutOrStdout(), "version pin cleared — agent will follow server's expected_version")
 			case pin != "":
 				cfg.PinnedVersion = pin
-				if err := agent.SaveConfig(cfgPath, cfg); err != nil {
+				if err := saveFn(cfgPath, cfg); err != nil {
 					return err
 				}
 				fmt.Fprintf(cmd.OutOrStdout(), "version pinned to %s — agent will not update until unpinned\n", pin)
@@ -122,7 +130,7 @@ func newAgentRollbackCmd() *cobra.Command {
 		Use:   "rollback",
 		Short: "Swap binary.prev back into place (revert the last self-update)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfgPath, err := agent.DefaultConfigPath()
+			cfgPath, err := agent.ResolveConfigPath()
 			if err != nil {
 				return err
 			}
