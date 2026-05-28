@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -76,6 +77,26 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 	sysPath := agent.SystemConfigPath()
 	if err := agent.SaveConfigSystem(sysPath, cfg); err != nil {
 		return fmt.Errorf("save system config to %s: %w", sysPath, err)
+	}
+
+	// 8a. Grant the service account WRITE access to the system config
+	// directory so the agent (running as the low-priv service account)
+	// can land the .deprovisioned marker next to agent.toml on a 410
+	// Gone response.
+	//
+	// Knock-on fix for the #77 family: pre-#77, the marker landed in
+	// the operator's HOME (always writable by the agent, who pre-#77
+	// ran as the operator). Post-#77 the marker tries to land in
+	// /etc/uncluster/ which defaults to root:root 0755 — the agent
+	// has read access to agent.toml (group: uncluster) but no write
+	// access to the parent dir, so the marker write silently fails
+	// (#46's err-ignored os.WriteFile).
+	//
+	// Same chown+0775 shape as grantPrincipalsAccess. Marker is the
+	// only file the agent ever writes into this dir, so over-granting
+	// write is bounded.
+	if err := grantConfigDirAccess(filepath.Dir(sysPath)); err != nil {
+		return fmt.Errorf("grant config dir access: %w", err)
 	}
 
 	// 9. Install system service (kardianos/service: launchd or systemd).
@@ -243,6 +264,32 @@ func findFreeSystemIDDarwin() (uid, gid int, err error) {
 		}
 	}
 	return 0, 0, fmt.Errorf("no free system UID/GID found in 200-300 range")
+}
+
+// grantConfigDirAccess grants the service account write access to the
+// system config directory (/etc/uncluster). Same shape as
+// grantPrincipalsAccess. The agent uses this directory to land the
+// .deprovisioned marker (#46) on a 410 Gone response — without write
+// access, the marker write silently fails and the supervisor flap-
+// restarts the agent against a revoked token forever.
+//
+// Linux: chown root:<service-account> + 0775. The file inside
+// (agent.toml mode 0640) stays restricted; only the dir grants write.
+// macOS: ACL-grant write+delete to the service user.
+func grantConfigDirAccess(dir string) error {
+	username := serviceAccountName()
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("chmod", "+a", username+" allow write,readattr,readextattr,list,add_file,add_subdirectory,delete_child,delete", dir).Run()
+	default:
+		if err := exec.Command("chown", "root:"+username, dir).Run(); err != nil {
+			return fmt.Errorf("chown root:%s %s: %w", username, dir, err)
+		}
+		if err := exec.Command("chmod", "0775", dir).Run(); err != nil {
+			return fmt.Errorf("chmod 0775 %s: %w", dir, err)
+		}
+		return nil
+	}
 }
 
 // grantPrincipalsAccess grants the service account write access to the
