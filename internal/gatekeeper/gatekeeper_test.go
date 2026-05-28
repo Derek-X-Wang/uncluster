@@ -130,3 +130,28 @@ func TestCAPubkeyFileContent(t *testing.T) {
 		t.Error("principals path is not a directory")
 	}
 }
+
+// TestCheckConfigLoadedPath verifies the structured check that surfaces
+// which agent.toml the service loaded (#77 acceptance). Operators read
+// this from `agent doctor` output or from the heartbeat health array.
+func TestCheckConfigLoadedPath(t *testing.T) {
+	t.Run("ok_with_path", func(t *testing.T) {
+		got := gatekeeper.CheckConfigLoadedPath("/etc/uncluster/agent.toml")
+		if got.Name != "config-loaded-path" {
+			t.Errorf("Name = %q, want config-loaded-path", got.Name)
+		}
+		if got.Status != gatekeeper.CheckOK {
+			t.Errorf("Status = %v, want CheckOK", got.Status)
+		}
+		if got.Message != "/etc/uncluster/agent.toml" {
+			t.Errorf("Message = %q, want path verbatim", got.Message)
+		}
+	})
+
+	t.Run("warn_when_path_empty", func(t *testing.T) {
+		got := gatekeeper.CheckConfigLoadedPath("")
+		if got.Status != gatekeeper.CheckWarn {
+			t.Errorf("Status with empty path = %v, want CheckWarn", got.Status)
+		}
+	})
+}

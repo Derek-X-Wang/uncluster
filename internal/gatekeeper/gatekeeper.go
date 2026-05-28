@@ -31,6 +31,30 @@ type CheckResult struct {
 // DoctorResults is the collection of all check results.
 type DoctorResults []CheckResult
 
+// CheckConfigLoadedPath emits a structured check identifying which file
+// the agent loaded its config from. Surfaced as the first row of doctor
+// output and as a health check on the heartbeat (#77 acceptance).
+//
+// The check is informational — always reports CheckOK — so the operator
+// can confirm post-install that the service is reading the system path
+// (vs. silently falling back to a stale per-user file). Empty path is the
+// only condition that produces a warn, and that only happens if the
+// caller fails to resolve a path at all.
+func CheckConfigLoadedPath(path string) CheckResult {
+	if path == "" {
+		return CheckResult{
+			Name:    "config-loaded-path",
+			Status:  CheckWarn,
+			Message: "no config path resolved",
+		}
+	}
+	return CheckResult{
+		Name:    "config-loaded-path",
+		Status:  CheckOK,
+		Message: path,
+	}
+}
+
 // ExitCode returns 0 for all-ok, 1 for any warn, 2 for any fail.
 func (r DoctorResults) ExitCode() int {
 	code := 0
