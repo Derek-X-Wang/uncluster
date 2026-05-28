@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 
@@ -13,6 +14,113 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/gatekeeper"
 )
+
+// RunAgent executes one full lifecycle of the agent run loop: loads the
+// resolved on-disk config, refuses to start on the .deprovisioned marker,
+// and blocks on Agent.Run until ctx is cancelled or the agent exits.
+//
+// This function is the single source of truth for the agent's foreground
+// run behaviour. It is called from:
+//   - the `uncluster agent run` cobra command (terminal / systemd / launchd
+//     foreground execution)
+//   - the Windows SCM handler (`cmd/uncluster/agent_run_windows.go`),
+//     which wraps it under svc.Run so the binary completes the SCM
+//     control-handler handshake (see #88)
+//
+// Diagnostic output is written to stderrW (the supervisor's stderr stream
+// or a redirect for the SCM handler). The function returns nil for the
+// graceful termination paths (deprovisioned, unauthorized, marker present)
+// so the supervisor does not interpret them as crashes and restart against
+// a revoked token.
+func RunAgent(ctx context.Context, stderrW io.Writer) error {
+	if stderrW == nil {
+		stderrW = os.Stderr
+	}
+	// Prefer the system-wide path so the service account (which has
+	// a different HOME than the operator who ran `agent join`) can
+	// read it. Falls back to per-user for ad-hoc / pre-install runs.
+	// See #77 for the original bug.
+	p, err := agent.ResolveConfigPath()
+	if err != nil {
+		return err
+	}
+	cfg, err := agent.LoadConfig(p)
+	if err != nil {
+		return fmt.Errorf("load agent config: %w", err)
+	}
+	if cfg.Server == "" || cfg.AgentToken == "" {
+		return fmt.Errorf("agent not joined; run `uncluster agent join` first")
+	}
+	// Log the resolved path at startup so the operator can grep
+	// journalctl/Event Viewer to confirm which file the service
+	// actually loaded (#77 acceptance).
+	slog.Info("agent: loaded config", "path", p)
+	a := agent.New(cfg, nil).
+		WithConfigPath(p).
+		WithHealthProvider(
+			func(ctx context.Context) []api.AgentHealthCheck {
+				// Surface the loaded config path first so the
+				// operator can confirm via the agent's heartbeat
+				// that the service is reading the system path,
+				// not silently falling back to a stale per-user
+				// copy.
+				results := append(
+					gatekeeper.DoctorResults{
+						gatekeeper.CheckConfigLoadedPath(p),
+						gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
+					},
+					gatekeeper.Doctor(ctx, cfg)...,
+				)
+				checks := make([]api.AgentHealthCheck, 0, len(results))
+				for _, r := range results {
+					hc := api.AgentHealthCheck{
+						Component: gatekeeperComponent(r.Name),
+						Check:     gatekeeperCheck(r.Name),
+						State:     gatekeeperState(r.Status),
+					}
+					// Always include the message for informational
+					// checks (config-loaded-path, update-host-allowlist)
+					// because the message IS the payload — the OK
+					// status alone tells the operator nothing useful.
+					if r.Message != "" && (r.Status != gatekeeper.CheckOK || r.Name == "config-loaded-path" || r.Name == "update-host-allowlist") {
+						msg := r.Message
+						hc.Message = &msg
+					}
+					checks = append(checks, hc)
+				}
+				return checks
+			},
+		)
+	// Refuse to start if a .deprovisioned marker exists next to
+	// agent.toml. The supervisor would otherwise flap-restart us
+	// against a revoked token, which the operator has to manually
+	// untangle (#46).
+	if _, err := os.Stat(a.DeprovisionedMarkerPath()); err == nil {
+		fmt.Fprintln(stderrW,
+			"agent: previously deprovisioned by control plane; uninstall the service unit manually (see `uncluster agent install --help`).")
+		return nil
+	}
+	if err := a.Run(ctx); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrDeprovisioned):
+			// 410-Gone path: onRevoked wiped principals and wrote
+			// the marker. Exit 0 so the service supervisor does NOT
+			// restart us (per ACCEPTANCE.md §44).
+			fmt.Fprintln(stderrW,
+				"agent: deprovisioned by control plane; principals wiped, supervisor should not restart")
+			return nil
+		case errors.Is(err, agent.ErrUnauthorized):
+			// 401 path: token revoked at the token layer but agent
+			// record is still enrolled. Principals preserved; operator
+			// must intervene (re-issue agent token or remove agent).
+			fmt.Fprintln(stderrW,
+				"agent: unauthorized; agent token revoked or rotated; operator intervention required")
+			return nil
+		}
+		return err
+	}
+	return nil
+}
 
 func newAgentCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -25,90 +133,10 @@ func newAgentCmd() *cobra.Command {
 		Use:   "run",
 		Short: "Run the agent in the foreground (used by service units)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// Prefer the system-wide path so the service account (which has
-			// a different HOME than the operator who ran `agent join`) can
-			// read it. Falls back to per-user for ad-hoc / pre-install runs.
-			// See #77 for the original bug.
-			p, err := agent.ResolveConfigPath()
-			if err != nil {
-				return err
-			}
-			cfg, err := agent.LoadConfig(p)
-			if err != nil {
-				return fmt.Errorf("load agent config: %w", err)
-			}
-			if cfg.Server == "" || cfg.AgentToken == "" {
-				return fmt.Errorf("agent not joined; run `uncluster agent join` first")
-			}
-			// Log the resolved path at startup so the operator can grep
-			// journalctl/Event Viewer to confirm which file the service
-			// actually loaded (#77 acceptance).
-			slog.Info("agent: loaded config", "path", p)
-			a := agent.New(cfg, nil).
-				WithConfigPath(p).
-				WithHealthProvider(
-					func(ctx context.Context) []api.AgentHealthCheck {
-						// Surface the loaded config path first so the
-						// operator can confirm via the agent's heartbeat
-						// that the service is reading the system path,
-						// not silently falling back to a stale per-user
-						// copy.
-						results := append(
-							gatekeeper.DoctorResults{
-								gatekeeper.CheckConfigLoadedPath(p),
-								gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
-							},
-							gatekeeper.Doctor(ctx, cfg)...,
-						)
-						checks := make([]api.AgentHealthCheck, 0, len(results))
-						for _, r := range results {
-							hc := api.AgentHealthCheck{
-								Component: gatekeeperComponent(r.Name),
-								Check:     gatekeeperCheck(r.Name),
-								State:     gatekeeperState(r.Status),
-							}
-							// Always include the message for informational
-							// checks (config-loaded-path, update-host-allowlist)
-							// because the message IS the payload — the OK
-							// status alone tells the operator nothing useful.
-							if r.Message != "" && (r.Status != gatekeeper.CheckOK || r.Name == "config-loaded-path" || r.Name == "update-host-allowlist") {
-								msg := r.Message
-								hc.Message = &msg
-							}
-							checks = append(checks, hc)
-						}
-						return checks
-					},
-				)
-			// Refuse to start if a .deprovisioned marker exists next to
-			// agent.toml. The supervisor would otherwise flap-restart us
-			// against a revoked token, which the operator has to manually
-			// untangle (#46).
-			if _, err := os.Stat(a.DeprovisionedMarkerPath()); err == nil {
-				fmt.Fprintln(cmd.ErrOrStderr(),
-					"agent: previously deprovisioned by control plane; uninstall the service unit manually (see `uncluster agent install --help`).")
-				return nil
-			}
-			if err := a.Run(cmd.Context()); err != nil {
-				switch {
-				case errors.Is(err, agent.ErrDeprovisioned):
-					// 410-Gone path: onRevoked wiped principals and wrote
-					// the marker. Exit 0 so the service supervisor does NOT
-					// restart us (per ACCEPTANCE.md §44).
-					fmt.Fprintln(cmd.ErrOrStderr(),
-						"agent: deprovisioned by control plane; principals wiped, supervisor should not restart")
-					return nil
-				case errors.Is(err, agent.ErrUnauthorized):
-					// 401 path: token revoked at the token layer but agent
-					// record is still enrolled. Principals preserved; operator
-					// must intervene (re-issue agent token or remove agent).
-					fmt.Fprintln(cmd.ErrOrStderr(),
-						"agent: unauthorized; agent token revoked or rotated; operator intervention required")
-					return nil
-				}
-				return err
-			}
-			return nil
+			// The actual run logic is in RunAgent so the Windows SCM
+			// handler (cmd/uncluster/agent_run_windows.go) can share
+			// the same entry point. See #88.
+			return RunAgent(cmd.Context(), cmd.ErrOrStderr())
 		},
 	}
 	cmd.AddCommand(run)
