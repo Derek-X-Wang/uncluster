@@ -55,6 +55,32 @@ func CheckConfigLoadedPath(path string) CheckResult {
 	}
 }
 
+// CheckUpdateHostAllowlist surfaces the configured allowlist for binary
+// self-update downloads (#39, ADR-0006). Always informational:
+//
+//   - non-empty allowlist → CheckOK, message lists the hosts
+//   - empty allowlist     → CheckOK, message "updates disabled (empty
+//     allowlist)" — this is a valid operator posture (rejecting all
+//     updates), not a misconfiguration.
+//
+// Operators can read this to confirm that an install correctly pinned
+// the expected hosts. The Agent enforces the allowlist directly in the
+// update flow — this check is purely observability.
+func CheckUpdateHostAllowlist(allowlist []string) CheckResult {
+	if len(allowlist) == 0 {
+		return CheckResult{
+			Name:    "update-host-allowlist",
+			Status:  CheckOK,
+			Message: "updates disabled (empty allowlist)",
+		}
+	}
+	return CheckResult{
+		Name:    "update-host-allowlist",
+		Status:  CheckOK,
+		Message: strings.Join(allowlist, ", "),
+	}
+}
+
 // ExitCode returns 0 for all-ok, 1 for any warn, 2 for any fail.
 func (r DoctorResults) ExitCode() int {
 	code := 0

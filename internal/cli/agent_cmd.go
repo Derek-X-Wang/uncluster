@@ -56,6 +56,7 @@ func newAgentCmd() *cobra.Command {
 						results := append(
 							gatekeeper.DoctorResults{
 								gatekeeper.CheckConfigLoadedPath(p),
+								gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
 							},
 							gatekeeper.Doctor(ctx, cfg)...,
 						)
@@ -66,11 +67,11 @@ func newAgentCmd() *cobra.Command {
 								Check:     gatekeeperCheck(r.Name),
 								State:     gatekeeperState(r.Status),
 							}
-							// Always include the message for the
-							// config-loaded-path check so the resolved
-							// path is visible in the heartbeat (it is OK
-							// status but the message *is* the payload).
-							if r.Message != "" && (r.Status != gatekeeper.CheckOK || r.Name == "config-loaded-path") {
+							// Always include the message for informational
+							// checks (config-loaded-path, update-host-allowlist)
+							// because the message IS the payload — the OK
+							// status alone tells the operator nothing useful.
+							if r.Message != "" && (r.Status != gatekeeper.CheckOK || r.Name == "config-loaded-path" || r.Name == "update-host-allowlist") {
 								msg := r.Message
 								hc.Message = &msg
 							}
@@ -125,6 +126,15 @@ func newAgentCmd() *cobra.Command {
 }
 
 func newAgentInstallCmd() *cobra.Command {
+	// Future flag: --update-host=<host> (repeatable) to set
+	// Config.UpdateHostAllowlist at install time. Not wired in this slice
+	// per #39 brief ("reserve the name and document it as planned").
+	// When implemented, the flag values overwrite
+	// agent.toml's update_host_allowlist BEFORE the file is copied to the
+	// system path. Operators who want to disable updates pass --update-host=
+	// once with an empty value (translates to []string{}); operators who
+	// want the default pass no flag (leaves the field unset; loader uses
+	// DefaultUpdateHostAllowlist).
 	return &cobra.Command{
 		Use:   "install",
 		Short: "Privileged install: configure sshd, create service account, and start system service (requires root)",
@@ -198,6 +208,7 @@ func newAgentDoctorCmd() *cobra.Command {
 			results := append(
 				gatekeeper.DoctorResults{
 					gatekeeper.CheckConfigLoadedPath(cfgPath),
+					gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
 				},
 				gatekeeper.Doctor(cmd.Context(), cfg)...,
 			)
@@ -317,6 +328,8 @@ func gatekeeperComponent(name string) string {
 		return "service"
 	case "config-loaded-path":
 		return "config"
+	case "update-host-allowlist":
+		return "selfupdate"
 	default:
 		return name
 	}
@@ -343,6 +356,8 @@ func gatekeeperCheck(name string) string {
 		return "include_directive"
 	case "config-loaded-path":
 		return "loaded_path"
+	case "update-host-allowlist":
+		return "host_allowlist"
 	default:
 		return name
 	}
