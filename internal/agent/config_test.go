@@ -3,6 +3,7 @@ package agent_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -22,6 +23,10 @@ func TestConfigRoundTrip(t *testing.T) {
 			SSHDropIn:     "/etc/ssh/sshd_config.d/uncluster.conf",
 			PrincipalsDir: "/etc/ssh/auth_principals",
 		},
+		// UpdateHostAllowlist intentionally non-nil to assert the slice
+		// round-trips faithfully. Round-trip with nil is covered by the
+		// AllowedUpdateHosts unit tests.
+		UpdateHostAllowlist: []string{"github.com", "releases.uncluster.example.com"},
 	}
 	if err := agent.SaveConfig(p, in); err != nil {
 		t.Fatal(err)
@@ -30,7 +35,7 @@ func TestConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("round trip mismatch:\n got  %+v\n want %+v", out, in)
 	}
 }

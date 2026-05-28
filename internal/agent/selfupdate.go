@@ -242,6 +242,36 @@ func (a *Agent) HandleCheckUpdate(ctx context.Context, _ api.CheckUpdateCommand)
 	assetURL := ResolveTemplate(plan.AssetURLTemplate, runtime.GOOS, runtime.GOARCH, plan.ExpectedVersion)
 	sha256URL := ResolveTemplate(plan.SHA256URLTemplate, runtime.GOOS, runtime.GOARCH, plan.ExpectedVersion)
 
+	// Enforce the install-time-pinned host allowlist BEFORE any HTTP
+	// request. A compromised Control plane can hand back any URLs; this
+	// is the last-mile defence that keeps the Agent from fetching from
+	// an attacker-controlled host even if SHA256 verification is
+	// also compromised (the same compromise hands back a matching
+	// .sha256 file). See ADR-0006 + #39.
+	allowlist := a.cfg.AllowedUpdateHosts()
+	if err := ValidateUpdateURL(assetURL, allowlist); err != nil {
+		a.logger.Error("selfupdate: asset URL rejected",
+			"component", "selfupdate",
+			"reason", "disallowed_host",
+			"url", assetURL,
+			"allowlist", allowlist,
+			"err", err,
+		)
+		return err
+	}
+	if sha256URL != "" {
+		if err := ValidateUpdateURL(sha256URL, allowlist); err != nil {
+			a.logger.Error("selfupdate: sha256 URL rejected",
+				"component", "selfupdate",
+				"reason", "disallowed_host",
+				"url", sha256URL,
+				"allowlist", allowlist,
+				"err", err,
+			)
+			return err
+		}
+	}
+
 	updater := NewUpdater(binaryPath, a.cfg.PinnedVersion, a.logger)
 	if err := updater.Apply(ctx, plan.ExpectedVersion, assetURL, sha256URL); err != nil {
 		if errors.Is(err, ErrPinned) {

@@ -155,3 +155,29 @@ func TestCheckConfigLoadedPath(t *testing.T) {
 		}
 	})
 }
+
+// TestCheckUpdateHostAllowlist verifies the doctor surface for #39.
+// Operators read this to confirm the installed allowlist matches what
+// they intended at install time. Empty is informational ("updates
+// disabled"), not a warn — empty is a valid operator posture.
+func TestCheckUpdateHostAllowlist(t *testing.T) {
+	t.Run("multi_host_listed", func(t *testing.T) {
+		got := gatekeeper.CheckUpdateHostAllowlist([]string{"github.com", "releases.uncluster.example.com"})
+		if got.Status != gatekeeper.CheckOK {
+			t.Errorf("Status = %v, want CheckOK", got.Status)
+		}
+		if !strings.Contains(got.Message, "github.com") || !strings.Contains(got.Message, "releases.uncluster.example.com") {
+			t.Errorf("Message = %q, want both hosts present", got.Message)
+		}
+	})
+
+	t.Run("empty_allowlist_reports_updates_disabled", func(t *testing.T) {
+		got := gatekeeper.CheckUpdateHostAllowlist(nil)
+		if got.Status != gatekeeper.CheckOK {
+			t.Errorf("Status with empty allowlist = %v, want CheckOK (empty is a valid posture)", got.Status)
+		}
+		if !strings.Contains(got.Message, "disabled") {
+			t.Errorf("Message = %q, want it to mention 'disabled'", got.Message)
+		}
+	})
+}

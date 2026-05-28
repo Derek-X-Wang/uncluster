@@ -29,6 +29,24 @@ type Config struct {
 	// PinnedVersion overrides the server's expected_version. Set by
 	// `uncluster agent update --pin`. Empty = follow server's expected.
 	PinnedVersion  string `toml:"pinned_version,omitempty"`
+	// UpdateHostAllowlist is the install-time-pinned list of hostnames
+	// the Agent will accept for self-update binary + checksum downloads
+	// (#39, ADR-0006).
+	//
+	// Semantics:
+	//   - nil (field absent in agent.toml) → use DefaultUpdateHostAllowlist
+	//     (= ["github.com"]). Preserves pre-#39 install behaviour.
+	//   - []  (explicit empty)             → reject all update URLs;
+	//                                         updates disabled.
+	//   - non-empty                        → exact-match (case-insensitive)
+	//                                         host check; `github.com`
+	//                                         allows ONLY `github.com`
+	//                                         (NOT `evil.github.com`).
+	//
+	// Callers should resolve via Config.AllowedUpdateHosts() rather than
+	// reading this field directly, so the absent-vs-empty distinction is
+	// applied uniformly.
+	UpdateHostAllowlist []string `toml:"update_host_allowlist,omitempty"`
 }
 
 // DefaultConfigPath returns the per-user config path. Used by `agent join`

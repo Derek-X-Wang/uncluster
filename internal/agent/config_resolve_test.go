@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -131,7 +132,10 @@ func TestSaveConfigSystem_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig after re-install: %v", err)
 	}
-	if got != cfg2 {
+	// reflect.DeepEqual because Config now contains a []string field
+	// (UpdateHostAllowlist, #39) which makes the struct uncomparable
+	// with ==. Both sides have nil for that field here.
+	if !reflect.DeepEqual(got, cfg2) {
 		t.Errorf("re-install did not produce latest content:\n got  %+v\n want %+v", got, cfg2)
 	}
 
