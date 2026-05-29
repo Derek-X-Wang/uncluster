@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
@@ -285,29 +286,76 @@ const (
 	darwinSystemIDMax = 499
 )
 
-// uidInUseDarwin and gidInUseDarwin report whether a given UID/GID is already
-// allocated. They are package-level vars so unit tests can inject fakes; the
-// dscl probes themselves are integration-only. `dscl . -search` exits non-zero
-// when there is no match, which is the "free" signal.
+// usedUIDsDarwin and usedGIDsDarwin return the set of currently-allocated
+// UIDs/GIDs by listing the directory and parsing it. They are package-level
+// vars so unit tests can inject fakes; the dscl calls themselves are
+// integration-only.
+//
+// We list-and-parse rather than probe per ID because `dscl . -search /Users
+// UniqueID <n>` exits 0 WHETHER OR NOT <n> matches (it succeeds with empty
+// output on a miss). The prior per-ID `-search` predicate therefore reported
+// every id as "in use", so findFreeIDDarwin found nothing and install failed
+// with "no free system ID found in 200-499" even on a host with hundreds of
+// free ids — the latent defect behind the original #92/#94 symptom, confirmed
+// on the first t2-mac run of the #96 fix. `dscl . -list` returns the actual
+// allocation, which is the reliable signal.
 var (
-	uidInUseDarwin = func(id int) bool {
-		return exec.Command("dscl", ".", "-search", "/Users", "UniqueID", fmt.Sprintf("%d", id)).Run() == nil
+	usedUIDsDarwin = func() (map[int]bool, error) {
+		return listUsedIDsDarwin("/Users", "UniqueID")
 	}
-	gidInUseDarwin = func(id int) bool {
-		return exec.Command("dscl", ".", "-search", "/Groups", "PrimaryGroupID", fmt.Sprintf("%d", id)).Run() == nil
+	usedGIDsDarwin = func() (map[int]bool, error) {
+		return listUsedIDsDarwin("/Groups", "PrimaryGroupID")
 	}
 )
+
+// listUsedIDsDarwin runs `dscl . -list <path> <key>` and parses the result.
+func listUsedIDsDarwin(path, key string) (map[int]bool, error) {
+	out, err := exec.Command("dscl", ".", "-list", path, key).Output()
+	if err != nil {
+		return nil, fmt.Errorf("dscl -list %s %s: %w", path, key, err)
+	}
+	return parseUsedIDsDarwin(string(out)), nil
+}
+
+// parseUsedIDsDarwin parses `dscl . -list <path> <key>` output — lines of
+// "<record-name><whitespace><id>" — into the set of in-use numeric ids.
+// Malformed lines (blank, missing id column, non-numeric id) are skipped so a
+// dscl quirk or localized header cannot corrupt the set.
+func parseUsedIDsDarwin(out string) map[int]bool {
+	used := make(map[int]bool)
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		id, err := strconv.Atoi(fields[len(fields)-1])
+		if err != nil {
+			continue
+		}
+		used[id] = true
+	}
+	return used
+}
 
 // findFreeSystemUIDDarwin returns the first free UID in the operator system-
 // account window, scanned high-first.
 func findFreeSystemUIDDarwin() (int, error) {
-	return findFreeIDDarwin(uidInUseDarwin)
+	used, err := usedUIDsDarwin()
+	if err != nil {
+		return 0, err
+	}
+	return findFreeIDDarwin(func(id int) bool { return used[id] })
 }
 
 // findFreeSystemGIDDarwin returns the first free GID in the operator system-
 // account window, scanned high-first.
 func findFreeSystemGIDDarwin() (int, error) {
-	return findFreeIDDarwin(gidInUseDarwin)
+	used, err := usedGIDsDarwin()
+	if err != nil {
+		return 0, err
+	}
+	return findFreeIDDarwin(func(id int) bool { return used[id] })
 }
 
 // findFreeIDDarwin scans the operator system-account window (200-499) downward
