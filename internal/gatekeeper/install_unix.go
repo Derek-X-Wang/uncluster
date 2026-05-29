@@ -488,25 +488,48 @@ func serviceUnitPath() string {
 	}
 }
 
-// stopServiceForReinstall best-effort stops the service before uninstall.
-// Errors are non-fatal because Uninstall doesn't require a running service.
+// stopServiceForReinstall best-effort stops the service and removes it from the
+// launchd domain (darwin) before uninstall. Errors are non-fatal because
+// Uninstall doesn't require a running or bootstrapped service.
+//
+// Darwin: `launchctl bootout` removes the job from the system domain BEFORE
+// kardianos/service Uninstall deletes the plist. Without bootout, the domain
+// retains a tombstone for the deleted plist and a subsequent `launchctl
+// bootstrap` on the new plist exits 17 (EEXIST) which, though treated as
+// idempotent, can leave stale domain state pointing at the old binary path.
 func stopServiceForReinstall(ctx context.Context) error {
 	switch runtime.GOOS {
 	case "darwin":
-		return exec.CommandContext(ctx, "launchctl", "stop", "com.uncluster.agent").Run()
+		// Best-effort bootout: unregisters the job from the system domain.
+		// Ignore error — the job may not be bootstrapped yet (failed mid-install).
+		_ = darwinLaunchctlBootout(ctx)
+		return nil
 	default:
 		return exec.CommandContext(ctx, "systemctl", "stop", "com.uncluster.agent").Run()
 	}
 }
 
 // startService starts (or restarts) the system service.
+//
+// Darwin: on modern macOS, dropping a plist into /Library/LaunchDaemons does
+// not automatically register the job in the system domain. kardianos/service
+// Install() writes the plist but does NOT bootstrap it, so the legacy
+// `launchctl start <label>` (which requires a pre-loaded job) exits 3 with
+// "Could not find service in domain for system" — the #99 failure. The fix:
+//  1. bootstrapServiceDarwin: `launchctl bootstrap system <plist>` to
+//     register the job in the system domain (idempotent — EEXIST treated
+//     as success so re-running agent install stays green).
+//  2. darwinLaunchctlKickstart: `launchctl kickstart -k system/<label>` to
+//     (re)start the now-bootstrapped job. -k makes it safe on an already-
+//     running job. Same domain-qualified verb the existing reloadSSHD uses
+//     for sshd.
 func startService(ctx context.Context) error {
-	// Use platform command directly — kardianos/service.Start can fail if
-	// already running; we want to restart idempotently.
 	switch runtime.GOOS {
 	case "darwin":
-		_ = exec.CommandContext(ctx, "launchctl", "stop", "com.uncluster.agent").Run()
-		return exec.CommandContext(ctx, "launchctl", "start", "com.uncluster.agent").Run()
+		if err := bootstrapServiceDarwin(ctx); err != nil {
+			return err
+		}
+		return darwinLaunchctlKickstart(ctx)
 	default:
 		return exec.CommandContext(ctx, "systemctl", "restart", "com.uncluster.agent").Run()
 	}
