@@ -16,7 +16,8 @@ import (
 
 // Doctor runs all gatekeeper checks without making mutations and returns
 // results. The slice is ordered: sshd → ca pubkey → drop-in → include →
-// principals dir → service account → service running → sshd config loaded.
+// principals dir → service account → service group → service running →
+// sshd config loaded.
 func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 	paths := cfg.ExpectedPaths
 	var results DoctorResults
@@ -43,6 +44,11 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 
 	// 7. Service account.
 	results = append(results, checkServiceAccount())
+
+	// 7a. Service-account group (#96). The macOS group record is created
+	// separately from the user; an absent group silently disables the
+	// config-ownership ACL grant, so it gets its own legible check.
+	results = append(results, checkServiceGroup())
 
 	// 8. Service running.
 	results = append(results, checkServiceRunning())
@@ -152,6 +158,46 @@ func checkServiceAccount() CheckResult {
 	}
 	return CheckResult{Name: "service-account", Status: CheckOK,
 		Message: fmt.Sprintf("service account %q exists", username)}
+}
+
+// checkServiceGroup verifies the service-account GROUP record exists (#96).
+// On macOS the group is a separate dscl record that install must create
+// explicitly (Linux's useradd auto-creates it). If it is absent,
+// restrictSystemConfigACL no-ops and the system agent.toml stays
+// root:wheel 0640 — unreadable by the low-priv account — so the service
+// cannot start. Surfacing this as its own check makes the failure legible
+// to operators instead of presenting only as a downstream "config
+// unreadable" / service-not-running symptom.
+func checkServiceGroup() CheckResult {
+	return serviceGroupResult(lookupServiceGroupName())
+}
+
+// serviceGroupResult maps a resolved group name to a CheckResult. Split out
+// from the probe so the OK/Fail mapping is unit-testable; the lookup itself
+// is integration-only.
+func serviceGroupResult(group string) CheckResult {
+	if group == "" {
+		return CheckResult{Name: "service-group", Status: CheckFail,
+			Message: fmt.Sprintf("service account group %q not found (config will be unreadable by the service account)", serviceAccountName())}
+	}
+	return CheckResult{Name: "service-group", Status: CheckOK,
+		Message: fmt.Sprintf("service account group %q exists", group)}
+}
+
+// lookupServiceGroupName probes for the service-account group record and
+// returns its name, or "" if absent. getent covers Linux (glibc/musl); dscl
+// covers macOS (no getent). Mirrors agent.lookupServiceGroup but lives here so
+// the gatekeeper doctor does not import the agent package's unexported helper.
+func lookupServiceGroupName() string {
+	for _, name := range []string{"uncluster", "_uncluster"} {
+		if exec.Command("getent", "group", name).Run() == nil {
+			return name
+		}
+		if exec.Command("dscl", ".", "-read", "/Groups/"+name).Run() == nil {
+			return name
+		}
+	}
+	return ""
 }
 
 func checkServiceRunning() CheckResult {

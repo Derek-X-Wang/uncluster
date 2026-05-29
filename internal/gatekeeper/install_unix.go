@@ -233,12 +233,33 @@ func ensureServiceAccountDarwin(username string) error {
 	if exec.Command("id", "-u", username).Run() == nil {
 		return nil
 	}
-	// Find a free UID < 500 (macOS system accounts range).
-	uid, gid, err := findFreeSystemIDDarwin()
+	// Allocate a free UID and a free GID INDEPENDENTLY (#96 Bug 1). The UID
+	// and GID namespaces are separate on macOS; the prior implementation
+	// required the SAME number free as both, which fails on a dense host
+	// (hosted macos-latest) where free UIDs and free GIDs exist but never
+	// share a number. They need not match.
+	uid, err := findFreeSystemUIDDarwin()
 	if err != nil {
-		return fmt.Errorf("find free uid/gid: %w", err)
+		return fmt.Errorf("find free uid: %w", err)
 	}
-	cmds := [][]string{
+	gid, err := findFreeSystemGIDDarwin()
+	if err != nil {
+		return fmt.Errorf("find free gid: %w", err)
+	}
+
+	// Create the GROUP record BEFORE the user (#96 Bug 2). Without this the
+	// `_uncluster` group never exists, so lookupServiceGroup() returns "",
+	// restrictSystemConfigACL() no-ops, and agent.toml stays root:wheel 0640
+	// — unreadable by `_uncluster`, so the launchd service fails to start.
+	// Linux's `useradd --system` auto-creates a matching group (USERGROUPS_
+	// ENAB); macOS dscl does not, so we create it explicitly here.
+	groupCmds := [][]string{
+		{"dscl", ".", "-create", "/Groups/" + username},
+		{"dscl", ".", "-create", "/Groups/" + username, "PrimaryGroupID", fmt.Sprintf("%d", gid)},
+		{"dscl", ".", "-create", "/Groups/" + username, "RealName", "Uncluster Agent"},
+	}
+	// Then create the user, pointing PrimaryGroupID at the now-existing group.
+	userCmds := [][]string{
 		{"dscl", ".", "-create", "/Users/" + username},
 		{"dscl", ".", "-create", "/Users/" + username, "UserShell", "/usr/bin/false"},
 		{"dscl", ".", "-create", "/Users/" + username, "RealName", "Uncluster Agent"},
@@ -246,7 +267,7 @@ func ensureServiceAccountDarwin(username string) error {
 		{"dscl", ".", "-create", "/Users/" + username, "PrimaryGroupID", fmt.Sprintf("%d", gid)},
 		{"dscl", ".", "-create", "/Users/" + username, "NFSHomeDirectory", "/var/empty"},
 	}
-	for _, c := range cmds {
+	for _, c := range append(groupCmds, userCmds...) {
 		if out, err := exec.Command(c[0], c[1:]...).CombinedOutput(); err != nil {
 			return fmt.Errorf("dscl %v: %w\n%s", c, err, out)
 		}
@@ -254,27 +275,56 @@ func ensureServiceAccountDarwin(username string) error {
 	return nil
 }
 
-// findFreeSystemIDDarwin scans 200-499 (Apple's documented operator-
-// system-account window per System User Accounts) downward and returns
-// the first UID/GID pair where neither is in use. Iterating high-first
-// keeps low IDs free for future Apple-reserved expansion and reduces
-// collision risk with operator-created accounts.
+// macOS operator system-account window. 0-199 is Apple-reserved; 200-499 is
+// the operator system-account window; 500+ is reserved for regular/interactive
+// users (the hosted-runner user is 501). Widening past this in either
+// direction is a rejected approach per #96 (collides with Apple-reserved or
+// interactive accounts).
+const (
+	darwinSystemIDMin = 200
+	darwinSystemIDMax = 499
+)
+
+// uidInUseDarwin and gidInUseDarwin report whether a given UID/GID is already
+// allocated. They are package-level vars so unit tests can inject fakes; the
+// dscl probes themselves are integration-only. `dscl . -search` exits non-zero
+// when there is no match, which is the "free" signal.
+var (
+	uidInUseDarwin = func(id int) bool {
+		return exec.Command("dscl", ".", "-search", "/Users", "UniqueID", fmt.Sprintf("%d", id)).Run() == nil
+	}
+	gidInUseDarwin = func(id int) bool {
+		return exec.Command("dscl", ".", "-search", "/Groups", "PrimaryGroupID", fmt.Sprintf("%d", id)).Run() == nil
+	}
+)
+
+// findFreeSystemUIDDarwin returns the first free UID in the operator system-
+// account window, scanned high-first.
+func findFreeSystemUIDDarwin() (int, error) {
+	return findFreeIDDarwin(uidInUseDarwin)
+}
+
+// findFreeSystemGIDDarwin returns the first free GID in the operator system-
+// account window, scanned high-first.
+func findFreeSystemGIDDarwin() (int, error) {
+	return findFreeIDDarwin(gidInUseDarwin)
+}
+
+// findFreeIDDarwin scans the operator system-account window (200-499) downward
+// and returns the first value for which inUse reports false. Iterating
+// high-first keeps low IDs free for future Apple-reserved expansion and
+// reduces collision risk with operator-created accounts.
 //
-// Range rationale: 0-199 is Apple-reserved; 200-499 is the operator
-// system-account window; 500+ is reserved for regular users. The prior
-// 200-300 bound was conservative without a documented reason and was
-// exhausted on hosted macos-latest runners where Apple's preinstalled
-// accounts plus the GitHub runner's own bootstrap accounts pack the
-// low end densely (see #92).
-func findFreeSystemIDDarwin() (uid, gid int, err error) {
-	for id := 499; id >= 200; id-- {
-		checkUID := exec.Command("dscl", ".", "-search", "/Users", "UniqueID", fmt.Sprintf("%d", id))
-		checkGID := exec.Command("dscl", ".", "-search", "/Groups", "PrimaryGroupID", fmt.Sprintf("%d", id))
-		if checkUID.Run() != nil && checkGID.Run() != nil {
-			return id, id, nil
+// This is a pure scanner parameterised on an `inUse` predicate so UID and GID
+// can be allocated INDEPENDENTLY in their own namespaces (#96 Bug 1): the
+// returned UID and GID need not — and on a dense host will not — match.
+func findFreeIDDarwin(inUse func(int) bool) (int, error) {
+	for id := darwinSystemIDMax; id >= darwinSystemIDMin; id-- {
+		if !inUse(id) {
+			return id, nil
 		}
 	}
-	return 0, 0, fmt.Errorf("no free system UID/GID found in 200-499 range")
+	return 0, fmt.Errorf("no free system ID found in %d-%d range", darwinSystemIDMin, darwinSystemIDMax)
 }
 
 // grantConfigDirAccess grants the service account write access to the
