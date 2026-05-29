@@ -999,6 +999,39 @@ jobs:
           mkdir -p t2-mac-artifacts
           sudo launchctl list com.uncluster.agent > t2-mac-artifacts/launchctl.txt 2>&1
           sudo log show --last 5m --predicate 'subsystem == "com.uncluster.agent" OR senderImagePath CONTAINS "uncluster"' > t2-mac-artifacts/log-show.txt 2>&1
+          # #101: the agent process exits 78 (EX_CONFIG) immediately after launchd
+          # bootstrap, leaving no PID. The Go binary has NO path that emits 78 (it
+          # only ever exits 0/1, or 0/1/2 for `doctor`), so the actual cause must
+          # be in the agent's own stderr (a real config/startup error) OR in the
+          # launchd/exec layer (the binary never ran main()). These two logs are
+          # the tiebreaker — `agent run` writes its diagnostics to the launchd-
+          # redirected StandardErrorPath/StandardOutPath set in the kardianos plist.
+          sudo cat /var/log/com.uncluster.agent.err.log > t2-mac-artifacts/agent-err.log 2>&1 || true
+          sudo cat /var/log/com.uncluster.agent.out.log > t2-mac-artifacts/agent-out.log 2>&1 || true
+          # `launchctl print` is richer than `list`: it reports the job's last
+          # exit code + human-readable reason and the resolved program path,
+          # which distinguishes "couldn't exec the binary" from "binary ran and
+          # exited". Captured both before and as the canonical EX_CONFIG record.
+          sudo launchctl print system/com.uncluster.agent > t2-mac-artifacts/launchctl-print.txt 2>&1 || true
+          # The generated plist as launchd actually sees it — confirms UserName,
+          # ProgramArguments, and the StandardErrorPath/StandardOutPath redirects.
+          sudo cat /Library/LaunchDaemons/com.uncluster.agent.plist > t2-mac-artifacts/agent-plist.txt 2>&1 || true
+          # Binary identity: perms (incl. xattrs via -l@), any com.apple.quarantine
+          # xattr, and code-signing status. If launchd refused to exec the binary
+          # as _uncluster for a signing/quarantine reason, that is Bucket-B weather
+          # (a hosted-runner artifact, not a real-Mac config bug); these surface it.
+          sudo ls -l@ /usr/local/bin/uncluster > t2-mac-artifacts/binary-perms.txt 2>&1 || true
+          xattr -l /usr/local/bin/uncluster > t2-mac-artifacts/binary-xattr.txt 2>&1 || true
+          codesign -dvvv /usr/local/bin/uncluster > t2-mac-artifacts/binary-codesign.txt 2>&1 || true
+          # Reproduce the failing invocation directly as _uncluster (the same
+          # identity + a service-like empty HOME) to capture the agent's own
+          # stderr even if launchd suppressed/aborted the redirect. This is the
+          # definitive Bucket A vs B probe: a clean config error here = Bucket A;
+          # an exec/permission failure or a clean run = Bucket B.
+          sudo -u _uncluster env -i HOME=/var/empty /usr/local/bin/uncluster agent run > t2-mac-artifacts/agent-run-as-service-account.txt 2>&1 &
+          repro_pid=$!
+          sleep 3
+          sudo kill "${repro_pid}" 2>/dev/null || true
           cp /tmp/cp.log t2-mac-artifacts/cp.log 2>/dev/null || true
           sudo cat /etc/ssh/sshd_config.d/uncluster.conf > t2-mac-artifacts/sshd-drop-in.conf 2>&1
           sudo cat /etc/ssh/uncluster_ca.pub > t2-mac-artifacts/ca.pub 2>&1
