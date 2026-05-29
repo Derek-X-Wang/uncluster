@@ -697,6 +697,85 @@ jobs:
           sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
           uncluster --help >/dev/null
 
+      - name: preflight:system-id-capacity
+        id: preflight
+        # Read-only capacity probe for #96. The independent-allocation fix
+        # (separate UID + GID scans of 200-499) succeeds whenever the host
+        # has ANY free UID AND ANY free GID in that window — they need not
+        # match. But a hosted macos-latest runner whose 200-499 window is
+        # fully packed in EITHER namespace has no allocatable system-ID space
+        # at all, and no production fix can conjure one (widening the range is
+        # a rejected approach per #96 — 0-199 is Apple-reserved, 500+ is the
+        # interactive-user range). This step records the empirical counts so
+        # the outcome is visible in artifacts either way, and emits outputs
+        # that gate the account-creation tail below.
+        run: |
+          set -uo pipefail
+          mkdir -p t2-mac-artifacts
+          pf=t2-mac-artifacts/preflight.txt
+          {
+            echo "===== sw_vers ====="
+            sw_vers || true
+            echo
+            echo "===== sysadminctl capability (-h) ====="
+            # sysadminctl -h prints usage incl. -addUser/-roleAccount support.
+            sysadminctl -h 2>&1 || true
+            echo
+            echo "===== used UIDs (dscl . -list /Users UniqueID) ====="
+            dscl . -list /Users UniqueID 2>/dev/null | sort -k2 -n || true
+            echo
+            echo "===== used GIDs (dscl . -list /Groups PrimaryGroupID) ====="
+            dscl . -list /Groups PrimaryGroupID 2>/dev/null | sort -k2 -n || true
+          } | tee "$pf"
+
+          # Build the set of in-use UIDs/GIDs and scan the 200-499 window.
+          used_uids="$(dscl . -list /Users UniqueID 2>/dev/null | awk '{print $2}')"
+          used_gids="$(dscl . -list /Groups PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+
+          free_uid=""
+          free_gid=""
+          for id in $(seq 499 -1 200); do
+            if [ -z "$free_uid" ] && ! echo "$used_uids" | grep -qx "$id"; then
+              free_uid="$id"
+            fi
+            if [ -z "$free_gid" ] && ! echo "$used_gids" | grep -qx "$id"; then
+              free_gid="$id"
+            fi
+          done
+
+          # Count totals for the artifact.
+          free_uid_count=0
+          free_gid_count=0
+          for id in $(seq 499 -1 200); do
+            echo "$used_uids" | grep -qx "$id" || free_uid_count=$((free_uid_count+1))
+            echo "$used_gids" | grep -qx "$id" || free_gid_count=$((free_gid_count+1))
+          done
+
+          {
+            echo
+            echo "===== #96 independent-allocation capacity (200-499) ====="
+            echo "free_uid_count=${free_uid_count}"
+            echo "free_gid_count=${free_gid_count}"
+            echo "first_free_uid=${free_uid:-NONE}"
+            echo "first_free_gid=${free_gid:-NONE}"
+          } | tee -a "$pf"
+
+          has_uid=false; [ -n "$free_uid" ] && has_uid=true
+          has_gid=false; [ -n "$free_gid" ] && has_gid=true
+          has_space=false; { [ "$has_uid" = true ] && [ "$has_gid" = true ]; } && has_space=true
+
+          {
+            echo "has_free_uid=${has_uid}"
+            echo "has_free_gid=${has_gid}"
+            echo "has_free_id_space=${has_space}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$has_space" = true ]; then
+            echo "::notice::T2-mac preflight: free UID(s)=${free_uid_count}, free GID(s)=${free_gid_count} in 200-499 — independent allocation can run; account tail EXPECTED-GREEN."
+          else
+            echo "::warning::T2-mac preflight: no allocatable system-ID space (free_uid_count=${free_uid_count}, free_gid_count=${free_gid_count}); account-creation tail will be documented advisory-xfail per #96/ADR-0008."
+          fi
+
       - name: bootstrap:enable-remote-login
         id: remote-login
         # The spike-blocker step. On hosted macos-latest, enabling Remote
@@ -781,7 +860,11 @@ jobs:
 
       - name: product:agent-install
         id: agent-install
-        if: steps.remote-login.outputs.spike_blocked != 'true'
+        # Account-creation tail (#96): gated on free system-ID space. If the
+        # hosted runner has no allocatable UID/GID in 200-499 even after the
+        # independent-allocation fix, this and the steps below are SKIPPED
+        # (documented advisory-xfail), not failed — see account-tail-xfail-notice.
+        if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space == 'true'
         # The other spike-pressure point: `sudo uncluster agent install`
         # creates `_uncluster` via dscl, writes /Library/LaunchDaemons,
         # mutates /etc/ssh, calls launchctl. Any of these may need
@@ -792,7 +875,7 @@ jobs:
 
       - name: product:assert-service-loaded
         id: assert-svc
-        if: steps.remote-login.outputs.spike_blocked != 'true'
+        if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space == 'true'
         run: |
           set -euo pipefail
           out="$(sudo launchctl list com.uncluster.agent 2>&1 || true)"
@@ -805,7 +888,7 @@ jobs:
 
       - name: product:assert-agent-online
         id: assert-online
-        if: steps.remote-login.outputs.spike_blocked != 'true'
+        if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space == 'true'
         run: |
           set -euo pipefail
           CALLER_TOK="$(cat /tmp/caller-token)"
@@ -827,14 +910,16 @@ jobs:
 
       - name: product:assert-doctor
         id: assert-doctor
-        if: steps.remote-login.outputs.spike_blocked != 'true'
+        # Post-install doctor — depends on the account/group/service the
+        # install tail creates, so it is gated with the rest of the tail.
+        if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space == 'true'
         run: |
           set -euo pipefail
           sudo uncluster agent doctor
 
       - name: product:assert-sshd-drop-in
         id: assert-drop-in
-        if: steps.remote-login.outputs.spike_blocked != 'true'
+        if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space == 'true'
         run: |
           set -euo pipefail
           # Sonoma+ supports sshd_config.d directly; pre-Sonoma needs
@@ -845,11 +930,14 @@ jobs:
           sudo grep -q 'TrustedUserCAKeys' /etc/ssh/sshd_config.d/uncluster.conf
           sudo grep -q 'AuthorizedPrincipalsFile' /etc/ssh/sshd_config.d/uncluster.conf
 
-      - name: product:assert-service-user
+      - name: product:assert-service-user-and-group
         id: assert-user
-        if: steps.remote-login.outputs.spike_blocked != 'true'
+        if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space == 'true'
         # macOS service-account convention is `_uncluster` (underscore-
-        # prefix system accounts). Verify it exists with no shell.
+        # prefix system accounts). Verify the user exists with no shell AND
+        # that the GROUP record exists (#96 Bug 2 — without it,
+        # restrictSystemConfigACL no-ops and agent.toml stays unreadable by
+        # the service account).
         run: |
           set -euo pipefail
           out="$(dscl . -read /Users/_uncluster 2>&1 || true)"
@@ -863,6 +951,46 @@ jobs:
               echo "service user _uncluster has interactive shell"
               exit 1
           fi
+          # #96 Bug 2: the group record MUST exist so lookupServiceGroup()
+          # resolves and the config-ownership chown applies.
+          gout="$(dscl . -read /Groups/_uncluster 2>&1 || true)"
+          echo "${gout}"
+          if ! echo "${gout}" | grep -qE 'RecordName.*_uncluster'; then
+              echo "service group _uncluster missing (#96 Bug 2 regression)"
+              exit 1
+          fi
+          # #96 acceptance: system agent.toml owned root:_uncluster, mode 0640,
+          # readable by the service account (no silent no-op).
+          ls -le /etc/uncluster/agent.toml || true
+          owner_group="$(stat -f '%Su:%Sg' /etc/uncluster/agent.toml)"
+          echo "agent.toml owner:group = ${owner_group}"
+          if [ "${owner_group}" != "root:_uncluster" ]; then
+              echo "system agent.toml not owned root:_uncluster (got ${owner_group}) — config-ACL grant did not apply (#96)"
+              exit 1
+          fi
+          # Confirm the service account can actually read it.
+          if ! sudo -u _uncluster test -r /etc/uncluster/agent.toml; then
+              echo "_uncluster cannot read /etc/uncluster/agent.toml (#96 acceptance failure)"
+              exit 1
+          fi
+          echo "agent.toml is root:_uncluster 0640 and readable by _uncluster"
+
+      - name: account-tail-xfail-notice
+        id: xfail-notice
+        # Fires only when the runner has NO allocatable system-ID space and we
+        # were not already spike-blocked at Remote Login. Documents the
+        # advisory-xfail of the account-creation/service-start/doctor tail per
+        # #96 + ADR-0008's failure taxonomy. This is NOT a hard failure (the
+        # job is advisory anyway) and there is NO retry loop — the gap is the
+        # data point; real account creation is validated on T4 hardware (#16).
+        if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space != 'true'
+        run: |
+          set -euo pipefail
+          reason="[advisory-xfail] hosted macOS runner has no allocatable system-ID space; real account creation validated on T4 hardware per ADR-0008"
+          echo "::warning::T2-mac: ${reason}"
+          echo "${reason}" | tee -a t2-mac-artifacts/preflight.txt
+          echo "free_uid=${{ steps.preflight.outputs.has_free_uid }} free_gid=${{ steps.preflight.outputs.has_free_gid }} (need both true for the account tail)" \
+              | tee -a t2-mac-artifacts/preflight.txt
 
       - name: collect:artifacts
         if: always()
@@ -877,6 +1005,8 @@ jobs:
           sudo ls -la /etc/ssh/auth_principals > t2-mac-artifacts/principals-listing.txt 2>&1
           sudo sshd -T > t2-mac-artifacts/sshd-T.txt 2>&1
           sudo dscl . -read /Users/_uncluster > t2-mac-artifacts/dscl-user.txt 2>&1
+          sudo dscl . -read /Groups/_uncluster > t2-mac-artifacts/dscl-group.txt 2>&1
+          sudo ls -le /etc/uncluster/agent.toml > t2-mac-artifacts/agent-toml-perms.txt 2>&1
           ls -la t2-mac-artifacts
 
       - name: collect:upload
@@ -893,19 +1023,47 @@ jobs:
         # NOT enforce-taxonomy — we are explicitly advisory. This step
         # just records what happened so a future operator deciding
         # promote-to-required has a single line to read per run.
+        #
+        # #96: distinguish three outcomes explicitly —
+        #   (a) Remote-Login spike-blocked (pre-existing #71 gap),
+        #   (b) account tail advisory-xfail'd because the runner has no free
+        #       system-ID space (skipped, NOT failed — the documented #96 tail),
+        #   (c) ran the account tail (ID space existed) — report pass/fail.
+        # In every case the UPSTREAM steps (build/preflight/bootstrap/start/
+        # mint/join) are expected-green; a failure THERE is a real regression
+        # even though the job is advisory.
         run: |
           if [[ "${{ steps.remote-login.outputs.spike_blocked }}" == "true" ]]; then
               echo "::notice::T2-mac SPIKE: BLOCKED at Remote Login enablement step (#71)."
               echo "Follow-up issue should be filed if this persists across multiple runs."
               exit 0
           fi
-          # Aggregate the product steps. Any failure → warning (advisory).
-          fail=0
+
+          # Upstream steps that DO NOT need the service account — must be green
+          # on the hosted runner regardless of ID-space availability so the
+          # job keeps its regression-catching value (#96).
+          upstream_fail=0
           for step in \
               "${{ steps.cp-bs.outcome }}" \
               "${{ steps.cp-start.outcome }}" \
               "${{ steps.mint-join.outcome }}" \
-              "${{ steps.agent-join.outcome }}" \
+              "${{ steps.agent-join.outcome }}"; do
+              if [[ "${step}" == "failure" ]]; then
+                  upstream_fail=1
+              fi
+          done
+          if [[ "${upstream_fail}" == "1" ]]; then
+              echo "::warning::T2-mac: an UPSTREAM expected-green step (bootstrap/start/mint/join) failed — investigate as a real regression, not an ID-space xfail. See artifacts."
+          fi
+
+          if [[ "${{ steps.preflight.outputs.has_free_id_space }}" != "true" ]]; then
+              echo "::notice::T2-mac: account-creation/service-start/doctor tail ADVISORY-XFAIL (no allocatable system-ID space in 200-499). Documented per #96/ADR-0008; not a regression. Upstream steps: $([[ ${upstream_fail} == 0 ]] && echo green || echo FAILED)."
+              exit 0
+          fi
+
+          # ID space existed → the account tail RAN. Aggregate it.
+          tail_fail=0
+          for step in \
               "${{ steps.agent-install.outcome }}" \
               "${{ steps.assert-svc.outcome }}" \
               "${{ steps.assert-online.outcome }}" \
@@ -913,13 +1071,13 @@ jobs:
               "${{ steps.assert-drop-in.outcome }}" \
               "${{ steps.assert-user.outcome }}"; do
               if [[ "${step}" == "failure" ]]; then
-                  fail=1
+                  tail_fail=1
               fi
           done
-          if [[ "${fail}" == "1" ]]; then
-              echo "::warning::T2-mac SPIKE: at least one product step failed. See uploaded artifacts. Until empirically green for N consecutive runs (operator's call) this stays advisory."
+          if [[ "${tail_fail}" == "1" || "${upstream_fail}" == "1" ]]; then
+              echo "::warning::T2-mac: at least one product step failed WITH free ID space available (#96 fix should have made the account tail green). See uploaded artifacts. Stays advisory until empirically green for N consecutive runs."
           else
-              echo "::notice::T2-mac SPIKE: all product steps passed. Green run logged."
+              echo "::notice::T2-mac: all product steps passed end-to-end (independent UID/GID allocation + group record worked). Green run logged (#96)."
           fi
           exit 0
 
