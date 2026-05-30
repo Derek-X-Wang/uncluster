@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -60,8 +61,14 @@ func TestRun_HealthyHostPassesAndWritesEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evidence dir not created: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Errorf("evidence dir mode = %#o, want 0700", perm)
+	// Unix mode bits only — Windows reports 0777 for dirs regardless of the
+	// requested mode (it uses ACLs, not POSIX permissions). The 0700 intent is
+	// still asserted on Unix where it is the real access control; on Windows we
+	// just confirm the dir exists. Mirrors config_resolve_test.go's guard.
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Errorf("evidence dir mode = %#o, want 0700", perm)
+		}
 	}
 	for _, f := range []string{"manifest.json", "summary.json"} {
 		if _, err := os.Stat(filepath.Join(res.EvidencePath, f)); err != nil {
