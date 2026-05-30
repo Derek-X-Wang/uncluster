@@ -64,35 +64,17 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 		})
 	}
 
-	// 5. Principals dir exists and is writable.
+	// 5. Principals dir exists, is a directory, and grants the service
+	// account write access — verified by READING the DACL (non-mutating).
+	// The prior implementation write-probed by creating + removing a temp
+	// file, which violates the ADR-0009 `inspect` contract that lets the
+	// auto-invoke hook run `doctor`. CI asserted the grant by grepping
+	// `icacls` for "UnclusterAgent" (#104).
 	pDir := paths.PrincipalsDir
 	if pDir == "" {
 		pDir = windowsPaths.PrincipalsDir
 	}
-	if fi, err := os.Stat(pDir); err != nil {
-		results = append(results, CheckResult{
-			Name: "principals-dir", Status: CheckFail,
-			Message: pDir + " not found. Run: uncluster agent install",
-		})
-	} else if !fi.IsDir() {
-		results = append(results, CheckResult{
-			Name: "principals-dir", Status: CheckFail,
-			Message: pDir + " exists but is not a directory",
-		})
-	} else {
-		// Check writability by attempting to stat a temp file.
-		testFile := pDir + "\\.uncluster_write_test"
-		if f, err := os.OpenFile(testFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600); err != nil {
-			results = append(results, CheckResult{
-				Name: "principals-dir", Status: CheckWarn,
-				Message: "principals dir exists but may not be writable: " + err.Error(),
-			})
-		} else {
-			_ = f.Close()
-			_ = os.Remove(testFile)
-			results = append(results, CheckResult{Name: "principals-dir", Status: CheckOK})
-		}
-	}
+	results = append(results, checkPrincipalsACLWindows(pDir))
 
 	// 6. UnclusterAgent service installed.
 	svcOut, svcErr := exec.Command("sc.exe", "query", agent.WindowsServiceName).CombinedOutput()
@@ -113,6 +95,13 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 			})
 		}
 	}
+
+	// 8. System config ownership (#104). The Unix doctor checks the system
+	// agent.toml is owned root:<service account> 0640 (readable by the service
+	// account, not world). The Windows equivalent is the DACL granting
+	// `NT SERVICE\UnclusterAgent` READ — without it the SCM service cannot read
+	// its config and fails to start (#77). Non-mutating: reads the DACL.
+	results = append(results, checkConfigACLWindows(agent.SystemConfigPath()))
 
 	return results
 }
