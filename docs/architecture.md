@@ -251,10 +251,11 @@ $ uncluster server update set --version=v2.0.2 \
 | ACL CRUD + projection | `internal/server/handlers_acl.go`, `internal/server/policy.go` |
 | Heartbeat handler + envelope | `internal/server/handlers_agent.go`, `internal/api/types.go` |
 | Audit writes | `internal/server/audit.go` |
-| Agent install | `internal/agent/install.go` (+ `install_<os>.go`) |
-| Agent sshd / principals | `internal/agent/sshd.go`, `internal/agent/principals.go` |
-| Agent update | `internal/agent/update.go` (+ `update_<os>.go`) |
-| Agent health diagnose | `internal/agent/health.go` |
+| Agent install + sshd config + service | `internal/gatekeeper/` (`install_unix.go`, `install_windows.go`, `install_launchd_*.go`, `service_*.go`, `install_drift.go`) |
+| Agent principals apply (Policy → files) | `internal/agent/policy.go` |
+| Agent self-update | `internal/agent/selfupdate.go`, `internal/agent/updatehost.go` |
+| Agent health diagnose (`doctor`) | `internal/gatekeeper/doctor_*.go`, `internal/gatekeeper/health.go` (`DoctorResults.HealthChecks` — the one doctor→wire mapping shared by heartbeat, `doctor --json`, and `validate`) |
+| Validation tool (`uncluster validate`, ADR-0009) | `internal/validate/`, `internal/cli/validate_cmd.go`, skill at `.claude/skills/validate/` |
 | `uncluster ssh` wrapper | `internal/cli/ssh_cmd.go` |
 | `uncluster acl ...` | `internal/cli/acl_cmd.go` |
 | `uncluster audit ...` | `internal/cli/audit_cmd.go` |
