@@ -24,7 +24,7 @@ Independent of tier. Determines what may auto-fire vs what requires explicit aut
 
 ## Decisions
 
-1. **Trigger by safety class, not by tier.** A Claude Code Stop / pre-push hook may auto-invoke `inspect` (and carefully `bounded`) checks, path-sensitive to changes under the install/daemon/self-update code. It must **never** auto-run `privileged` or `disruptive` checks — auto-`sudo`+reboot on every commit would brick the operator's dev machine. Those stay explicit manual invocations.
+1. **Trigger by safety class, not by tier.** A Claude Code Stop / pre-push hook may auto-invoke **only `inspect`** (read-only) checks, path-sensitive to changes under the install/daemon/self-update code. `bounded` checks write to temp scopes and self-clean but still run **manually** (they touch the filesystem, so the auto-loop stays strictly read-only). The hook must **never** auto-run `privileged` or `disruptive` checks — auto-`sudo`+reboot on every commit would brick the operator's dev machine. Those stay explicit manual invocations.
 
 2. **Evidence ephemeral, verdict durable-but-local.** Bulky evidence (logs, doctor output, `sshd -T`, service state) goes to `/tmp/uncluster-validate/<run-id>/` (mode 0700, Caller tokens redacted). A one-line-per-run breadcrumb goes to `~/.local/state/uncluster/validation.jsonl` — `{commit, dirty, tier, target, checks, result, evidence_path}` — durable and outside the repo. No repo-checked-in validation log pre-MVP. Rationale: pure-ephemeral would make "was this validated at commit X?" unanswerable without re-running, recreating the re-validation cost this whole model exists to kill; the breadcrumb preserves the answer for ~free.
 
