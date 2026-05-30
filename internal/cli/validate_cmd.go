@@ -67,7 +67,7 @@ hook only ever runs --safety inspect.`,
 				EvidenceRoot:   evidenceRt,
 				BreadcrumbPath: bcPath,
 				Commit:         gitCommitDirty,
-				Check:          makeCheckRunner(cmd.Context(), allowReboot),
+				Check:          makeCheckRunner(cmd.Context(), allowReboot, target),
 			}
 
 			res, err := r.Run()
@@ -112,7 +112,7 @@ hook only ever runs --safety inspect.`,
 // prepended checks `agent doctor --json` uses) and captures the JSON as
 // evidence — so validate and doctor share ONE health definition. Unknown check
 // names return a fail so a typo doesn't silently pass.
-func makeCheckRunner(ctx context.Context, allowReboot bool) validate.CheckRunner {
+func makeCheckRunner(ctx context.Context, allowReboot bool, target string) validate.CheckRunner {
 	return func(name string) validate.CheckResult {
 		switch name {
 		case "doctor":
@@ -148,11 +148,19 @@ func makeCheckRunner(ctx context.Context, allowReboot bool) validate.CheckRunner
 			// download/checksum/atomic-swap against live release artifacts is
 			// the deferred ready-for-human real-machine exercise.
 			return runSelfUpdateCheck()
+		case "dogfood":
+			// The #112 dogfood check: validate the target THROUGH Uncluster's
+			// own SSH, with a plain-ssh control first to classify failures
+			// (product vs transport vs indeterminate). The harness + classifier
+			// are fully built + unit-tested (validate.RunDogfood); binding the
+			// plain-ssh + `uncluster ssh` probes to a LIVE deployment (CP + 2
+			// agents + plain-ssh creds) is the deferred ready-for-human exercise.
+			return runDogfoodCheck(target)
 		default:
 			return validate.CheckResult{
 				Name:  name,
 				State: "fail",
-				Raw:   fmt.Sprintf("unknown check %q (wired checks: doctor, bounded-fixture, install-smoke, reboot-survival, self-update)", name),
+				Raw:   fmt.Sprintf("unknown check %q (wired checks: doctor, bounded-fixture, install-smoke, reboot-survival, self-update, dogfood)", name),
 			}
 		}
 	}
@@ -343,6 +351,34 @@ func runSelfUpdateCheck() validate.CheckResult {
 			"the real download/checksum/atomic-swap against live release artifacts is the deferred " +
 			"ready-for-human real-machine exercise (#111). Not run here.",
 	}
+}
+
+// runDogfoodCheck is the production entry for the #112 dogfood validation. The
+// harness + product-vs-transport classifier (validate.RunDogfood /
+// ClassifyDogfood) are fully built + unit-tested with fakes for every branch.
+// Binding the plain-ssh control + the `uncluster ssh <target> -- hostname` path
+// to a LIVE deployment (control plane + ≥2 agents + plain-ssh creds) is the
+// deferred ready-for-human exercise. Rather than fake a pass, this reports an
+// honest warn (correctly classified indeterminate — no plain-ssh control is
+// configured here) so an operator sees the deferral, not a false green.
+func runDogfoodCheck(target string) validate.CheckResult {
+	if target == "" || target == "this-machine" {
+		return validate.CheckResult{
+			Name:  "dogfood",
+			State: "warn",
+			Raw:   "dogfood needs a remote --target <agent-name>; the harness + classifier are built + unit-tested with fakes. Real cross-machine dogfood (live CP + agents + plain-ssh control) is the deferred ready-for-human exercise (#112). Not run here.",
+		}
+	}
+	// No plain-ssh control / live deployment wired in this context → the
+	// classifier correctly yields indeterminate (warn), never a false product
+	// pass/fail. The real probes are the deferred exercise.
+	return validate.RunDogfood(validate.DogfoodOpts{
+		Target:            target,
+		ControlConfigured: false,
+		UnclusterSSH: func() (bool, string) {
+			return false, "real `uncluster ssh` dogfood probe is the deferred ready-for-human exercise (#112)"
+		},
+	}).CheckResult()
 }
 
 // gitCommitDirty returns the current repo commit (short) and whether the tree
