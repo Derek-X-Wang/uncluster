@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -65,7 +67,7 @@ hook only ever runs --safety inspect.`,
 				EvidenceRoot:   evidenceRt,
 				BreadcrumbPath: bcPath,
 				Commit:         gitCommitDirty,
-				Check:          makeCheckRunner(cmd.Context()),
+				Check:          makeCheckRunner(cmd.Context(), allowReboot),
 			}
 
 			res, err := r.Run()
@@ -110,7 +112,7 @@ hook only ever runs --safety inspect.`,
 // prepended checks `agent doctor --json` uses) and captures the JSON as
 // evidence — so validate and doctor share ONE health definition. Unknown check
 // names return a fail so a typo doesn't silently pass.
-func makeCheckRunner(ctx context.Context) validate.CheckRunner {
+func makeCheckRunner(ctx context.Context, allowReboot bool) validate.CheckRunner {
 	return func(name string) validate.CheckResult {
 		switch name {
 		case "doctor":
@@ -129,6 +131,13 @@ func makeCheckRunner(ctx context.Context) validate.CheckRunner {
 			// the Runner). The real-machine exercise is deferred to a
 			// ready-for-human slice; the orchestration is the shippable unit.
 			return runInstallSmokeCheck(ctx)
+		case "reboot-survival":
+			// The #110 disruptive two-phase reboot-survival check. First run
+			// arms (persist state + reboot); the post-reboot re-run resumes and
+			// verifies the service resurrected. Requires --safety disruptive
+			// --allow-reboot (enforced by the Runner AND the arm phase). The real
+			// reboot exercise is deferred to a ready-for-human slice.
+			return runRebootSurvivalCheck(ctx, allowReboot)
 		default:
 			return validate.CheckResult{
 				Name:  name,
@@ -223,6 +232,89 @@ func runInstallSmokeCheck(ctx context.Context) validate.CheckResult {
 			return results.ExitCode() != 2, buf.String()
 		},
 	})
+}
+
+// runRebootSurvivalCheck wires the REAL reboot + liveness probe into the #110
+// two-phase state machine. ResumeOrArm dispatches: if a run is armed (persisted
+// state present) it resumes (Phase 2 — verify the service came back); otherwise
+// it arms (Phase 1 — persist + real reboot). The real reboot only fires under
+// --safety disruptive --allow-reboot (enforced by the Runner AND the arm phase);
+// the first real-machine exercise is a deferred ready-for-human slice — running
+// this on the operator box with the flag really reboots it.
+func runRebootSurvivalCheck(ctx context.Context, allowReboot bool) validate.CheckResult {
+	statePath, err := validate.DefaultRebootStatePath()
+	if err != nil {
+		return validate.CheckResult{Name: "reboot-survival", State: "fail", Raw: "resolve reboot state path: " + err.Error()}
+	}
+	rs := &validate.RebootSurvival{
+		StatePath:   statePath,
+		Target:      "this-machine",
+		AllowReboot: allowReboot,
+		EnsureInstalled: func() error {
+			// Phase 1 precondition: doctor must not report a hard failure
+			// (a missing install can't survive a reboot it never had).
+			cfgPath, e := agent.ResolveConfigPath()
+			if e != nil {
+				return e
+			}
+			cfg, e := agent.LoadConfig(cfgPath)
+			if e != nil {
+				return e
+			}
+			if code := gatekeeper.Doctor(ctx, cfg).ExitCode(); code == 2 {
+				return fmt.Errorf("agent not healthy pre-reboot (doctor exit 2); install/repair before arming reboot-survival")
+			}
+			return nil
+		},
+		TriggerReboot:     realReboot,
+		VerifyResurrected: realServiceLiveness(ctx),
+	}
+	return rs.ResumeOrArm(newValidateRunID(), "")
+}
+
+// realReboot triggers a real OS reboot. Only ever called from the disruptive
+// reboot-survival arm phase under --allow-reboot. OS-specific command.
+func realReboot() error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("shutdown", "/r", "/t", "5")
+	default:
+		// -r reboot; sudo is the operator's responsibility (the whole check is
+		// privileged/disruptive).
+		cmd = exec.Command("shutdown", "-r", "now")
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("reboot command failed: %w\n%s", err, out)
+	}
+	return nil
+}
+
+// realServiceLiveness returns a Phase-2 verifier that checks the agent service
+// resurrected after the reboot via doctor's service-running check + the loaded
+// config. Healthy = doctor reports the service running and no hard failure.
+func realServiceLiveness(ctx context.Context) func() (bool, string) {
+	return func() (bool, string) {
+		cfgPath, err := agent.ResolveConfigPath()
+		if err != nil {
+			return false, "resolve config: " + err.Error()
+		}
+		cfg, err := agent.LoadConfig(cfgPath)
+		if err != nil {
+			return false, "load config: " + err.Error()
+		}
+		results := gatekeeper.Doctor(ctx, cfg)
+		var buf bytes.Buffer
+		_ = writeDoctorJSON(&buf, results, results.ExitCode())
+		return results.ExitCode() != 2, buf.String()
+	}
+}
+
+// newValidateRunID makes a run id for the reboot-survival arm phase, matching
+// the validate evidence run-id shape.
+func newValidateRunID() string {
+	return time.Now().UTC().Format("20060102T150405Z")
 }
 
 // gitCommitDirty returns the current repo commit (short) and whether the tree
