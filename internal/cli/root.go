@@ -22,5 +22,6 @@ func NewRoot() *cobra.Command {
 	root.AddCommand(newSSHCmd())
 	root.AddCommand(newAgentsCmd())
 	root.AddCommand(newAuditCmd())
+	root.AddCommand(newValidateCmd())
 	return root
 }
