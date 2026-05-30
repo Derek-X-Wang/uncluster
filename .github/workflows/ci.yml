@@ -49,6 +49,8 @@ jobs:
         run: bash scripts/ci/test-classify-step.sh
       - name: verify doctor-json health asserter (#104 intentional-fail tests)
         run: bash scripts/ci/test-assert-doctor-json.sh
+      - name: verify validate-inspect hook (#107 path-sensitivity + inspect-only)
+        run: bash scripts/hooks/test-validate-inspect-hook.sh
       - name: run T1a smoke
         id: smoke
         continue-on-error: true
