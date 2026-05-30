@@ -31,6 +31,7 @@ func newValidateCmd() *cobra.Command {
 		allowMutate bool
 		allowReboot bool
 		evidenceRt  string
+		force       bool
 	)
 	cmd := &cobra.Command{
 		Use:   "validate",
@@ -55,6 +56,25 @@ hook only ever runs --safety inspect.`,
 			bcPath, err := validate.DefaultBreadcrumbPath()
 			if err != nil {
 				return err
+			}
+
+			// Skip-if-already-validated (#113): unless --force, if a prior
+			// identical run PASSED at this exact commit on a clean tree, report
+			// "already validated" and exit 0 without re-running. Fail-safe — a
+			// dirty tree, any differing field, or a missing/corrupt breadcrumb
+			// re-runs. This is read-only and never mutates, so it is safe even
+			// for privileged/disruptive invocations.
+			if !force {
+				commit, dirty := gitCommitDirty()
+				if bcs, rerr := validate.ReadBreadcrumbs(bcPath); rerr == nil {
+					if skip, reason := validate.ShouldSkip(bcs, validate.SkipQuery{
+						Commit: commit, Dirty: dirty, Tier: tier, Target: target, Checks: checks,
+					}); skip {
+						fmt.Fprintf(cmd.OutOrStdout(), "validate SKIP  [%s/%s %s]  %s\n", tier, target, sc, reason)
+						fmt.Fprintln(cmd.OutOrStdout(), "(pass --force to re-validate)")
+						return nil
+					}
+				}
 			}
 
 			r := &validate.Runner{
@@ -104,6 +124,7 @@ hook only ever runs --safety inspect.`,
 	cmd.Flags().BoolVar(&allowMutate, "allow-mutate", false, "authorize privileged (sudo) checks")
 	cmd.Flags().BoolVar(&allowReboot, "allow-reboot", false, "authorize disruptive (reboot/self-update) checks")
 	cmd.Flags().StringVar(&evidenceRt, "evidence-root", "", "override evidence root (default /tmp/uncluster-validate)")
+	cmd.Flags().BoolVar(&force, "force", false, "re-validate even if an identical run already passed at this commit (skip the breadcrumb cache)")
 	return cmd
 }
 
