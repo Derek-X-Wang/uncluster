@@ -138,11 +138,21 @@ func makeCheckRunner(ctx context.Context, allowReboot bool) validate.CheckRunner
 			// --allow-reboot (enforced by the Runner AND the arm phase). The real
 			// reboot exercise is deferred to a ready-for-human slice.
 			return runRebootSurvivalCheck(ctx, allowReboot)
+		case "self-update":
+			// The #111 disruptive self-update validation: happy path (agent
+			// comes back on the target version) + rollback (a broken update
+			// reverts to the prior binary). Requires --safety disruptive
+			// --allow-reboot (self-update restarts the service). The
+			// orchestration is fully built + unit-tested
+			// (validate.RunSelfUpdateValidation); binding it to the REAL
+			// download/checksum/atomic-swap against live release artifacts is
+			// the deferred ready-for-human real-machine exercise.
+			return runSelfUpdateCheck()
 		default:
 			return validate.CheckResult{
 				Name:  name,
 				State: "fail",
-				Raw:   fmt.Sprintf("unknown check %q (wired checks: doctor, bounded-fixture, install-smoke)", name),
+				Raw:   fmt.Sprintf("unknown check %q (wired checks: doctor, bounded-fixture, install-smoke, reboot-survival, self-update)", name),
 			}
 		}
 	}
@@ -315,6 +325,24 @@ func realServiceLiveness(ctx context.Context) func() (bool, string) {
 // the validate evidence run-id shape.
 func newValidateRunID() string {
 	return time.Now().UTC().Format("20060102T150405Z")
+}
+
+// runSelfUpdateCheck is the production entry for the #111 self-update
+// validation. The orchestration (validate.RunSelfUpdateValidation) is fully
+// built + unit-tested with faked update artifacts; binding it to the REAL
+// download → checksum → atomic-swap → restart against live release artifacts
+// (and a cross-restart `--version` probe) is the deferred ready-for-human
+// real-machine exercise. Rather than fake a pass, this returns a warn that
+// names the deferral, so an operator running it sees an honest "not yet wired
+// to real artifacts" signal instead of a false green.
+func runSelfUpdateCheck() validate.CheckResult {
+	return validate.CheckResult{
+		Name:  "self-update",
+		State: "warn",
+		Raw: "self-update orchestration is built + unit-tested (happy + rollback) with faked artifacts; " +
+			"the real download/checksum/atomic-swap against live release artifacts is the deferred " +
+			"ready-for-human real-machine exercise (#111). Not run here.",
+	}
 }
 
 // gitCommitDirty returns the current repo commit (short) and whether the tree
