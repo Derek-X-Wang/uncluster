@@ -21,6 +21,7 @@ If any of those is absent, no ADR.
 | 0006 | [Self-update — Control plane decides, GitHub serves bytes](./0006-self-update-channel.md) | accepted   |
 | 0007 | [ACL — central management, agent-reflected, both must agree](./0007-acl-central-plus-agent-reflected.md) | accepted   |
 | 0008 | [Tiered E2E CI architecture](./0008-tiered-e2e-ci.md)                                                    | accepted   |
+| 0009 | [AI-agent-driven validation — tiers × safety classes](./0009-ai-agent-driven-validation.md)              | accepted   |
 
 ## Format
 
