@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -121,11 +122,18 @@ func makeCheckRunner(ctx context.Context) validate.CheckRunner {
 			// target. Reach it with: validate --checks bounded-fixture
 			// --safety bounded.
 			return validate.RunBoundedFixture(validate.BoundedFixtureOpts{})
+		case "install-smoke":
+			// The #109 privileged install-smoke: snapshot the install footprint,
+			// run the REAL `agent install`, verify via doctor --json, restore on
+			// failure. Requires --safety privileged --allow-mutate (enforced by
+			// the Runner). The real-machine exercise is deferred to a
+			// ready-for-human slice; the orchestration is the shippable unit.
+			return runInstallSmokeCheck(ctx)
 		default:
 			return validate.CheckResult{
 				Name:  name,
 				State: "fail",
-				Raw:   fmt.Sprintf("unknown check %q (wired checks: doctor, bounded-fixture)", name),
+				Raw:   fmt.Sprintf("unknown check %q (wired checks: doctor, bounded-fixture, install-smoke)", name),
 			}
 		}
 	}
@@ -161,6 +169,60 @@ func runDoctorCheck(ctx context.Context) validate.CheckResult {
 		state = "fail"
 	}
 	return validate.CheckResult{Name: "doctor", State: state, Raw: buf.String()}
+}
+
+// runInstallSmokeCheck wires the REAL install + doctor-verify into the #109
+// install-smoke orchestration. The footprint is the ADR-0004 install surface
+// (CA pubkey, sshd drop-in, principals dir, system agent.toml). Install runs the
+// real `gatekeeper.Install`; Verify runs doctor in-process and is healthy only
+// when doctor reports zero failing checks. The snapshot/restore + lock are owned
+// by validate.RunInstallSmoke / the Runner.
+//
+// This is the production path; it only fires under `--safety privileged
+// --allow-mutate`. Running it on the operator's own box performs a real install
+// — that real-machine exercise is the deferred ready-for-human slice, not part
+// of AFK CI.
+func runInstallSmokeCheck(ctx context.Context) validate.CheckResult {
+	cfgPath, err := agent.ResolveConfigPath()
+	if err != nil {
+		return validate.CheckResult{Name: "install-smoke", State: "fail", Raw: "resolve config path: " + err.Error()}
+	}
+	cfg, err := agent.LoadConfig(cfgPath)
+	if err != nil {
+		return validate.CheckResult{Name: "install-smoke", State: "fail", Raw: "load agent config: " + err.Error()}
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return validate.CheckResult{Name: "install-smoke", State: "fail", Raw: "resolve executable: " + err.Error()}
+	}
+
+	footprint := []string{
+		cfg.ExpectedPaths.CAPubkey,
+		cfg.ExpectedPaths.SSHDropIn,
+		cfg.ExpectedPaths.PrincipalsDir,
+		agent.SystemConfigPath(),
+	}
+
+	return validate.RunInstallSmoke(validate.InstallSmokeOpts{
+		Footprint: footprint,
+		Install: func() error {
+			return gatekeeper.Install(ctx, cfg, exe)
+		},
+		Verify: func() (bool, string) {
+			results := append(
+				gatekeeper.DoctorResults{
+					gatekeeper.CheckConfigLoadedPath(cfgPath),
+					gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
+				},
+				gatekeeper.Doctor(ctx, cfg)...,
+			)
+			var buf bytes.Buffer
+			_ = writeDoctorJSON(&buf, results, results.ExitCode())
+			// Healthy only when doctor has zero failing checks (exit code != 2).
+			// A warn (exit 1) is tolerated, matching the CI --no-fails gate.
+			return results.ExitCode() != 2, buf.String()
+		},
+	})
 }
 
 // gitCommitDirty returns the current repo commit (short) and whether the tree
