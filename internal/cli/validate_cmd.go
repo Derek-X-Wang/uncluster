@@ -114,11 +114,18 @@ func makeCheckRunner(ctx context.Context) validate.CheckRunner {
 		switch name {
 		case "doctor":
 			return runDoctorCheck(ctx)
+		case "bounded-fixture":
+			// The #108 bounded-class fixture: writes only to a throwaway temp
+			// scope and self-cleans (zero residue), exercising the mutating-
+			// guardrail machinery (lock + snapshot/restore) on a harmless
+			// target. Reach it with: validate --checks bounded-fixture
+			// --safety bounded.
+			return validate.RunBoundedFixture(validate.BoundedFixtureOpts{})
 		default:
 			return validate.CheckResult{
 				Name:  name,
 				State: "fail",
-				Raw:   fmt.Sprintf("unknown check %q (this skeleton wires only 'doctor')", name),
+				Raw:   fmt.Sprintf("unknown check %q (wired checks: doctor, bounded-fixture)", name),
 			}
 		}
 	}

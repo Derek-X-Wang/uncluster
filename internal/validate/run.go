@@ -48,6 +48,12 @@ type Runner struct {
 	EvidenceRoot   string
 	BreadcrumbPath string
 
+	// LockPath is the validation lockfile (default alongside the breadcrumb).
+	// A mutating run (any safety class that writes — bounded and above) acquires
+	// it so two runs cannot mutate the same machine concurrently; inspect runs
+	// are read-only and take no lock.
+	LockPath string
+
 	// Check runs a single check (injectable). Commit returns the current repo
 	// commit + dirty flag for the breadcrumb (injectable).
 	Check  CheckRunner
@@ -102,6 +108,25 @@ func (r *Runner) Run() (Result, error) {
 	if err := CheckSafetyAllowed(r.Safety, r.AllowMutate, r.AllowReboot); err != nil {
 		return Result{}, err
 	}
+
+	// A mutating run (anything that writes — bounded and above) holds the
+	// validation lock for its whole duration so two runs cannot mutate the same
+	// machine concurrently (#108). Inspect is read-only and needs no lock.
+	if r.Safety != SafetyInspect {
+		lockPath := r.LockPath
+		if lockPath == "" {
+			var err error
+			if lockPath, err = DefaultLockPath(); err != nil {
+				return Result{}, err
+			}
+		}
+		lk, err := AcquireLock(lockPath)
+		if err != nil {
+			return Result{}, err // ErrLocked when another mutating run holds it
+		}
+		defer lk.Release()
+	}
+
 	now := time.Now
 	if r.Now != nil {
 		now = r.Now
