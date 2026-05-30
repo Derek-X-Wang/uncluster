@@ -47,6 +47,8 @@ jobs:
         run: bash test/e2e/scripts/test-collect-artifacts.sh
       - name: verify failure-taxonomy classifier (intentional-fail tests)
         run: bash scripts/ci/test-classify-step.sh
+      - name: verify doctor-json health asserter (#104 intentional-fail tests)
+        run: bash scripts/ci/test-assert-doctor-json.sh
       - name: run T1a smoke
         id: smoke
         continue-on-error: true
@@ -242,32 +244,33 @@ jobs:
 
       - name: product:assert-doctor
         id: assert-doctor
+        # #104: doctor --json is the single source of truth for "healthy".
+        # Capture it once (the asserts below select specific checks from this
+        # same file) and gate on zero failing checks. doctor now performs the
+        # owner/group/mode + config-ownership checks CI used to re-implement in
+        # bash, so a health regression shows up identically here and in doctor.
         run: |
           set -euo pipefail
-          sudo uncluster agent doctor
+          sudo uncluster agent doctor --json | tee /tmp/doctor.json
+          scripts/ci/assert-doctor-json.sh --no-fails < /tmp/doctor.json
 
       - name: product:assert-sshd-drop-in
         id: assert-drop-in
+        # #104: assert via doctor's sshd/config_drop_in check (which verifies
+        # the drop-in exists AND carries TrustedUserCAKeys + AuthorizedPrincipals
+        # File) instead of re-grepping the file in bash.
         run: |
           set -euo pipefail
-          test -f /etc/ssh/sshd_config.d/uncluster.conf
-          sudo grep -q 'TrustedUserCAKeys' /etc/ssh/sshd_config.d/uncluster.conf
-          sudo grep -q 'AuthorizedPrincipalsFile' /etc/ssh/sshd_config.d/uncluster.conf
+          scripts/ci/assert-doctor-json.sh --ok sshd/config_drop_in < /tmp/doctor.json
 
       - name: product:assert-principals-dir-perms
         id: assert-perms
+        # #104: doctor's principals/dir_writable check now asserts owner=root,
+        # group=<service account>, group-writable mode — the exact properties
+        # this step used to stat in bash. Parse it instead of re-implementing.
         run: |
           set -euo pipefail
-          # Owner root, group uncluster, mode 0775 per install_unix.go.
-          stat -c '%U:%G %a' /etc/ssh/auth_principals
-          owner="$(stat -c '%U' /etc/ssh/auth_principals)"
-          group="$(stat -c '%G' /etc/ssh/auth_principals)"
-          mode="$(stat -c '%a' /etc/ssh/auth_principals)"
-          if [[ "${owner}" != "root" || "${group}" != "uncluster" || "${mode}" != "775" ]]; then
-              echo "principals dir perms wrong: ${owner}:${group} ${mode}"
-              ls -la /etc/ssh/auth_principals
-              exit 1
-          fi
+          scripts/ci/assert-doctor-json.sh --ok principals/dir_writable < /tmp/doctor.json
 
       - name: product:deprovision-and-marker
         id: deprov
@@ -521,30 +524,34 @@ jobs:
 
       - name: product:assert-doctor
         id: assert-doctor
+        # #104: doctor --json is the single source of truth for "healthy".
+        # Capture it to a workspace file (PowerShell) so the bash-based
+        # assert-doctor-json.sh — the SAME helper t2-linux uses — can parse it.
+        # doctor's Windows checks are now non-mutating (the principals-dir probe
+        # reads the DACL instead of write-probing a temp file) per the inspect
+        # contract, and the principals/dir_writable + config/ownership checks
+        # replace the inline icacls grep below.
         run: |
-          & C:\uncluster\uncluster.exe agent doctor
+          & C:\uncluster\uncluster.exe agent doctor --json | Tee-Object -FilePath doctor.json
+          # exit 0 = all checks ok; non-zero = a warn/fail check exists. The
+          # specific-check asserts below (bash, via the shared
+          # assert-doctor-json.sh) confirm the properties CI used to grep for.
           if ($LASTEXITCODE -ne 0) { throw "doctor exit=$LASTEXITCODE" }
 
       - name: product:assert-sshd-drop-in
         id: assert-drop-in
-        run: |
-          $p = 'C:\ProgramData\ssh\sshd_config.d\uncluster.conf'
-          if (-not (Test-Path $p)) { throw "drop-in not found at $p" }
-          $content = Get-Content $p -Raw
-          if ($content -notmatch 'TrustedUserCAKeys') { throw "missing TrustedUserCAKeys" }
-          if ($content -notmatch 'AuthorizedPrincipalsFile') { throw "missing AuthorizedPrincipalsFile" }
+        # #104: assert via doctor's sshd/config_drop_in check instead of
+        # re-grepping the drop-in file in PowerShell.
+        shell: bash
+        run: scripts/ci/assert-doctor-json.sh --ok sshd/config_drop_in < doctor.json
 
       - name: product:assert-principals-acl
         id: assert-acl
-        run: |
-          $dir = 'C:\ProgramData\ssh\auth_principals'
-          if (-not (Test-Path $dir)) { throw "principals dir not found at $dir" }
-          $acl = icacls $dir 2>&1 | Out-String
-          Write-Host $acl
-          # Expect an entry granting UnclusterAgent virtual account write.
-          if ($acl -notmatch 'UnclusterAgent') {
-              throw "principals dir ACL missing UnclusterAgent virtual account"
-          }
+        # #104: doctor's principals/dir_writable check now reads the DACL and
+        # confirms NT SERVICE\UnclusterAgent has write — the exact grant this
+        # step used to grep `icacls` output for. Parse doctor instead.
+        shell: bash
+        run: scripts/ci/assert-doctor-json.sh --ok principals/dir_writable < doctor.json
 
       - name: product:deprovision-and-marker
         id: deprov
@@ -957,10 +964,15 @@ jobs:
         # doctor would otherwise check (sshd drop-in, service account/group,
         # config ownership) are independently asserted in the always-green
         # assert-sshd-drop-in + assert-service-user-and-group steps below.
+        #
+        # #104: parse `doctor --json` via the shared assert-doctor-json.sh (the
+        # same helper t2-linux/t2-windows use) instead of relying on the bare
+        # exit code, so a health regression surfaces identically across OSes.
         if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space == 'true' && steps.assert-svc.outputs.agent_started == 'true'
         run: |
           set -euo pipefail
-          sudo uncluster agent doctor
+          sudo uncluster agent doctor --json | tee /tmp/doctor.json
+          scripts/ci/assert-doctor-json.sh --no-fails < /tmp/doctor.json
 
       - name: product:assert-sshd-drop-in
         id: assert-drop-in

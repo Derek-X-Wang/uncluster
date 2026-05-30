@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -63,7 +64,10 @@ func RunAgent(ctx context.Context, stderrW io.Writer) error {
 				// operator can confirm via the agent's heartbeat
 				// that the service is reading the system path,
 				// not silently falling back to a stale per-user
-				// copy.
+				// copy. DoctorResults.HealthChecks is the SINGLE
+				// doctor → wire-shape mapping (#104) — the same one
+				// `agent doctor --json` uses — so the heartbeat and
+				// doctor never drift.
 				results := append(
 					gatekeeper.DoctorResults{
 						gatekeeper.CheckConfigLoadedPath(p),
@@ -71,24 +75,7 @@ func RunAgent(ctx context.Context, stderrW io.Writer) error {
 					},
 					gatekeeper.Doctor(ctx, cfg)...,
 				)
-				checks := make([]api.AgentHealthCheck, 0, len(results))
-				for _, r := range results {
-					hc := api.AgentHealthCheck{
-						Component: gatekeeperComponent(r.Name),
-						Check:     gatekeeperCheck(r.Name),
-						State:     gatekeeperState(r.Status),
-					}
-					// Always include the message for informational
-					// checks (config-loaded-path, update-host-allowlist)
-					// because the message IS the payload — the OK
-					// status alone tells the operator nothing useful.
-					if r.Message != "" && (r.Informational || r.Status != gatekeeper.CheckOK) {
-						msg := r.Message
-						hc.Message = &msg
-					}
-					checks = append(checks, hc)
-				}
-				return checks
+				return results.HealthChecks()
 			},
 		)
 	// Refuse to start if a .deprovisioned marker exists next to
@@ -215,9 +202,19 @@ Re-running is safe — install is idempotent and self-heals drift.`,
 }
 
 func newAgentDoctorCmd() *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check gatekeeper configuration state (no mutations). Exit 0=ok, 1=warn, 2=fail.",
+		Long: `Runs the gatekeeper health checks and reports each one. Performs ZERO
+filesystem mutations on every platform — it only reads (stat, file reads,
+read-only service queries), so it is safe to invoke automatically (the
+ADR-0009 inspect contract).
+
+With --json, emits the structured check set (the same api.AgentHealthCheck
+shape the agent reports on its heartbeat) so CI, the validate skill, and
+dogfood all parse ONE definition of "healthy". Exit code is still 0=ok,
+1=warn, 2=fail in both modes.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Doctor reads — prefer the system path so a post-install run
 			// reflects what the service sees.
@@ -241,24 +238,78 @@ func newAgentDoctorCmd() *cobra.Command {
 				gatekeeper.Doctor(cmd.Context(), cfg)...,
 			)
 
-			statusLabel := map[gatekeeper.CheckStatus]string{
-				gatekeeper.CheckOK:   "ok  ",
-				gatekeeper.CheckWarn: "warn",
-				gatekeeper.CheckFail: "FAIL",
-			}
-			for _, r := range results {
-				fmt.Fprintf(cmd.OutOrStdout(), "[%s] %-30s %s\n", statusLabel[r.Status], r.Name, r.Message)
+			code := results.ExitCode()
+
+			if jsonOut {
+				if err := writeDoctorJSON(cmd.OutOrStdout(), results, code); err != nil {
+					return err
+				}
+			} else {
+				statusLabel := map[gatekeeper.CheckStatus]string{
+					gatekeeper.CheckOK:   "ok  ",
+					gatekeeper.CheckWarn: "warn",
+					gatekeeper.CheckFail: "FAIL",
+				}
+				for _, r := range results {
+					fmt.Fprintf(cmd.OutOrStdout(), "[%s] %-30s %s\n", statusLabel[r.Status], r.Name, r.Message)
+				}
 			}
 
-			code := results.ExitCode()
 			if code != 0 {
 				// Return a typed error so cobra prints nothing extra but os.Exit
 				// still gets the right code via the root command's exit handler.
+				// In --json mode the JSON has already been written to stdout, so
+				// the structured output AND the exit code both reach the caller.
 				return &exitCodeError{code: code}
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit structured health checks as JSON (single source of truth shape)")
+	return cmd
+}
+
+// doctorJSON is the documented schema for `uncluster agent doctor --json`.
+// The future validate skill and CI parse this exact shape. `checks` is the
+// wire-identical api.AgentHealthCheck slice the agent reports on its heartbeat;
+// `exit_code` mirrors the process exit (0=ok, 1=warn, 2=fail) so a JSON
+// consumer need not re-derive the rollup; `summary` gives per-state counts for
+// terse assertions.
+type doctorJSON struct {
+	Checks   []api.AgentHealthCheck `json:"checks"`
+	ExitCode int                    `json:"exit_code"`
+	Summary  doctorSummary          `json:"summary"`
+}
+
+type doctorSummary struct {
+	OK   int `json:"ok"`
+	Warn int `json:"warn"`
+	Fail int `json:"fail"`
+}
+
+// writeDoctorJSON renders the doctor results as the documented doctorJSON
+// schema. Extracted so it is unit-testable without a live config/sshd host.
+func writeDoctorJSON(w io.Writer, results gatekeeper.DoctorResults, exitCode int) error {
+	out := doctorJSON{
+		Checks:   results.HealthChecks(),
+		ExitCode: exitCode,
+	}
+	for _, r := range results {
+		switch r.Status {
+		case gatekeeper.CheckOK:
+			out.Summary.OK++
+		case gatekeeper.CheckWarn:
+			out.Summary.Warn++
+		case gatekeeper.CheckFail:
+			out.Summary.Fail++
+		}
+	}
+	b, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal doctor json: %w", err)
+	}
+	_, err = fmt.Fprintln(w, string(b))
+	return err
 }
 
 func newAgentJoinCmd() *cobra.Command {
@@ -338,71 +389,6 @@ is self-healing.`,
 	join.Flags().BoolVar(&tokenStdin, "token-stdin", false, "read join token from stdin (first line); alternatively set UNCLUSTER_TOKEN")
 
 	return join
-}
-
-// gatekeeperComponent maps a doctor check name to the component field for
-// the V2 heartbeat health shape.
-func gatekeeperComponent(name string) string {
-	switch name {
-	case "sshd-binary", "sshd-running", "sshd-drop-in", "sshd-effective-config", "macos-include":
-		return "sshd"
-	case "ca-pubkey":
-		return "ca_pubkey"
-	case "principals-dir":
-		return "principals"
-	case "service-account":
-		return "service_account"
-	case "service-running":
-		return "service"
-	case "config-loaded-path":
-		return "config"
-	case "update-host-allowlist":
-		return "selfupdate"
-	default:
-		return name
-	}
-}
-
-// gatekeeperCheck maps a doctor check name to the check field.
-func gatekeeperCheck(name string) string {
-	switch name {
-	case "sshd-binary":
-		return "installed"
-	case "sshd-running", "service-running":
-		return "running"
-	case "sshd-drop-in":
-		return "config_drop_in"
-	case "sshd-effective-config":
-		return "effective_config"
-	case "ca-pubkey":
-		return "present"
-	case "principals-dir":
-		return "dir_writable"
-	case "service-account":
-		return "exists"
-	case "macos-include":
-		return "include_directive"
-	case "config-loaded-path":
-		return "loaded_path"
-	case "update-host-allowlist":
-		return "host_allowlist"
-	default:
-		return name
-	}
-}
-
-// gatekeeperState maps a doctor CheckStatus to the state string.
-func gatekeeperState(s gatekeeper.CheckStatus) string {
-	switch s {
-	case gatekeeper.CheckOK:
-		return "ok"
-	case gatekeeper.CheckWarn:
-		return "warn"
-	case gatekeeper.CheckFail:
-		return "fail"
-	default:
-		return "unknown"
-	}
 }
 
 // exitCodeError is a sentinel that carries a non-zero exit code without

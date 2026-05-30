@@ -16,8 +16,11 @@ import (
 
 // Doctor runs all gatekeeper checks without making mutations and returns
 // results. The slice is ordered: sshd → ca pubkey → drop-in → include →
-// principals dir → service account → service group → service running →
-// sshd config loaded.
+// principals dir → service account → service group → config ownership →
+// service running → sshd config loaded.
+//
+// Doctor is strictly side-effect-free (the ADR-0009 `inspect` contract): every
+// check reads (os.Stat, exec read-only queries, file reads) — none writes.
 func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 	paths := cfg.ExpectedPaths
 	var results DoctorResults
@@ -39,8 +42,18 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 		results = append(results, checkMacOSInclude())
 	}
 
-	// 6. Principals directory.
-	results = append(results, checkPrincipalsDir(paths))
+	// Resolve the service-account group once and share it across the
+	// principals-dir and config-ownership checks (both grade against it). An
+	// empty result means the group record is absent — checkServiceGroup
+	// surfaces that as its own fail, so the owner/group/mode checks degrade to
+	// owner+mode-only rather than double-reporting the missing group.
+	wantGroup := lookupServiceGroupName()
+
+	// 6. Principals directory: existence + owner/group/mode (#104). CI
+	// asserted owner=root group=<service account> mode group-writable inline;
+	// bringing it here makes doctor the strong source of truth, not a weaker
+	// signal than CI.
+	results = append(results, checkPrincipalsDirPerms(paths.PrincipalsDir, wantGroup))
 
 	// 7. Service account.
 	results = append(results, checkServiceAccount())
@@ -49,6 +62,13 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 	// separately from the user; an absent group silently disables the
 	// config-ownership ACL grant, so it gets its own legible check.
 	results = append(results, checkServiceGroup())
+
+	// 7b. System config ownership (#104). The macOS t2 job asserted
+	// /etc/uncluster/agent.toml is root:<service account> 0640 inline; without
+	// that ownership the low-priv service account cannot read its config and
+	// the service fails to start (#96). Absent file → warn (doctor may run
+	// pre-install), wrong ownership/mode → fail.
+	results = append(results, checkConfigOwnership(agent.SystemConfigPath(), wantGroup))
 
 	// 8. Service running.
 	results = append(results, checkServiceRunning())
@@ -134,20 +154,6 @@ func checkMacOSInclude() CheckResult {
 	}
 	return CheckResult{Name: "macos-include", Status: CheckWarn,
 		Message: "Include /etc/ssh/sshd_config.d/* missing from sshd_config (run install to add)"}
-}
-
-func checkPrincipalsDir(paths agent.ExpectedPaths) CheckResult {
-	info, err := os.Stat(paths.PrincipalsDir)
-	if err != nil {
-		return CheckResult{Name: "principals-dir", Status: CheckFail,
-			Message: fmt.Sprintf("missing %s: %v", paths.PrincipalsDir, err)}
-	}
-	if !info.IsDir() {
-		return CheckResult{Name: "principals-dir", Status: CheckFail,
-			Message: fmt.Sprintf("%s exists but is not a directory", paths.PrincipalsDir)}
-	}
-	return CheckResult{Name: "principals-dir", Status: CheckOK,
-		Message: fmt.Sprintf("principals dir ok at %s", paths.PrincipalsDir)}
 }
 
 func checkServiceAccount() CheckResult {
