@@ -284,10 +284,12 @@ jobs:
           # Marker lands next to whichever agent.toml the service process
           # actually loaded from. Post-#77 fix the service reads from
           # /etc/uncluster/agent.toml so the marker lands at
-          # /etc/uncluster/.deprovisioned. Allow up to 15s for the agent
-          # to heartbeat, see 410, wipe, write the marker, and exit.
+          # /etc/uncluster/.deprovisioned. Budget = 30s: the Unix wipe is an
+          # instant in-process os.Remove, so the only latency is the agent
+          # heartbeat catching the 410 (interval <=10s). 30s clears that tail
+          # comfortably (the Windows path needs more — see that job).
           marker="/etc/uncluster/.deprovisioned"
-          for _ in $(seq 1 15); do
+          for _ in $(seq 1 30); do
               if sudo test -f "${marker}"; then
                   echo "marker present at ${marker}"
                   break
@@ -563,8 +565,18 @@ jobs:
           Invoke-RestMethod -Method Delete -Uri http://127.0.0.1:17777/v1/agents/ci-agent -Headers $headers | Out-Null
           # Post-#77 fix the service loads agent.toml from the system path,
           # so the marker lands at $env:PROGRAMDATA\uncluster\.deprovisioned.
+          #
+          # Budget = 60s (was 15s, which flaked — #127). Unlike Unix, the
+          # Windows wipe is an async round-trip to the LocalSystem
+          # principals-writer (ADR-0004 role-split): onRevoked submits an empty
+          # desired-state and blocks up to applyTimeout=30s for the writer's
+          # applied-status, THEN writes the marker. So worst-case marker latency
+          # after this DELETE is heartbeat-interval (<=10s) + writer round-trip
+          # (<=30s) ~= 40s. 60s clears that tail with margin. The marker still
+          # implies "principals wiped" (wipe precedes the marker), so once the
+          # marker appears the empty-dir assert below is deterministic.
           $marker = (Join-Path $env:PROGRAMDATA 'uncluster\.deprovisioned')
-          $deadline = (Get-Date).AddSeconds(15)
+          $deadline = (Get-Date).AddSeconds(60)
           $found = $false
           while ((Get-Date) -lt $deadline) {
               if (Test-Path $marker) { $found = $true; break }
