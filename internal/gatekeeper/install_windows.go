@@ -3,13 +3,31 @@
 package gatekeeper
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
 )
+
+// windowsBaseSSHDConfig is the stock Win32-OpenSSH base config that the
+// drop-in (sshd_config.d\uncluster.conf) is only honored through if it is
+// Included. Win32-OpenSSH ships this file WITHOUT any Include directive
+// (verified against openssh-portable contrib/win32/openssh/sshd_config), so
+// on a stock host the drop-in is never read and cert login can never work.
+const windowsBaseSSHDConfig = `C:\ProgramData\ssh\sshd_config`
+
+// windowsIncludeLine is appended to the base sshd_config when no covering
+// Include is found. Forward slashes work on Win32-OpenSSH and avoid any
+// backslash-escaping ambiguity in the config grammar.
+const windowsIncludeLine = "Include __PROGRAMDATA__/ssh/sshd_config.d/*"
+
+// dropInIncludeMarker tags the line we append so re-installs can recognise
+// (and never duplicate) our own edit.
+const dropInIncludeMarker = "# Added by uncluster agent install"
 
 // windowsPaths holds the canonical Windows paths for all SSH-related files
 // managed by the Uncluster gatekeeper.
@@ -52,6 +70,15 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 	// 3. Write sshd drop-in.
 	if err := writeSSHDropIn(paths); err != nil {
 		return fmt.Errorf("write sshd drop-in: %w", err)
+	}
+
+	// 3a. Ensure the base sshd_config Includes the drop-in dir. Win32-OpenSSH's
+	// stock sshd_config has NO Include directive, so without this the drop-in
+	// written in step 3 (TrustedUserCAKeys + AuthorizedPrincipalsFile) is never
+	// read and cert login can never succeed (#126). The existing sshd restart
+	// in step 9 picks up the edit. Mirrors ensureMacOSInclude on the Unix path.
+	if err := ensureWindowsInclude(); err != nil {
+		return fmt.Errorf("windows sshd_config include: %w", err)
 	}
 
 	// 4. Create principals directory.
@@ -198,6 +225,77 @@ func grantPrincipalsAccessWindows(dir string) error {
 		return fmt.Errorf("icacls grant: %w\noutput: %s", err, string(out))
 	}
 	return nil
+}
+
+// ensureWindowsInclude ensures the stock base sshd_config Includes the
+// sshd_config.d drop-in directory. It is the Windows analog of
+// ensureMacOSInclude. Idempotent — never double-appends.
+func ensureWindowsInclude() error {
+	return ensureWindowsIncludeAt(windowsBaseSSHDConfig)
+}
+
+// ensureWindowsIncludeAt reads the base config at path; if it lacks a covering
+// drop-in Include directive, it appends windowsIncludeLine (tagged with
+// dropInIncludeMarker). A missing base config is tolerated (not an error) — on
+// such a host sshd_config.d may still be honored, and failing install here
+// would be worse than a no-op. Pure detection lives in
+// sshdConfigHasDropInInclude so the matrix can unit-test it.
+func ensureWindowsIncludeAt(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Base config absent — nothing to patch. sshd_config.d may still
+			// be honored implicitly; do not fail the install.
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if sshdConfigHasDropInInclude(string(b)) {
+		return nil // already covered — idempotent
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open %s for append: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "\n%s\n%s\n", dropInIncludeMarker, windowsIncludeLine); err != nil {
+		return fmt.Errorf("append include to %s: %w", path, err)
+	}
+	return nil
+}
+
+// sshdConfigHasDropInInclude reports whether the given sshd_config content
+// already carries an uncommented `Include` directive that pulls in the
+// sshd_config.d drop-in directory. Matching is:
+//   - case-insensitive on the `Include` keyword (sshd treats it so);
+//   - tolerant of both `\` and `/` path separators;
+//   - blind to whether the include ends in a glob (`*`) — a bare directory
+//     include still pulls in the drop-in files;
+//   - skips commented (`#`-prefixed) lines.
+//
+// It looks for the literal `sshd_config.d` path component (normalised to
+// forward slashes) so an Include of some unrelated file does not match.
+func sshdConfigHasDropInInclude(content string) bool {
+	sc := bufio.NewScanner(strings.NewReader(content))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if !strings.EqualFold(fields[0], "Include") {
+			continue
+		}
+		// Normalise the remainder's separators and look for the drop-in dir.
+		rest := strings.ToLower(strings.ReplaceAll(line, `\`, "/"))
+		if strings.Contains(rest, "sshd_config.d") {
+			return true
+		}
+	}
+	return false
 }
 
 // installService installs the Windows SCM service.
