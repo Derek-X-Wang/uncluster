@@ -5,14 +5,53 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/windows/svc"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
 	"github.com/derek-x-wang/uncluster/internal/cli"
 )
+
+// scmErrorLogName is the diagnostic log the agent writes its stderr to when
+// running under SCM. It lives in the same C:\ProgramData\uncluster tree as
+// agent.toml so all Windows agent state sits together.
+const scmErrorLogName = "agent.err.log"
+
+// scmErrorLogPath returns the SCM stderr-log path, derived from the same
+// ProgramData base as the system config (honoring the PROGRAMDATA env override
+// agent.SystemConfigPath() uses) — i.e. C:\ProgramData\uncluster\agent.err.log.
+func scmErrorLogPath() string {
+	return filepath.Join(filepath.Dir(agent.SystemConfigPath()), scmErrorLogName)
+}
+
+// openSCMErrorLog opens (append, create) the SCM stderr log and returns it as
+// an io.WriteCloser. Under SCM, os.Stderr is wired to NUL, so a RunAgent error
+// (config-read failure, unreadable agent.toml, any startup death) would be
+// invisible — the #101 lesson made worse on Windows where there isn't even a
+// console to read (#128). Redirecting to a real file makes those failures
+// diagnosable.
+//
+// On success it also locks down the log's ACL (SYSTEM + Administrators full,
+// agent service account write) best-effort — a failure to tighten the ACL is
+// logged but never blocks the agent from starting, since visibility of errors
+// is the whole point and a slightly-loose diagnostic log is better than none.
+func openSCMErrorLog(path string) (io.WriteCloser, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	if aclErr := restrictErrorLogACL(path); aclErr != nil {
+		slog.Warn("agent: could not tighten SCM error-log ACL", "path", path, "error", aclErr)
+	}
+	return f, nil
+}
 
 // runAsWindowsService detects whether the binary is running under the
 // Windows Service Control Manager. If so — and only if argv indicates
@@ -111,16 +150,28 @@ func (s *agentService) Execute(args []string, r <-chan svc.ChangeRequest, status
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Under SCM, os.Stderr is wired to NUL — any RunAgent diagnostic (config
+	// read failure, unreadable agent.toml, startup death) would vanish (#128).
+	// Redirect to C:\ProgramData\uncluster\agent.err.log so failures are
+	// visible. If the log can't be opened, fall back to os.Stderr (no worse
+	// than before) rather than refusing to start.
+	var stderrW io.Writer = os.Stderr
+	logPath := scmErrorLogPath()
+	if lf, err := openSCMErrorLog(logPath); err != nil {
+		slog.Error("agent: could not open SCM error log; falling back to NUL stderr",
+			"path", logPath, "error", err)
+	} else {
+		stderrW = lf
+		defer lf.Close()
+	}
+
 	// runErr is written exactly once, when RunAgent returns, then closed.
 	// Buffered so the goroutine cannot block if Execute has already
 	// returned (shouldn't happen, but defensive against SCM oddities).
 	runErr := make(chan error, 1)
 	go func() {
 		defer close(runErr)
-		// RunAgent's stderr destination is os.Stderr here. Under SCM,
-		// stdio is wired to NUL by default — operators should look at
-		// the Application Event Log or the agent's heartbeat for state.
-		runErr <- cli.RunAgent(ctx, os.Stderr)
+		runErr <- cli.RunAgent(ctx, stderrW)
 	}()
 
 	status <- svc.Status{State: svc.Running, Accepts: acceptedControls}
