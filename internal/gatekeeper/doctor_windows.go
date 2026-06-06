@@ -64,17 +64,26 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 		})
 	}
 
-	// 5. Principals dir exists, is a directory, and grants the service
-	// account write access — verified by READING the DACL (non-mutating).
-	// The prior implementation write-probed by creating + removing a temp
-	// file, which violates the ADR-0009 `inspect` contract that lets the
-	// auto-invoke hook run `doctor`. CI asserted the grant by grepping
-	// `icacls` for "UnclusterAgent" (#104).
+	// 5. Principals dir is locked down for the #127 role-split: it exists, is a
+	// directory, and the low-priv `NT SERVICE\UnclusterAgent` account holds NO
+	// write grant (INVERTED from pre-#127 — an agent write grant inherits onto
+	// the per-user files and makes Win32-OpenSSH silently ignore them). Verified
+	// by READING the DACL (non-mutating, ADR-0009 inspect contract).
 	pDir := paths.PrincipalsDir
 	if pDir == "" {
 		pDir = windowsPaths.PrincipalsDir
 	}
 	results = append(results, checkPrincipalsACLWindows(pDir))
+
+	// 5a. Per-user principals files carry a safe owner/DACL (owned by
+	// SYSTEM/Administrators, no write-class ACE for any other principal). A file
+	// failing this is silently ignored by sshd, denying login even with the
+	// right principal present (#127). Non-mutating: reads owner + DACL.
+	results = append(results, checkPerUserPrincipalsFilesWindows(pDir))
+
+	// 5b. The agent↔writer spool dir exists and the agent can submit
+	// desired-state to it (#127).
+	results = append(results, checkSpoolACLWindows(agent.SpoolDir()))
 
 	// 6. UnclusterAgent service installed.
 	svcOut, svcErr := exec.Command("sc.exe", "query", agent.WindowsServiceName).CombinedOutput()
@@ -95,6 +104,11 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 			})
 		}
 	}
+
+	// 7a. UnclusterPrincipalsWriter (LocalSystem) service installed and running
+	// — the only identity that writes principals files in the #127 role-split.
+	// Its absence breaks policy apply. Non-mutating: read-only `sc query`.
+	results = append(results, checkWriterServiceWindows())
 
 	// 8. System config ownership (#104). The Unix doctor checks the system
 	// agent.toml is owned root:<service account> 0640 (readable by the service

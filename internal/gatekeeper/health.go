@@ -39,8 +39,10 @@ func healthComponent(name string) string {
 		return "sshd"
 	case "ca-pubkey":
 		return "ca_pubkey"
-	case "principals-dir":
+	case "principals-dir", "principals-file-acl", "spool-dir":
 		return "principals"
+	case "writer-service":
+		return "writer_service"
 	case "service-account":
 		return "service_account"
 	case "service-group":
@@ -71,6 +73,12 @@ func healthCheckField(name string) string {
 		return "present"
 	case "principals-dir":
 		return "dir_writable"
+	case "principals-file-acl":
+		return "file_acl"
+	case "spool-dir":
+		return "spool_acl"
+	case "writer-service":
+		return "running"
 	case "service-account":
 		return "exists"
 	case "service-group":

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,12 @@ func TestServerClient_Do_Returns401AsErrUnauthorized(t *testing.T) {
 // TestOnRevoked_WipesPrincipals verifies that onRevoked() removes all files
 // from the principals directory.
 func TestOnRevoked_WipesPrincipals(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// On Windows the wipe routes through the LocalSystem writer (#127); with
+		// no writer running it waits out its deadline and the files persist. The
+		// Windows wipe is covered by TestWindowsApplyHandoff_RoundTrip.
+		t.Skip("Windows wipe needs a running writer; see TestWindowsApplyHandoff_RoundTrip")
+	}
 	// Use two distinct dirs to model the real install layout (#46): config
 	// dir holds agent.toml + the .deprovisioned marker; principals dir lives
 	// in /etc/ssh/auth_principals. Pre-fix the marker was incorrectly
@@ -142,6 +149,11 @@ func TestOnRevoked_WritesDeprovisionedMarker(t *testing.T) {
 // TestCheckFailClosed_WipesWhenElapsed verifies that checkFailClosed applies
 // an empty policy when fail_closed_after has elapsed.
 func TestCheckFailClosed_WipesWhenElapsed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Fail-closed wipes via the empty-policy apply path, which on Windows
+		// routes through the LocalSystem writer (#127); no writer runs here.
+		t.Skip("Windows wipe needs a running writer; see TestWindowsApplyHandoff_RoundTrip")
+	}
 	dir := t.TempDir()
 	// Write a principal file so we can verify it gets wiped.
 	if err := os.WriteFile(filepath.Join(dir, "alice"), []byte("caller_123\n"), 0o600); err != nil {

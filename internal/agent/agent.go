@@ -227,18 +227,16 @@ func (a *Agent) checkFailClosed() {
 // onRevoked handles explicit deprovision (410 Gone). Wipes principals,
 // writes .deprovisioned marker, returns ErrDeprovisioned so Run() exits
 // with an error that supervisors can distinguish.
+//
+// The wipe goes through the platform apply path (wipePrincipals), NOT a direct
+// os.Remove: on Windows the agent account holds NO delete permission on the
+// SYSTEM-owned principals files (#127 role-split), so it must submit an empty
+// desired-state to the LocalSystem writer, which renders an empty dir. On Unix
+// wipePrincipals removes the files in-process (byte-identical to the old path).
 func (a *Agent) onRevoked() error {
 	principalsDir := a.cfg.ExpectedPaths.PrincipalsDir
 	if principalsDir != "" {
-		// Remove all principal files in the dir.
-		entries, err := os.ReadDir(principalsDir)
-		if err == nil {
-			for _, e := range entries {
-				if !e.IsDir() {
-					_ = os.Remove(filepath.Join(principalsDir, e.Name()))
-				}
-			}
-		}
+		a.wipePrincipals(principalsDir)
 	}
 	// Write .deprovisioned marker NEXT TO agent.toml so the supervisor sees
 	// it on next start (#46). Pre-fix the marker was derived from

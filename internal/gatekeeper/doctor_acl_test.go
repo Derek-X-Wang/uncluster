@@ -5,50 +5,114 @@ import (
 	"testing"
 )
 
-// TestPrincipalsACLResult covers the pure ACL-grant mapping for the Windows
-// principals-dir doctor check (#104). The Windows install grants the
-// `NT SERVICE\UnclusterAgent` virtual account write access via icacls; CI
-// asserted that grant by grepping `icacls` output for "UnclusterAgent"
-// (`assert-principals-acl`). doctor now reads the DACL directly (non-mutating,
-// per the ADR-0009 inspect contract — replacing the old write-probe that
-// created+removed a temp file) and grades the grant. The Win32 DACL read +
-// ACE enumeration is integration-only; this exercises the OK/Fail mapping
-// deterministically so the contract is testable on every platform.
+// TestPrincipalsDirACLResult covers the pure ACL mapping for the INVERTED
+// Windows principals-dir doctor check (#127 role-split). The check name and wire
+// shape are unchanged (`principals-dir` → `principals/dir_writable`, the name CI
+// asserts `--ok`), but the meaning is inverted: a healthy install is one where
+// the low-priv `NT SERVICE\UnclusterAgent` account holds NO write grant on the
+// dir. An agent write grant inherits onto the per-user files and makes
+// Win32-OpenSSH silently ignore them, so it is now a FAILURE.
 //
 // Lives in a non-tagged file (no //go:build windows) because the mapper takes
 // plain bool/string inputs and references no windows.* types — so the matrix
 // build verifies it and the host runs it.
-func TestPrincipalsACLResult(t *testing.T) {
+func TestPrincipalsDirACLResult(t *testing.T) {
 	const dir = `C:\ProgramData\ssh\auth_principals`
 
-	t.Run("ok_when_service_account_granted_write", func(t *testing.T) {
-		got := principalsACLResult(dir, true, true)
+	t.Run("ok_when_agent_has_no_write", func(t *testing.T) {
+		got := principalsDirACLResult(dir, principalsDirACLProbe{dirOK: true, agentSIDResolved: true, agentHasWrite: false})
 		if got.Name != "principals-dir" {
 			t.Errorf("Name = %q, want principals-dir", got.Name)
 		}
 		if got.Status != CheckOK {
-			t.Errorf("Status = %v, want CheckOK (service account has write)", got.Status)
+			t.Errorf("Status = %v, want CheckOK (agent has no write)", got.Status)
 		}
 	})
 
-	t.Run("fail_when_service_account_not_granted", func(t *testing.T) {
-		// SID resolved, but no write-granting ACE — the #83-class regression
-		// where install ran before the virtual account existed.
-		got := principalsACLResult(dir, true, false)
+	t.Run("ok_when_agent_sid_unresolvable", func(t *testing.T) {
+		// SID does not resolve → the agent cannot possibly hold a grant → OK.
+		got := principalsDirACLResult(dir, principalsDirACLProbe{dirOK: true, agentSIDResolved: false})
+		if got.Status != CheckOK {
+			t.Errorf("Status with unresolvable SID = %v, want CheckOK", got.Status)
+		}
+	})
+
+	t.Run("fail_when_agent_holds_write", func(t *testing.T) {
+		// The #127 regression: the agent must NEVER be able to write auth_principals.
+		got := principalsDirACLResult(dir, principalsDirACLProbe{dirOK: true, agentSIDResolved: true, agentHasWrite: true})
 		if got.Status != CheckFail {
-			t.Errorf("Status without write grant = %v, want CheckFail", got.Status)
+			t.Errorf("Status with agent write grant = %v, want CheckFail", got.Status)
 		}
 		if !strings.Contains(got.Message, "UnclusterAgent") {
-			t.Errorf("Message = %q, want it to name the service account", got.Message)
+			t.Errorf("Message = %q, want it to name the agent account", got.Message)
 		}
 	})
 
-	t.Run("fail_when_sid_unresolvable", func(t *testing.T) {
-		// SID cannot be resolved → the service was never registered with SCM,
-		// so the grant cannot exist. Fail (matches CI's hard assert).
-		got := principalsACLResult(dir, false, false)
+	t.Run("fail_when_dir_missing", func(t *testing.T) {
+		got := principalsDirACLResult(dir, principalsDirACLProbe{dirOK: false})
 		if got.Status != CheckFail {
-			t.Errorf("Status with unresolvable SID = %v, want CheckFail", got.Status)
+			t.Errorf("Status with missing dir = %v, want CheckFail", got.Status)
+		}
+	})
+}
+
+// TestWriterServiceResult covers the writer-service presence/run-state mapping.
+func TestWriterServiceResult(t *testing.T) {
+	t.Run("ok_when_installed_and_running", func(t *testing.T) {
+		got := writerServiceResult(true, true)
+		if got.Name != "writer-service" || got.Status != CheckOK {
+			t.Errorf("got %+v, want writer-service CheckOK", got)
+		}
+	})
+	t.Run("fail_when_not_installed", func(t *testing.T) {
+		if got := writerServiceResult(false, false); got.Status != CheckFail {
+			t.Errorf("Status not-installed = %v, want CheckFail", got.Status)
+		}
+	})
+	t.Run("fail_when_installed_not_running", func(t *testing.T) {
+		if got := writerServiceResult(true, false); got.Status != CheckFail {
+			t.Errorf("Status installed-not-running = %v, want CheckFail", got.Status)
+		}
+	})
+}
+
+// TestSpoolACLResult covers the spool-dir mapping.
+func TestSpoolACLResult(t *testing.T) {
+	const dir = `C:\ProgramData\uncluster\spool`
+	t.Run("ok_when_agent_can_write", func(t *testing.T) {
+		got := spoolACLResult(dir, true, true)
+		if got.Name != "spool-dir" || got.Status != CheckOK {
+			t.Errorf("got %+v, want spool-dir CheckOK", got)
+		}
+	})
+	t.Run("fail_when_missing", func(t *testing.T) {
+		if got := spoolACLResult(dir, false, false); got.Status != CheckFail {
+			t.Errorf("Status missing = %v, want CheckFail", got.Status)
+		}
+	})
+	t.Run("fail_when_agent_cannot_write", func(t *testing.T) {
+		if got := spoolACLResult(dir, true, false); got.Status != CheckFail {
+			t.Errorf("Status no-write = %v, want CheckFail", got.Status)
+		}
+	})
+}
+
+// TestPerUserPrincipalsACLResult covers the per-user-file scan mapping.
+func TestPerUserPrincipalsACLResult(t *testing.T) {
+	const dir = `C:\ProgramData\ssh\auth_principals`
+	t.Run("ok_when_no_unsafe_files", func(t *testing.T) {
+		got := perUserPrincipalsACLResult(dir, nil)
+		if got.Name != "principals-file-acl" || got.Status != CheckOK {
+			t.Errorf("got %+v, want principals-file-acl CheckOK", got)
+		}
+	})
+	t.Run("fail_when_unsafe_file_present", func(t *testing.T) {
+		got := perUserPrincipalsACLResult(dir, []string{"derek"})
+		if got.Status != CheckFail {
+			t.Errorf("Status with unsafe file = %v, want CheckFail", got.Status)
+		}
+		if !strings.Contains(got.Message, "derek") {
+			t.Errorf("Message = %q, want it to name the offending file", got.Message)
 		}
 	})
 }

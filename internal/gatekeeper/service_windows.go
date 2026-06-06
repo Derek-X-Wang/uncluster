@@ -29,6 +29,34 @@ func buildService(cfg agent.Config, serviceExe string) (service.Service, error) 
 	return service.New(prg, svcCfg)
 }
 
+// windowsPrincipalsWriterAccount is the LocalSystem account the writer service
+// runs as. Win32-OpenSSH accepts a SYSTEM-owned AuthorizedPrincipalsFile (rule
+// 1), so a LocalSystem-created file needs no SeRestore to satisfy ownership —
+// this is the whole reason the writer is LocalSystem and not the low-priv agent
+// (#127, ADR-0004 Windows amendment). `LocalSystem` is the canonical SCM
+// principal name CreateService maps to S-1-5-18.
+const windowsPrincipalsWriterAccount = "LocalSystem"
+
+// buildPrincipalsWriterService constructs the kardianos/service.Service for the
+// LocalSystem UnclusterPrincipalsWriter (#127). It binds to `<exe>
+// principals-writer run` and runs as LocalSystem. Its excess privileges are
+// stripped post-install via SERVICE_REQUIRED_PRIVILEGES (setWriterRequiredPrivileges)
+// — kardianos has no field for that, so we set it directly with
+// ChangeServiceConfig2. The runtime SCM handshake is owned by
+// cmd/uncluster/principals_writer_windows.go, not this stub program.
+func buildPrincipalsWriterService(serviceExe string) (service.Service, error) {
+	svcCfg := &service.Config{
+		Name:        agent.WindowsPrincipalsWriterServiceName,
+		DisplayName: "Uncluster Principals Writer",
+		Description: "Uncluster LocalSystem writer for AuthorizedPrincipalsFile (privilege-stripped, network-less)",
+		Executable:  serviceExe,
+		Arguments:   []string{"principals-writer", "run"},
+		UserName:    windowsPrincipalsWriterAccount,
+	}
+	prg := &agentSvcProgram{}
+	return service.New(prg, svcCfg)
+}
+
 // agentSvcProgram satisfies service.Interface. On Windows it is only
 // passed to service.New so kardianos can construct the install metadata
 // (it requires a non-nil program even for install-only use). The runtime
