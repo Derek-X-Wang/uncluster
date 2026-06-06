@@ -76,6 +76,17 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 	}
 	results = append(results, checkPrincipalsACLWindows(pDir))
 
+	// 5a. Per-user AuthorizedPrincipalsFile safety (#127). The dir-grant check
+	// above (step 5) only proves the agent can write the DIR — it does NOT
+	// prove the per-user FILES are locked down. Win32-OpenSSH's
+	// auth2-pubkeyfile.c rejects any principals file writable by a
+	// non-admin/non-SYSTEM principal ("bad ownership or modes") and silently
+	// ignores it, so a file inheriting the dir's `NT SERVICE\UnclusterAgent`
+	// Modify ACE breaks login while doctor previously reported healthy. This
+	// check reads each per-user file's DACL (non-mutating) and fails if any
+	// carries a writable ACE outside {SYSTEM, Administrators, UnclusterAgent}.
+	results = append(results, checkPerUserPrincipalsFilesWindows(pDir))
+
 	// 6. UnclusterAgent service installed.
 	svcOut, svcErr := exec.Command("sc.exe", "query", agent.WindowsServiceName).CombinedOutput()
 	if svcErr != nil {

@@ -96,3 +96,58 @@ func TestConfigACLResult(t *testing.T) {
 		}
 	})
 }
+
+// TestPerUserPrincipalsACLResult covers the pure mapping for the new per-user
+// AuthorizedPrincipalsFile safety check (#127). Win32-OpenSSH silently ignores
+// a principals file writable by a non-admin/non-SYSTEM principal, so a file
+// inheriting the dir's `NT SERVICE\UnclusterAgent` Modify ACE breaks login
+// while doctor (pre-#127, dir-grant-only) reported healthy. The mapper grades
+// the scan result: no offenders → OK; any offender → Fail naming the file(s).
+//
+// Lives in the non-tagged test file (no //go:build windows) because the mapper
+// takes plain []string/string and references no windows.* types — the matrix
+// build verifies it and the host runs it.
+func TestPerUserPrincipalsACLResult(t *testing.T) {
+	const dir = `C:\ProgramData\ssh\auth_principals`
+
+	t.Run("ok_when_no_unsafe_files", func(t *testing.T) {
+		got := perUserPrincipalsACLResult(dir, nil)
+		if got.Name != "principals-file-acl" {
+			t.Errorf("Name = %q, want principals-file-acl", got.Name)
+		}
+		if got.Status != CheckOK {
+			t.Errorf("Status with no unsafe files = %v, want CheckOK", got.Status)
+		}
+	})
+
+	t.Run("ok_when_empty_slice", func(t *testing.T) {
+		got := perUserPrincipalsACLResult(dir, []string{})
+		if got.Status != CheckOK {
+			t.Errorf("Status with empty slice = %v, want CheckOK", got.Status)
+		}
+	})
+
+	t.Run("fail_names_single_offender", func(t *testing.T) {
+		got := perUserPrincipalsACLResult(dir, []string{"derek"})
+		if got.Status != CheckFail {
+			t.Errorf("Status with one unsafe file = %v, want CheckFail", got.Status)
+		}
+		if !strings.Contains(got.Message, "derek") {
+			t.Errorf("Message = %q, want it to name the offending file", got.Message)
+		}
+		// The fail message must point the operator at the silent-ignore failure mode.
+		if !strings.Contains(got.Message, "silently ignore") {
+			t.Errorf("Message = %q, want it to explain the sshd silent-ignore behaviour", got.Message)
+		}
+	})
+
+	t.Run("fail_names_all_offenders", func(t *testing.T) {
+		got := perUserPrincipalsACLResult(dir, []string{"derek", "alice"})
+		if got.Status != CheckFail {
+			t.Errorf("Status = %v, want CheckFail", got.Status)
+		}
+		if !strings.Contains(got.Message, "derek") || !strings.Contains(got.Message, "alice") {
+			t.Errorf("Message = %q, want it to name every offending file", got.Message)
+		}
+	})
+}

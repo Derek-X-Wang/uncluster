@@ -1,6 +1,33 @@
 package gatekeeper
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
+
+// perUserPrincipalsACLResult maps the result of scanning the per-user
+// AuthorizedPrincipalsFiles to a CheckResult. `unsafe` lists the names of
+// per-user files that carry a WRITABLE ACE for some principal other than
+// SYSTEM, Administrators, or the agent's service account — the exact thing
+// Win32-OpenSSH's auth2-pubkeyfile.c rejects ("bad ownership or modes"),
+// silently ignoring the file so cert login is denied even with the right
+// principal present (#127). The pre-#127 write path let the per-user file
+// inherit the dir's `NT SERVICE\UnclusterAgent` Modify ACE, so doctor reported
+// healthy while sshd ignored the file. This check closes that blind spot.
+//
+// Empty `unsafe` → OK. Non-empty → Fail naming the offending file(s) so the
+// operator knows which user's login is silently broken. Pure (no windows.*
+// types) so the OK/Fail mapping is unit-testable on every platform; the DACL
+// read + ACE classification lives in the windows-tagged probe.
+func perUserPrincipalsACLResult(dir string, unsafe []string) CheckResult {
+	if len(unsafe) == 0 {
+		return CheckResult{Name: "principals-file-acl", Status: CheckOK,
+			Message: fmt.Sprintf("per-user principals files under %s are writable only by SYSTEM/Administrators/UnclusterAgent", dir)}
+	}
+	return CheckResult{Name: "principals-file-acl", Status: CheckFail,
+		Message: fmt.Sprintf("per-user principals file(s) [%s] carry a writable ACE for a non-admin/non-SYSTEM principal — Win32-OpenSSH will silently ignore them (login denied). Run `uncluster agent install` and re-apply policy to normalize. (#127)",
+			strings.Join(unsafe, ", "))}
+}
 
 // principalsACLResult maps a resolved Windows principals-dir ACL probe to a
 // CheckResult. Healthy install: the `NT SERVICE\UnclusterAgent` virtual account

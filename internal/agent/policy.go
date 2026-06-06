@@ -145,6 +145,18 @@ func atomicWritePrincipals(dir, username string, callerTokenIDs []string) error 
 		_ = os.Remove(tmp)
 		return fmt.Errorf("close: %w", err)
 	}
+	// Normalize the per-file ACL on the TEMP file BEFORE the rename. On Windows
+	// the temp file is created inside the principals dir and inherits the dir's
+	// `NT SERVICE\UnclusterAgent` Modify ACE — a writable-by-non-admin ACE that
+	// Win32-OpenSSH's auth2-pubkeyfile.c rejects ("bad ownership or modes"),
+	// silently ignoring the file so cert login is denied (#127). Stripping
+	// inheritance and pinning the protected DACL on the temp file means the file
+	// is never momentarily visible at its final path with an unsafe ACL — the
+	// rename preserves the explicit DACL. No-op on Unix.
+	if err := restrictPrincipalsFileACL(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("restrict principals file acl: %w", err)
+	}
 	target := filepath.Join(dir, username)
 	if err := os.Rename(tmp, target); err != nil {
 		_ = os.Remove(tmp)
