@@ -12,6 +12,21 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/api"
 )
 
+// skipIfWindowsApplyNeedsWriter skips tests that exercise the in-process
+// principals write via runApplyPolicy. On Windows the apply path no longer
+// writes files directly — it hands a desired-state to the LocalSystem
+// UnclusterPrincipalsWriter over the spool (#127 role-split) — so these tests,
+// which run no writer, would time out. The Windows handoff + render is covered
+// by the windows-tagged TestWindowsApplyHandoff_RoundTrip (which runs a writer)
+// and the cross-platform TestApplyDesiredStateBytes_* (which exercise the same
+// renderer). The Unix path is unchanged, so these still run there.
+func skipIfWindowsApplyNeedsWriter(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows apply routes through the LocalSystem writer (no writer in this unit test); covered by TestWindowsApplyHandoff_RoundTrip")
+	}
+}
+
 // makeAgentWithPrincipalsDir returns a minimal Agent with a principals dir
 // set to a temp dir and a default logger.
 func makeAgentWithPrincipalsDir(t *testing.T) (*Agent, string) {
@@ -29,6 +44,7 @@ func makeAgentWithPrincipalsDir(t *testing.T) (*Agent, string) {
 // TestApplyPolicy_WritesFile verifies that a valid policy snapshot writes a
 // principals file containing the expected caller_token_ids.
 func TestApplyPolicy_WritesFile(t *testing.T) {
+	skipIfWindowsApplyNeedsWriter(t)
 	a, dir := makeAgentWithPrincipalsDir(t)
 
 	snap := api.PolicyPayload{
@@ -53,6 +69,7 @@ func TestApplyPolicy_WritesFile(t *testing.T) {
 // TestApplyPolicy_StateOKOnSuccess verifies that policyStateVal is updated after
 // a successful apply.
 func TestApplyPolicy_StateOKOnSuccess(t *testing.T) {
+	skipIfWindowsApplyNeedsWriter(t)
 	a, _ := makeAgentWithPrincipalsDir(t)
 
 	snap := api.PolicyPayload{
@@ -88,6 +105,7 @@ func TestApplyPolicy_StateOKOnSuccess(t *testing.T) {
 // TestApplyPolicy_RemovesStaleFile verifies that files for users removed from
 // policy are deleted.
 func TestApplyPolicy_RemovesStaleFile(t *testing.T) {
+	skipIfWindowsApplyNeedsWriter(t)
 	a, dir := makeAgentWithPrincipalsDir(t)
 
 	// Pre-create a stale file.
@@ -114,6 +132,7 @@ func TestApplyPolicy_RemovesStaleFile(t *testing.T) {
 // TestApplyPolicy_EmptyPolicyWipesAllFiles verifies that an empty principals
 // map deletes all existing principals files.
 func TestApplyPolicy_EmptyPolicyWipesAllFiles(t *testing.T) {
+	skipIfWindowsApplyNeedsWriter(t)
 	a, dir := makeAgentWithPrincipalsDir(t)
 
 	// Pre-create two principals files.
@@ -216,6 +235,7 @@ func TestApplyPolicy_MalformedCallerTokenRejected(t *testing.T) {
 // TestApplyPolicy_AtomicWrite verifies that the temp file is renamed atomically.
 // We check the principals file exists after apply and is not the .tmp file.
 func TestApplyPolicy_AtomicWrite(t *testing.T) {
+	skipIfWindowsApplyNeedsWriter(t)
 	a, dir := makeAgentWithPrincipalsDir(t)
 
 	snap := api.PolicyPayload{
@@ -302,6 +322,7 @@ func TestValidateCallerTokenID(t *testing.T) {
 
 // TestApplyPolicy_LastApplyAtUpdated verifies that last_apply_at advances after apply.
 func TestApplyPolicy_LastApplyAtUpdated(t *testing.T) {
+	skipIfWindowsApplyNeedsWriter(t)
 	a, _ := makeAgentWithPrincipalsDir(t)
 
 	before := time.Now().Unix()

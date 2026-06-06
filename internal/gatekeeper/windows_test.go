@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/derek-x-wang/uncluster/internal/agent"
 )
 
 // TestWindowsPaths_Constants verifies the canonical Windows path values.
@@ -105,18 +107,52 @@ func TestWritePrincipalsFile(t *testing.T) {
 	}
 }
 
-// TestGrantPrincipalsAccessWindows_CommandShape verifies the icacls command
-// is constructed with the right arguments. We can't test execution without
-// a real Windows environment, but we test that the function doesn't panic on
-// a temp dir (it will fail because icacls may not be in PATH in CI, but
-// we only test the error path here).
-func TestGrantPrincipalsAccessWindows_NonExistentDir(t *testing.T) {
-	// On a non-Windows CI runner this test is skipped by build tag.
-	// On Windows CI, the dir doesn't exist — icacls will fail, which is expected.
-	err := grantPrincipalsAccessWindows(`C:\NonExistentDir_UnclusterTest`)
-	if err == nil {
-		// If icacls somehow succeeded (unlikely), that's fine too.
-		t.Log("grantPrincipalsAccessWindows succeeded (unexpected but not a test failure)")
+// TestPrincipalsWriterServiceAccount verifies the writer runs as LocalSystem
+// (#127): Win32-OpenSSH accepts a SYSTEM-owned principals file, so a
+// LocalSystem-created file needs no SeRestore — the whole reason the writer is
+// LocalSystem and not the low-priv agent.
+func TestPrincipalsWriterServiceAccount(t *testing.T) {
+	if windowsPrincipalsWriterAccount != "LocalSystem" {
+		t.Errorf("writer account = %q, want LocalSystem", windowsPrincipalsWriterAccount)
 	}
-	// We just verify it doesn't panic or block.
+	if agent.WindowsPrincipalsWriterServiceName != "UnclusterPrincipalsWriter" {
+		t.Errorf("writer service name = %q, want UnclusterPrincipalsWriter",
+			agent.WindowsPrincipalsWriterServiceName)
+	}
+}
+
+// TestWriterRequiredPrivilegesMinimal asserts the writer's required-privilege
+// set is the documented minimum and — crucially — never includes SeRestore or
+// SeTakeOwnership (#127: those are ≈ machine-owner, the exact escalation the
+// role-split exists to avoid). The expected `sc qprivs UnclusterPrincipalsWriter`
+// output after install is therefore just SeChangeNotifyPrivilege.
+func TestWriterRequiredPrivilegesMinimal(t *testing.T) {
+	if len(writerRequiredPrivileges) != 1 || writerRequiredPrivileges[0] != "SeChangeNotifyPrivilege" {
+		t.Fatalf("writerRequiredPrivileges = %v, want [SeChangeNotifyPrivilege]", writerRequiredPrivileges)
+	}
+	for _, p := range writerRequiredPrivileges {
+		switch p {
+		case "SeRestorePrivilege", "SeTakeOwnershipPrivilege", "SeBackupPrivilege",
+			"SeDebugPrivilege", "SeTcbPrivilege", "SeImpersonatePrivilege":
+			t.Errorf("writer must NOT request escalation privilege %q (#127)", p)
+		}
+	}
+}
+
+// TestPrivilegesToMultiSZ verifies the MULTI_SZ encoding: each privilege is
+// NUL-terminated and the list is double-NUL-terminated, the shape
+// SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO expects.
+func TestPrivilegesToMultiSZ(t *testing.T) {
+	got, err := privilegesToMultiSZ([]string{"SeChangeNotifyPrivilege"})
+	if err != nil {
+		t.Fatalf("privilegesToMultiSZ: %v", err)
+	}
+	// "SeChangeNotifyPrivilege" is 23 chars → 23 + NUL (from UTF16FromString) +
+	// the trailing terminator NUL = 25 uint16s.
+	if n := len(got); n != 25 {
+		t.Errorf("multi-SZ len = %d, want 25", n)
+	}
+	if got[len(got)-1] != 0 || got[len(got)-2] != 0 {
+		t.Errorf("multi-SZ not double-NUL terminated: tail = %v", got[len(got)-2:])
+	}
 }

@@ -62,23 +62,34 @@ func (a *Agent) runApplyPolicy(snap api.PolicyPayload) {
 	a.policyMu.Unlock()
 }
 
-// doApplyPolicy writes/removes all principals files for snap atomically.
-func (a *Agent) doApplyPolicy(dir string, snap api.PolicyPayload) error {
+// doApplyPolicy is the per-platform apply dispatcher. On Unix it rewrites the
+// principals dir in-process (the low-priv service account holds the dir grant
+// and sshd accepts a root/service-owned file). On Windows it hands the
+// validated desired-state to the LocalSystem UnclusterPrincipalsWriter via the
+// spool, because Win32-OpenSSH rejects any AuthorizedPrincipalsFile carrying a
+// write-class ACE for the low-priv agent account (#127, ADR-0004 Windows
+// amendment). The implementations live in policy_apply_unix.go and
+// policy_apply_windows.go so the non-Windows behaviour stays byte-identical.
+
+// renderPrincipalsDir performs the atomic principals-dir rewrite for snap into
+// dir: it validates every username and caller_token_id, writes one file per
+// user (tmp→rename, applying restrictPrincipalsFileACL on the tmp file before
+// the rename so the live file never appears with a wrong ACL), deletes files
+// for users dropped from the policy, and deletes the file for any user whose
+// caller set is empty.
+//
+// This is the SINGLE renderer shared by the Unix in-process apply path and the
+// Windows LocalSystem writer, so the on-disk shape can never diverge between
+// platforms. On Unix restrictPrincipalsFileACL is a no-op; on Windows it sets
+// owner=SYSTEM + a PROTECTED {SYSTEM, Administrators} DACL (#127).
+func renderPrincipalsDir(dir string, snap api.PolicyPayload) error {
 	// Ensure principals dir exists.
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("principals dir: %w", err)
 	}
 
-	// Validate all caller_token_ids before writing anything.
-	for _, p := range snap.Principals {
-		if err := validateUsername(p.Username); err != nil {
-			return fmt.Errorf("invalid username %q: %w", p.Username, err)
-		}
-		for _, c := range p.CallerTokenIDs {
-			if err := validateCallerTokenID(c); err != nil {
-				return fmt.Errorf("invalid caller_token_id %q: %w", c, err)
-			}
-		}
+	if err := validatePolicyPayload(snap); err != nil {
+		return err
 	}
 
 	// Build set of usernames in the new policy.
@@ -122,7 +133,29 @@ func (a *Agent) doApplyPolicy(dir string, snap api.PolicyPayload) error {
 	return nil
 }
 
-// atomicWritePrincipals writes lines to <dir>/<username> atomically via tmp→rename.
+// validatePolicyPayload validates every username and caller_token_id in snap
+// before any file is touched. Reused by both the renderer and (defensively) by
+// the Windows writer when it re-validates a spool-delivered desired-state — the
+// agent is treated as untrusted across the privilege boundary (#127).
+func validatePolicyPayload(snap api.PolicyPayload) error {
+	for _, p := range snap.Principals {
+		if err := validateUsername(p.Username); err != nil {
+			return fmt.Errorf("invalid username %q: %w", p.Username, err)
+		}
+		for _, c := range p.CallerTokenIDs {
+			if err := validateCallerTokenID(c); err != nil {
+				return fmt.Errorf("invalid caller_token_id %q: %w", c, err)
+			}
+		}
+	}
+	return nil
+}
+
+// atomicWritePrincipals writes lines to <dir>/<username> atomically via
+// tmp→rename. The per-file ACL is applied to the tmp file BEFORE the rename:
+// a same-volume rename preserves the security descriptor, so the live file is
+// never visible to sshd with an inherited (agent-writable) ACL. On Unix
+// restrictPrincipalsFileACL is a no-op.
 func atomicWritePrincipals(dir, username string, callerTokenIDs []string) error {
 	tmp := filepath.Join(dir, username+".tmp")
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -144,6 +177,11 @@ func atomicWritePrincipals(dir, username string, callerTokenIDs []string) error 
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("close: %w", err)
+	}
+	// Apply the per-file ACL on the tmp file before rename (no-op on Unix).
+	if err := restrictPrincipalsFileACL(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("restrict principals file acl: %w", err)
 	}
 	target := filepath.Join(dir, username)
 	if err := os.Rename(tmp, target); err != nil {

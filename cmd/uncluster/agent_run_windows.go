@@ -54,20 +54,25 @@ func openSCMErrorLog(path string) (io.WriteCloser, error) {
 }
 
 // runAsWindowsService detects whether the binary is running under the
-// Windows Service Control Manager. If so — and only if argv indicates
-// `agent run` (the only path SCM is ever expected to take, because that's
-// what the service unit binds to) — it routes through svc.Run so the
-// SCM control-handler handshake completes and Windows reports the
-// service as Running.
+// Windows Service Control Manager. If so it routes through svc.Run for the
+// matching service so the SCM control-handler handshake completes and Windows
+// reports the service as Running.
+//
+// Two SCM services bind to this binary (the #127 role-split):
+//   - `<exe> agent run`              → agent.WindowsServiceName (UnclusterAgent)
+//   - `<exe> principals-writer run`  → agent.WindowsPrincipalsWriterServiceName
+//     (UnclusterPrincipalsWriter, LocalSystem)
+//
+// argv selects which; anything else falls through to the interactive cobra
+// path (defensive — SCM should only ever pass one of those two).
 //
 // Pre-#88 the binary returned from main with no svc.Run call: SCM never
 // got the "started" status word, hit its 30s timeout, and `net start`
-// returned exit 2 even though the agent process was alive and heartbeating
-// to the CP. See #88 for the full trace.
+// returned exit 2 even though the process was alive. See #88 for the trace.
 //
-// The SCM-registered service name is agent.WindowsServiceName, shared with
-// the installer and restart paths so the name SCM dispatches on cannot
-// drift from the name it was registered under.
+// The SCM-registered service names are the agent.Windows*ServiceName constants,
+// shared with the installer and restart paths so the name SCM dispatches on
+// cannot drift from the name it was registered under.
 //
 // Returns:
 //   - handled=true with err=nil  → SCM lifecycle completed; main exits 0.
@@ -84,16 +89,20 @@ func runAsWindowsService() (handled bool, err error) {
 	if !isService {
 		return false, nil
 	}
-	// Sanity check argv: the service unit binds to `<exe> agent run`.
-	// If something else is passed, fall through (defensive — should not
-	// happen in production).
-	if !argvIsAgentRun(os.Args) {
+	switch {
+	case argvIsAgentRun(os.Args):
+		if runErr := svc.Run(agent.WindowsServiceName, &agentService{}); runErr != nil {
+			return true, fmt.Errorf("svc.Run %s: %w", agent.WindowsServiceName, runErr)
+		}
+		return true, nil
+	case argvIsPrincipalsWriterRun(os.Args):
+		if runErr := svc.Run(agent.WindowsPrincipalsWriterServiceName, &principalsWriterService{}); runErr != nil {
+			return true, fmt.Errorf("svc.Run %s: %w", agent.WindowsPrincipalsWriterServiceName, runErr)
+		}
+		return true, nil
+	default:
 		return false, nil
 	}
-	if runErr := svc.Run(agent.WindowsServiceName, &agentService{}); runErr != nil {
-		return true, fmt.Errorf("svc.Run %s: %w", agent.WindowsServiceName, runErr)
-	}
-	return true, nil
 }
 
 // argvIsAgentRun reports whether argv looks like `<exe> agent run [...]`.
@@ -104,6 +113,16 @@ func argvIsAgentRun(argv []string) bool {
 		return false
 	}
 	return argv[1] == "agent" && argv[2] == "run"
+}
+
+// argvIsPrincipalsWriterRun reports whether argv looks like
+// `<exe> principals-writer run [...]` — the BinaryPathName the
+// UnclusterPrincipalsWriter SCM service is registered with (#127).
+func argvIsPrincipalsWriterRun(argv []string) bool {
+	if len(argv) < 3 {
+		return false
+	}
+	return argv[1] == "principals-writer" && argv[2] == "run"
 }
 
 // agentService implements svc.Handler. The Execute method drives the SCM

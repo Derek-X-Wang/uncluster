@@ -45,15 +45,25 @@ var windowsPaths = struct {
 // It is idempotent: re-running repairs drift without clobbering existing state.
 // Must run as Administrator (elevated).
 //
+// The #127 role-split: TWO services are registered. The low-priv
+// `NT SERVICE\UnclusterAgent` (network-facing) gets NO write access to
+// auth_principals; a LocalSystem, network-less, privilege-stripped
+// `UnclusterPrincipalsWriter` is the only identity that writes principals files.
+// Win32-OpenSSH silently ignores any AuthorizedPrincipalsFile carrying a
+// write-class ACE for a principal outside {SYSTEM, Administrators}, so the agent
+// could never hold such a grant and still have login work (ADR-0004 amendment).
+//
 // Steps:
 //  1. Check sshd installed + running (OpenSSH server).
 //  2. Write CA pubkey.
-//  3. Write sshd drop-in config.
+//  3. Write sshd drop-in config (+ ensure base config Includes the drop-in dir).
 //  4. Create principals directory.
-//  5. Grant service account write access to principals dir via icacls.
-//  6. Install SCM service (kardianos/service).
-//  7. Start SCM service.
-//  8. Restart sshd.
+//  5. Install BOTH SCM services (agent + writer); set writer required-privileges.
+//  6. Lock principals dir to {SYSTEM, Administrators} (NO agent ACE) and create
+//     the spool dir with the agent↔writer ACL.
+//  7. Save agent.toml to the system path (readable by the agent account).
+//  8. Start both services.
+//  9. Restart sshd.
 func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 	paths := cfg.ExpectedPaths
 
@@ -86,42 +96,51 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 		return fmt.Errorf("create principals dir: %w", err)
 	}
 
-	// 5. Install SCM service. MUST happen before grantPrincipalsAccessWindows
-	// (#83): the `NT SERVICE\UnclusterAgent` virtual account is created
-	// lazily by SCM when the service is registered. Granting an ACL to a
-	// not-yet-existing SID returns icacls error 1332 ("No mapping between
-	// account names and security IDs was done.").
+	// 5. Install BOTH SCM services. MUST happen before the principals-dir / spool
+	// ACL step (#83): the `NT SERVICE\UnclusterAgent` virtual account is created
+	// lazily by SCM when the agent service is registered, so its SID is only
+	// resolvable for the spool ACE after this. The LocalSystem writer needs no
+	// lazy SID (SYSTEM is well-known), but registering it here lets us strip its
+	// privileges in the same step.
 	if err := installService(ctx, cfg, serviceExe); err != nil {
-		return fmt.Errorf("install service: %w", err)
+		return fmt.Errorf("install agent service: %w", err)
+	}
+	if err := installPrincipalsWriterService(ctx, serviceExe); err != nil {
+		return fmt.Errorf("install principals-writer service: %w", err)
+	}
+	if err := setWriterRequiredPrivileges(); err != nil {
+		return fmt.Errorf("set writer required-privileges: %w", err)
 	}
 
-	// 6. Grant service account write access to principals dir via icacls.
-	// Safe to call now that the virtual account SID exists.
-	if err := grantPrincipalsAccessWindows(paths.PrincipalsDir); err != nil {
-		return fmt.Errorf("grant principals dir access: %w", err)
+	// 6. Lock down the principals dir to {SYSTEM, Administrators} with NO ACE for
+	// the agent (#127 — supersedes the pre-#127 grantPrincipalsAccessWindows
+	// Modify grant, which inherited onto every per-user file and tripped
+	// Win32-OpenSSH's secure-permission check). PROTECTED so a re-install over a
+	// host carrying the old agent grant scrubs it. Then create the spool dir
+	// (the ONLY place the agent gets write) with the agent↔writer ACL.
+	if err := restrictPrincipalsDirACLWindows(paths.PrincipalsDir); err != nil {
+		return fmt.Errorf("lock principals dir acl: %w", err)
+	}
+	if err := createSpoolDirWithACL(agent.SpoolDir()); err != nil {
+		return fmt.Errorf("create spool dir: %w", err)
 	}
 
-	// 7. Save agent.toml to the system path. MUST happen AFTER
-	// installService (step 5) so the `NT SERVICE\UnclusterAgent` SID is
-	// resolvable for the file ACL grant, and BEFORE startServiceWindows
-	// (step 8) so the service can read the file on first start.
-	//
-	// Hotfix for #77: previously SaveConfigSystem was called from the CLI
-	// install command BEFORE gatekeeper.Install ran — so the first pass
-	// produced an ACL without the UnclusterAgent ACE (SID didn't exist
-	// yet), and the second pass (after Install returned) was too late:
-	// `net start UnclusterAgent` had already failed with exit 2 ("service
-	// did not respond") because the service couldn't read its config.
-	// Putting the save here, AFTER the SID exists and BEFORE start,
-	// means the file lands with the right ACL on first try.
+	// 7. Save agent.toml to the system path. MUST happen AFTER installService
+	// (step 5) so the `NT SERVICE\UnclusterAgent` SID is resolvable for the file
+	// ACL grant, and BEFORE startServiceWindows (step 8) so the service can read
+	// the file on first start (#77).
 	sysPath := agent.SystemConfigPath()
 	if err := agent.SaveConfigSystem(sysPath, cfg); err != nil {
 		return fmt.Errorf("save system config to %s: %w", sysPath, err)
 	}
 
-	// 8. Start service.
+	// 8. Start both services. The writer must be up so the agent's first policy
+	// apply (which hands desired-state to the spool) can be serviced.
 	if err := startServiceWindows(ctx); err != nil {
-		return fmt.Errorf("start service: %w", err)
+		return fmt.Errorf("start agent service: %w", err)
+	}
+	if err := startPrincipalsWriterServiceWindows(ctx); err != nil {
+		return fmt.Errorf("start principals-writer service: %w", err)
 	}
 
 	// 9. Restart sshd so it picks up the new config.
@@ -211,21 +230,15 @@ func toLower(s string) string {
 	return string(b)
 }
 
-// grantPrincipalsAccessWindows grants the service virtual account write access
-// to the principals directory using icacls.
-func grantPrincipalsAccessWindows(dir string) error {
-	// Grant: (OI)(CI) = object-inherit + container-inherit for recursive access.
-	// M = Modify, which includes read+write+delete (enough for writing principal files).
-	out, err := exec.Command(
-		"icacls", dir,
-		"/grant", windowsServiceAccountName+":(OI)(CI)M",
-		"/T", // apply recursively
-	).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("icacls grant: %w\noutput: %s", err, string(out))
-	}
-	return nil
-}
+// NOTE (#127): the pre-role-split grantPrincipalsAccessWindows — which granted
+// `NT SERVICE\UnclusterAgent` Modify on the principals dir via icacls — has been
+// REMOVED. Win32-OpenSSH silently ignores any AuthorizedPrincipalsFile carrying
+// a write-class ACE for a principal outside {SYSTEM, Administrators}, and that
+// agent grant inherited onto every per-user file, so it was the root cause of
+// "bad ownership or modes" cert-login failures. The agent now writes nothing
+// under auth_principals; the LocalSystem UnclusterPrincipalsWriter does (see
+// install_principalswriter_windows.go). doctor FAILS if the old agent grant is
+// ever found again.
 
 // ensureWindowsInclude ensures the stock base sshd_config Includes the
 // sshd_config.d drop-in directory. It is the Windows analog of
