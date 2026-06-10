@@ -205,8 +205,14 @@ $ uncluster agents rm windows-rig
 ```
 # operator publishes a new version
 $ uncluster server update set --version=v2.0.2 \
-    --asset-url-template='https://github.com/Derek-X-Wang/uncluster/releases/download/{version}/uncluster-{os}-{arch}' \
-    --sha256-url-template='https://github.com/Derek-X-Wang/uncluster/releases/download/{version}/checksums.txt'
+    --asset-url-template='https://github.com/Derek-X-Wang/uncluster/releases/download/{version}/uncluster-{os}-{arch}{ext}' \
+    --sha256-url-template='https://github.com/Derek-X-Wang/uncluster/releases/download/{version}/uncluster-{os}-{arch}{ext}.sha256'
+
+# {ext} = ".exe" on windows, "" elsewhere (release assets carry the native
+# extension). The sha256 template MUST point at the per-asset .sha256 file
+# (GoReleaser checksum.split) — NOT the combined checksums.txt: the agent's
+# verifier reads the FIRST token of the fetched file, so a combined file
+# only ever matches its first line.
 
 # each Agent on next heartbeat:
 # - receives check_update command pointer

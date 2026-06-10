@@ -20,3 +20,4 @@ coverage.html
 *.db-wal
 *.db-shm
 /.local/
+dist/

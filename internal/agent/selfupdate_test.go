@@ -36,6 +36,26 @@ func TestResolveTemplate(t *testing.T) {
 			"linux", "amd64", "v1.0.0",
 			"https://example.com/static",
 		},
+		{
+			// {ext} resolves to ".exe" on windows so ONE template can address
+			// release assets that carry the native extension (GoReleaser names
+			// the raw windows binary uncluster-windows-amd64.exe).
+			"https://example.com/{version}/uncluster-{os}-{arch}{ext}",
+			"windows", "amd64", "v0.2.0",
+			"https://example.com/v0.2.0/uncluster-windows-amd64.exe",
+		},
+		{
+			// {ext} resolves to "" on non-windows.
+			"https://example.com/{version}/uncluster-{os}-{arch}{ext}",
+			"darwin", "arm64", "v0.2.0",
+			"https://example.com/v0.2.0/uncluster-darwin-arm64",
+		},
+		{
+			// {ext} before a suffix (the .sha256 template shape).
+			"https://example.com/{version}/uncluster-{os}-{arch}{ext}.sha256",
+			"windows", "amd64", "v0.2.0",
+			"https://example.com/v0.2.0/uncluster-windows-amd64.exe.sha256",
+		},
 	}
 	for _, tc := range tests {
 		got := ResolveTemplate(tc.tmpl, tc.os, tc.arch, tc.ver)
