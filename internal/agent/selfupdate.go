@@ -50,12 +50,22 @@ func NewUpdater(binaryPath, pinnedVersion string, logger *slog.Logger) *Updater 
 	}
 }
 
-// ResolveTemplate substitutes {os}, {arch}, and {version} in the URL template.
+// ResolveTemplate substitutes {os}, {arch}, {version}, and {ext} in the URL
+// template. {ext} is ".exe" when goos is windows and "" otherwise: release
+// assets carry the native binary extension (GoReleaser appends .exe to the
+// raw windows binary and that is not configurable), but the update plan holds
+// ONE template string for every platform — {ext} bridges the two. Templates
+// without {ext} resolve exactly as before.
 func ResolveTemplate(tmpl, goos, goarch, ver string) string {
+	ext := ""
+	if goos == "windows" {
+		ext = ".exe"
+	}
 	r := strings.NewReplacer(
 		"{os}", goos,
 		"{arch}", goarch,
 		"{version}", ver,
+		"{ext}", ext,
 	)
 	return r.Replace(tmpl)
 }

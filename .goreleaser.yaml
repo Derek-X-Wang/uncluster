@@ -1,0 +1,133 @@
+# GoReleaser (OSS) config. Triggered by .github/workflows/release.yml on v* tags.
+#
+# Two artifact families per release, because two consumers with different needs:
+#
+#  1. RAW binaries named `uncluster-{os}-{arch}` + per-asset `.sha256` files
+#     (checksum.split) — the AGENT SELF-UPDATE contract. The update plan's
+#     asset_url_template (docs/architecture.md §operational lifecycle) is
+#       .../download/{version}/uncluster-{os}-{arch}
+#     a single string for all platforms, so names are uniform (NO .exe suffix
+#     even on Windows — the agent swaps the download into its existing
+#     BinaryPath, so the asset name never needs the extension). The .sha256
+#     parser (internal/agent/selfupdate.go verifySHA256) reads the FIRST token
+#     of the fetched file, so each asset needs its own .sha256 — a combined
+#     checksums.txt would verify every platform against the first line.
+#
+#  2. tar.gz/zip ARCHIVES (binary + LICENSE + README) — for humans, Homebrew,
+#     and Scoop.
+#
+# Version: ldflags inject {{.Tag}} (v-prefixed, e.g. v0.2.0), NOT {{.Version}}
+# (which strips the v). Self-update compares version.Version against the
+# operator-set expected_version by EXACT STRING (selfupdate.go), and the same
+# value substitutes {version} in the release-download URL path — both want the
+# tag shape. Don't change one without the other.
+
+version: 2
+
+project_name: uncluster
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: uncluster
+    main: ./cmd/uncluster
+    binary: uncluster
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/derek-x-wang/uncluster/internal/version.Version={{ .Tag }}
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  # Family 1: raw binaries for agent self-update (uniform names, no .exe).
+  - id: selfupdate-binaries
+    ids: [uncluster]
+    formats: [binary]
+    name_template: "uncluster-{{ .Os }}-{{ .Arch }}"
+
+  # Family 2: archives for humans / Homebrew / Scoop.
+  - id: dist-archives
+    ids: [uncluster]
+    formats: [tar.gz]
+    name_template: "uncluster_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md*   # glob: tolerated as optional until a README lands
+
+checksum:
+  # split:true emits one <asset>.sha256 per artifact — required by the agent's
+  # verifySHA256 (first-token parse). checksums.txt alone would not work.
+  split: true
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^feat'
+      order: 0
+    - title: Fixes
+      regexp: '^fix'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^docs"
+      - "^ci"
+      - "^test"
+      - "^chore"
+
+release:
+  github:
+    owner: Derek-X-Wang
+    name: uncluster
+  # auto: tags with a prerelease suffix (v0.2.0-rc1) are marked pre-release;
+  # plain tags publish as latest. v0.1.0 was hand-marked pre-release while
+  # pre-MVP; from here the tag itself carries the signal.
+  prerelease: auto
+  draft: false
+
+# homebrew_casks replaces the deprecated `brews` (goreleaser ≥2.10): casks now
+# cover plain CLI binaries and skip the formula audit friction.
+homebrew_casks:
+  - name: uncluster
+    ids: [dist-archives]
+    repository:
+      owner: Derek-X-Wang
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: https://github.com/Derek-X-Wang/uncluster
+    description: "OpenSSH certificate-authority gatekeeper for personal machines"
+    # Binaries are unsigned/un-notarized (pre-MVP): strip the quarantine
+    # attribute on install so Gatekeeper doesn't block first run. Drop this
+    # hook if/when releases are signed + notarized.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/uncluster"]
+          end
+
+scoops:
+  - name: uncluster
+    ids: [dist-archives]
+    repository:
+      owner: Derek-X-Wang
+      name: scoop-bucket
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/Derek-X-Wang/uncluster
+    description: "OpenSSH certificate-authority gatekeeper for personal machines"
+    license: Apache-2.0

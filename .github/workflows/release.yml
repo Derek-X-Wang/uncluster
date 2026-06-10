@@ -1,0 +1,45 @@
+# Release pipeline: push a v* tag → GoReleaser builds all platforms, publishes
+# the GitHub release (raw self-update binaries + per-asset .sha256 + archives),
+# and updates the Homebrew tap and Scoop bucket. See .goreleaser.yaml for the
+# artifact-contract rationale (self-update template shape, checksum.split).
+#
+# Secrets:
+#   TAP_GITHUB_TOKEN — fine-grained PAT, contents:write on Derek-X-Wang/homebrew-tap
+#                      and Derek-X-Wang/scoop-bucket ONLY. The default GITHUB_TOKEN
+#                      cannot push to sibling repos.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags: GoReleaser derives the changelog from
+          # commits since the previous tag.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Run tests before publishing
+        run: go test ./...
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
