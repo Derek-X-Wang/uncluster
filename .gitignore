@@ -21,3 +21,4 @@ coverage.html
 *.db-shm
 /.local/
 dist/
+bin/
