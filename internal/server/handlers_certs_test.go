@@ -232,6 +232,77 @@ func TestIssueCert_TTLTooLong(t *testing.T) {
 	}
 }
 
+// TestIssueCert_RejectsMalformedPubkey verifies 400 when the pubkey reaches
+// ca.Sign but fails to parse. This exercises the CA's ErrInvalidInput → 400
+// classification through HTTP (#142): the handler must not 500 a bad pubkey.
+func TestIssueCert_RejectsMalformedPubkey(t *testing.T) {
+	srv, st, _ := newTestServerWithCA(t)
+	ts := httpTestServer(t, srv.Handler())
+
+	cliTok, _ := seedCallerToken(t, st)
+	callerPlaintext, callerID := seedCallerToken(t, st)
+	agentID, _ := mintAgentAndToken(t, st, ts, "cert-badpub")
+
+	gb, _ := json.Marshal(api.CreateACLRequest{Caller: callerID, Agent: agentID, Username: "u"})
+	gr, _ := http.NewRequest("POST", ts.URL+"/v1/acl", bytes.NewReader(gb))
+	gr.Header.Set("Authorization", "Bearer "+cliTok)
+	gr.Header.Set("Content-Type", "application/json")
+	r, _ := http.DefaultClient.Do(gr)
+	r.Body.Close()
+
+	// Non-empty (passes the handler's required-field check) but not a valid key.
+	certBody, _ := json.Marshal(api.CertRequest{
+		Agent:    agentID,
+		Username: "u",
+		Pubkey:   "ssh-ed25519 not-a-real-key",
+	})
+	certReq, _ := http.NewRequest("POST", ts.URL+"/v1/certs", bytes.NewReader(certBody))
+	certReq.Header.Set("Authorization", "Bearer "+callerPlaintext)
+	certReq.Header.Set("Content-Type", "application/json")
+	certResp, _ := http.DefaultClient.Do(certReq)
+	certResp.Body.Close()
+
+	if certResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("malformed pubkey: status=%d, want 400", certResp.StatusCode)
+	}
+}
+
+// TestIssueCert_RejectsNegativeTTL verifies 400 for a negative TTL, which slips
+// past the handler's upper-bound (>900) check and reaches ca.Sign as an invalid
+// validity window (ValidBefore <= ValidAfter). Pins that the CA-level timing
+// error classifies as 400, not 500 (#142).
+func TestIssueCert_RejectsNegativeTTL(t *testing.T) {
+	srv, st, _ := newTestServerWithCA(t)
+	ts := httpTestServer(t, srv.Handler())
+
+	cliTok, _ := seedCallerToken(t, st)
+	callerPlaintext, callerID := seedCallerToken(t, st)
+	agentID, _ := mintAgentAndToken(t, st, ts, "cert-negttl")
+
+	gb, _ := json.Marshal(api.CreateACLRequest{Caller: callerID, Agent: agentID, Username: "u"})
+	gr, _ := http.NewRequest("POST", ts.URL+"/v1/acl", bytes.NewReader(gb))
+	gr.Header.Set("Authorization", "Bearer "+cliTok)
+	gr.Header.Set("Content-Type", "application/json")
+	r, _ := http.DefaultClient.Do(gr)
+	r.Body.Close()
+
+	certBody, _ := json.Marshal(api.CertRequest{
+		Agent:      agentID,
+		Username:   "u",
+		Pubkey:     genTestUserKey(t),
+		TTLSeconds: -100,
+	})
+	certReq, _ := http.NewRequest("POST", ts.URL+"/v1/certs", bytes.NewReader(certBody))
+	certReq.Header.Set("Authorization", "Bearer "+callerPlaintext)
+	certReq.Header.Set("Content-Type", "application/json")
+	certResp, _ := http.DefaultClient.Do(certReq)
+	certResp.Body.Close()
+
+	if certResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("negative ttl: status=%d, want 400", certResp.StatusCode)
+	}
+}
+
 // TestIssueCert_NoCASigner verifies 503 when no CA is configured.
 func TestIssueCert_NoCASigner(t *testing.T) {
 	st, _ := store.OpenSQLite(filepath.Join(t.TempDir(), "noca.db"))

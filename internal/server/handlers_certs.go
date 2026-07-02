@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -116,8 +117,9 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 		Serial:        serial,
 	})
 	if err != nil {
-		// Distinguish user errors from server errors.
-		if isCertInputError(err) {
+		// Distinguish caller-input errors (400) from server errors (500) via the
+		// CA's typed sentinel — not by matching message text (#142).
+		if errors.Is(err, ca.ErrInvalidInput) {
 			s.writeDeniedEvent(ctx, callerTok.ID, agent.ID, req.Username, req.Pubkey, "bad_input")
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -207,34 +209,4 @@ func pubkeyFingerprint(rawPubkey string) string {
 		return ""
 	}
 	return ssh.FingerprintSHA256(pub)
-}
-
-// isCertInputError returns true for errors produced by bad caller input
-// (malformed pubkey, cert-as-pubkey, timing issues) so we can 400 them.
-func isCertInputError(err error) bool {
-	msg := err.Error()
-	for _, sub := range []string{
-		"parse user pubkey",
-		"is itself a certificate",
-		"ValidBefore must be strictly after",
-		"at least one principal",
-		"KeyID required",
-	} {
-		if containsSubstr(msg, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsSubstr(s, sub string) bool {
-	if len(sub) == 0 {
-		return true
-	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
