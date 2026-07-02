@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -54,7 +55,7 @@ func TestApplyPolicy_WritesFile(t *testing.T) {
 			{Username: "derek", CallerTokenIDs: []string{"caller_abc", "caller_xyz"}},
 		},
 	}
-	a.runApplyPolicy(snap)
+	a.runApplyPolicy(context.Background(), snap)
 
 	content, err := os.ReadFile(filepath.Join(dir, "derek"))
 	if err != nil {
@@ -79,7 +80,7 @@ func TestApplyPolicy_StateOKOnSuccess(t *testing.T) {
 			{Username: "alice", CallerTokenIDs: []string{"caller_one"}},
 		},
 	}
-	a.runApplyPolicy(snap)
+	a.runApplyPolicy(context.Background(), snap)
 
 	a.policyMu.Lock()
 	ps := a.policyStateVal
@@ -122,7 +123,7 @@ func TestApplyPolicy_RemovesStaleFile(t *testing.T) {
 			{Username: "derek", CallerTokenIDs: []string{"caller_new"}},
 		},
 	}
-	a.runApplyPolicy(snap)
+	a.runApplyPolicy(context.Background(), snap)
 
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Error("stale principals file should be removed after policy apply")
@@ -145,7 +146,7 @@ func TestApplyPolicy_EmptyPolicyWipesAllFiles(t *testing.T) {
 		Hash:       "",
 		Principals: []api.PolicyPrincipal{},
 	}
-	a.runApplyPolicy(snap)
+	a.runApplyPolicy(context.Background(), snap)
 
 	for _, user := range []string{"alice", "bob"} {
 		if _, err := os.Stat(filepath.Join(dir, user)); !os.IsNotExist(err) {
@@ -168,7 +169,7 @@ func TestApplyPolicy_FailOnDirPermission(t *testing.T) {
 		Version: 1, Hash: "blake3:first",
 		Principals: []api.PolicyPrincipal{{Username: "u1", CallerTokenIDs: []string{"c1"}}},
 	}
-	a.runApplyPolicy(snap1)
+	a.runApplyPolicy(context.Background(), snap1)
 
 	a.policyMu.Lock()
 	version1 := a.policyStateVal.appliedVersion
@@ -184,7 +185,7 @@ func TestApplyPolicy_FailOnDirPermission(t *testing.T) {
 		Version: 2, Hash: "blake3:second",
 		Principals: []api.PolicyPrincipal{{Username: "u2", CallerTokenIDs: []string{"c2"}}},
 	}
-	a.runApplyPolicy(snap2)
+	a.runApplyPolicy(context.Background(), snap2)
 
 	// Restore perms before reading state.
 	os.Chmod(dir, 0o755)
@@ -216,7 +217,7 @@ func TestApplyPolicy_MalformedCallerTokenRejected(t *testing.T) {
 			{Username: "alice", CallerTokenIDs: []string{"caller_ok", "bad\ncaller"}},
 		},
 	}
-	a.runApplyPolicy(snap)
+	a.runApplyPolicy(context.Background(), snap)
 
 	// File should NOT be written.
 	if _, err := os.Stat(filepath.Join(dir, "alice")); !os.IsNotExist(err) {
@@ -244,7 +245,7 @@ func TestApplyPolicy_AtomicWrite(t *testing.T) {
 			{Username: "carol", CallerTokenIDs: []string{"tok1"}},
 		},
 	}
-	a.runApplyPolicy(snap)
+	a.runApplyPolicy(context.Background(), snap)
 
 	// Target file should exist.
 	if _, err := os.Stat(filepath.Join(dir, "carol")); err != nil {
@@ -269,13 +270,13 @@ func TestApplyPolicy_RecoveryAfterFailure(t *testing.T) {
 	os.Chmod(dir, 0o000)
 	snap1 := api.PolicyPayload{Version: 1, Hash: "h1",
 		Principals: []api.PolicyPrincipal{{Username: "u", CallerTokenIDs: []string{"c"}}}}
-	a.runApplyPolicy(snap1)
+	a.runApplyPolicy(context.Background(), snap1)
 
 	// Restore perms → next apply should succeed.
 	os.Chmod(dir, 0o755)
 	snap2 := api.PolicyPayload{Version: 2, Hash: "h2",
 		Principals: []api.PolicyPrincipal{{Username: "u", CallerTokenIDs: []string{"c"}}}}
-	a.runApplyPolicy(snap2)
+	a.runApplyPolicy(context.Background(), snap2)
 
 	a.policyMu.Lock()
 	ps := a.policyStateVal
@@ -331,7 +332,7 @@ func TestApplyPolicy_LastApplyAtUpdated(t *testing.T) {
 		Hash:       "h",
 		Principals: []api.PolicyPrincipal{{Username: "x", CallerTokenIDs: []string{"c"}}},
 	}
-	a.runApplyPolicy(snap)
+	a.runApplyPolicy(context.Background(), snap)
 
 	a.policyMu.Lock()
 	ts := a.policyStateVal.lastApplyAt

@@ -37,13 +37,13 @@ type Agent struct {
 	endpointProvider EndpointProvider // optional; injected by CLI or tests
 
 	policyMu       sync.Mutex
-	policyStateVal policyState      // last-applied policy state; guarded by policyMu
+	policyStateVal policyState       // last-applied policy state; guarded by policyMu
 	applyCh        chan applyRequest // serialised policy-apply channel; set in Run; nil until Run called
 
 	// Fail-closed-after: wipe principals if no successful heartbeat for this long.
-	fcaMu             sync.Mutex
+	fcaMu              sync.Mutex
 	failClosedAfterSec *int64    // nil = disabled; updated from heartbeat response
-	lastHeartbeatOK   time.Time // last time a heartbeat succeeded
+	lastHeartbeatOK    time.Time // last time a heartbeat succeeded
 }
 
 func New(cfg Config, logger *slog.Logger) *Agent {
@@ -124,7 +124,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	go func() {
 		defer applyWG.Done()
 		for req := range a.applyCh {
-			a.runApplyPolicy(req.snapshot)
+			// hbCtx cancels at the top of shutdown(), so an in-flight apply
+			// (notably the Windows writer wait) returns promptly instead of
+			// stalling applyWG.Wait() for the full applyTimeout (#153).
+			a.runApplyPolicy(hbCtx, req.snapshot)
 		}
 	}()
 
@@ -168,7 +171,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context) error {
 			return err
 		case errors.Is(err, ErrRevoked):
 			a.logger.Error("deprovisioned: control plane revoked this agent; wiping principals")
-			return a.onRevoked()
+			return a.onRevoked(ctx)
 		}
 	}
 	// Check for fail-closed every 30 seconds.
@@ -186,20 +189,21 @@ func (a *Agent) heartbeatLoop(ctx context.Context) error {
 					return err
 				case errors.Is(err, ErrRevoked):
 					a.logger.Error("deprovisioned: control plane revoked this agent; wiping principals")
-					return a.onRevoked()
+					return a.onRevoked(ctx)
 				default:
 					a.logger.Warn("heartbeat error", "err", err)
 				}
 			}
 		case <-fcTicker.C:
-			a.checkFailClosed()
+			a.checkFailClosed(ctx)
 		}
 	}
 }
 
 // checkFailClosed wipes principals if fail_closed_after has elapsed since last
 // successful heartbeat. Safe to call concurrently; no-op if fail-closed not set.
-func (a *Agent) checkFailClosed() {
+// ctx is threaded to the apply so a shutdown mid-wipe returns promptly (#153).
+func (a *Agent) checkFailClosed(ctx context.Context) {
 	a.fcaMu.Lock()
 	fca := a.failClosedAfterSec
 	lastOK := a.lastHeartbeatOK
@@ -216,7 +220,7 @@ func (a *Agent) checkFailClosed() {
 			"fail_closed_after_sec", *fca,
 			"last_heartbeat_ok", lastOK)
 		// Apply empty policy to wipe all principals.
-		a.runApplyPolicy(api.PolicyPayload{
+		a.runApplyPolicy(ctx, api.PolicyPayload{
 			Version:    0,
 			Hash:       "",
 			Principals: nil,
@@ -233,10 +237,15 @@ func (a *Agent) checkFailClosed() {
 // SYSTEM-owned principals files (#127 role-split), so it must submit an empty
 // desired-state to the LocalSystem writer, which renders an empty dir. On Unix
 // wipePrincipals removes the files in-process (byte-identical to the old path).
-func (a *Agent) onRevoked() error {
+//
+// ctx is threaded into the wipe so the Windows writer-routed wipe honours Agent
+// shutdown (#153); during a normal 410 deprovision ctx is still live (onRevoked
+// returns ErrDeprovisioned, which is what later triggers shutdown), so the wipe
+// runs to completion.
+func (a *Agent) onRevoked(ctx context.Context) error {
 	principalsDir := a.cfg.ExpectedPaths.PrincipalsDir
 	if principalsDir != "" {
-		a.wipePrincipals(principalsDir)
+		a.wipePrincipals(ctx, principalsDir)
 	}
 	// Write .deprovisioned marker NEXT TO agent.toml so the supervisor sees
 	// it on next start (#46). Pre-fix the marker was derived from
@@ -364,4 +373,3 @@ func (a *Agent) dispatchCommand(ctx context.Context, rawCmd any) error {
 	}
 	return nil
 }
-
