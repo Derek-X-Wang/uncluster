@@ -1,14 +1,13 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
-
-	"github.com/derek-x-wang/uncluster/internal/api"
 )
 
 func newACLCmd() *cobra.Command {
@@ -34,34 +33,29 @@ func newACLGrantCmd() *cobra.Command {
 			if username == "" {
 				return fmt.Errorf("--as <username> is required")
 			}
-			cfg, err := LoadCLIConfig()
+			client, err := newConfiguredControlPlaneClient()
 			if err != nil {
 				return err
 			}
-			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config set server=URL` and `uncluster config set token --stdin`")
-			}
-			client := NewClient(cfg.Server, cfg.Token)
-
-			var entry api.ACLEntrySummary
-			if err := client.Do(cmd.Context(), "POST", "/v1/acl", api.CreateACLRequest{
-				Caller:   args[0],
-				Agent:    args[1],
-				Username: username,
-			}, &entry); err != nil {
-				return err
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "granted: id=%s caller=%s agent=%s username=%s\n",
-				entry.ID, entry.CallerTokenID, entry.AgentID, entry.Username)
-			return nil
+			return runACLGrant(cmd.Context(), client, cmd.OutOrStdout(), args[0], args[1], username)
 		},
 	}
 	cmd.Flags().StringVar(&username, "as", "", "SSH username (required)")
 	return cmd
 }
 
+// runACLGrant grants an ACL through the typed client and prints the result.
+func runACLGrant(ctx context.Context, client ControlPlaneClient, out io.Writer, caller, agent, username string) error {
+	entry, err := client.GrantACL(ctx, caller, agent, username)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "granted: id=%s caller=%s agent=%s username=%s\n",
+		entry.ID, entry.CallerTokenID, entry.AgentID, entry.Username)
+	return nil
+}
+
 // newACLRevokeCmd returns `uncluster acl revoke <caller> <agent> --as <user>`.
-// It finds the ACL entry by triple and deletes it.
 func newACLRevokeCmd() *cobra.Command {
 	var username string
 
@@ -73,46 +67,25 @@ func newACLRevokeCmd() *cobra.Command {
 			if username == "" {
 				return fmt.Errorf("--as <username> is required")
 			}
-			cfg, err := LoadCLIConfig()
+			client, err := newConfiguredControlPlaneClient()
 			if err != nil {
 				return err
 			}
-			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config set server=URL` and `uncluster config set token --stdin`")
-			}
-			client := NewClient(cfg.Server, cfg.Token)
-
-			// Resolve the agent name/id to its canonical Agent ID via the control
-			// plane first — the same resolution the grant path performs
-			// server-side. Without it, matching by name across the caller's rows
-			// deletes the first same-caller+username row across ALL agents, which
-			// can revoke the wrong Agent's access (#141). An unresolvable name is
-			// an error here, never a silent first-match delete.
-			var agent api.AgentDetail
-			if err := client.Do(cmd.Context(), "GET", "/v1/agents/"+args[1], nil, &agent); err != nil {
-				return fmt.Errorf("resolve agent %q: %w", args[1], err)
-			}
-
-			// List the caller's rows and select the one for the resolved agent.
-			q := url.Values{}
-			q.Set("caller", args[0])
-			var entries []api.ACLEntrySummary
-			if err := client.Do(cmd.Context(), "GET", "/v1/acl?"+q.Encode(), nil, &entries); err != nil {
-				return err
-			}
-			entry, err := selectACLEntry(entries, agent.ID, username)
-			if err != nil {
-				return fmt.Errorf("%w (caller=%s agent=%s)", err, args[0], args[1])
-			}
-			if err := client.Do(cmd.Context(), "DELETE", "/v1/acl/"+entry.ID, nil, nil); err != nil {
-				return err
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "revoked: id=%s\n", entry.ID)
-			return nil
+			return runACLRevoke(cmd.Context(), client, cmd.OutOrStdout(), args[0], args[1], username)
 		},
 	}
 	cmd.Flags().StringVar(&username, "as", "", "SSH username (required)")
 	return cmd
+}
+
+// runACLRevoke revokes an ACL through the typed client and prints the result.
+func runACLRevoke(ctx context.Context, client ControlPlaneClient, out io.Writer, caller, agent, username string) error {
+	entry, err := client.RevokeACL(ctx, caller, agent, username)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "revoked: id=%s\n", entry.ID)
+	return nil
 }
 
 // newACLLsCmd returns `uncluster acl ls [--caller=X] [--agent=Y]`.
@@ -124,46 +97,11 @@ func newACLLsCmd() *cobra.Command {
 		Use:   "ls",
 		Short: "List ACL entries",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := LoadCLIConfig()
+			client, err := newConfiguredControlPlaneClient()
 			if err != nil {
 				return err
 			}
-			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config set server=URL` and `uncluster config set token --stdin`")
-			}
-			client := NewClient(cfg.Server, cfg.Token)
-
-			q := url.Values{}
-			if callerFilter != "" {
-				q.Set("caller", callerFilter)
-			}
-			if agentFilter != "" {
-				q.Set("agent", agentFilter)
-			}
-			path := "/v1/acl"
-			if len(q) > 0 {
-				path += "?" + q.Encode()
-			}
-
-			var entries []api.ACLEntrySummary
-			if err := client.Do(cmd.Context(), "GET", path, nil, &entries); err != nil {
-				return err
-			}
-
-			if asJSON {
-				b, _ := json.MarshalIndent(entries, "", "  ")
-				fmt.Fprintln(cmd.OutOrStdout(), string(b))
-				return nil
-			}
-
-			fmt.Fprintf(cmd.OutOrStdout(), "%-28s %-28s %-20s %-12s %s\n",
-				"ID", "CALLER", "AGENT", "USERNAME", "CREATED")
-			for _, e := range entries {
-				fmt.Fprintf(cmd.OutOrStdout(), "%-28s %-28s %-20s %-12s %s\n",
-					e.ID, e.CallerTokenID, e.AgentID, e.Username,
-					time.Unix(e.CreatedAt, 0).Format(time.RFC3339))
-			}
-			return nil
+			return runACLList(cmd.Context(), client, cmd.OutOrStdout(), callerFilter, agentFilter, asJSON)
 		},
 	}
 	cmd.Flags().StringVar(&callerFilter, "caller", "", "filter by caller token id")
@@ -172,16 +110,25 @@ func newACLLsCmd() *cobra.Command {
 	return cmd
 }
 
-// selectACLEntry returns the ACL row matching both agentID and username. The
-// agentID must already be the canonical Agent ID (resolved from a name via the
-// control plane); matching on the resolved ID — not on the raw name argument —
-// is what keeps revoke from deleting a different Agent's row when a Caller holds
-// the same username on more than one Agent (#141). It errors when no row matches.
-func selectACLEntry(entries []api.ACLEntrySummary, agentID, username string) (api.ACLEntrySummary, error) {
-	for _, e := range entries {
-		if e.AgentID == agentID && e.Username == username {
-			return e, nil
-		}
+// runACLList lists ACL entries through the typed client and renders them.
+func runACLList(ctx context.Context, client ControlPlaneClient, out io.Writer, callerFilter, agentFilter string, asJSON bool) error {
+	entries, err := client.ListACL(ctx, callerFilter, agentFilter)
+	if err != nil {
+		return err
 	}
-	return api.ACLEntrySummary{}, fmt.Errorf("no ACL entry found for agent=%s username=%s", agentID, username)
+
+	if asJSON {
+		b, _ := json.MarshalIndent(entries, "", "  ")
+		fmt.Fprintln(out, string(b))
+		return nil
+	}
+
+	fmt.Fprintf(out, "%-28s %-28s %-20s %-12s %s\n",
+		"ID", "CALLER", "AGENT", "USERNAME", "CREATED")
+	for _, e := range entries {
+		fmt.Fprintf(out, "%-28s %-28s %-20s %-12s %s\n",
+			e.ID, e.CallerTokenID, e.AgentID, e.Username,
+			time.Unix(e.CreatedAt, 0).Format(time.RFC3339))
+	}
+	return nil
 }
