@@ -61,12 +61,16 @@ func startPrincipalsWriterServiceWindows(ctx context.Context) error {
 	return nil
 }
 
-// uninstallPrincipalsWriterService stops and removes the writer SCM service.
-// Used by the agent-service drift-rebuild and deprovision paths so the writer
-// never outlives the agent (#127). Best-effort: a stop failure (already
-// stopped) is ignored; an uninstall error is returned so the caller can surface
-// it.
-func uninstallPrincipalsWriterService(ctx context.Context, serviceExe string) error {
+// UninstallPrincipalsWriterService stops and removes the LocalSystem writer SCM
+// service. It is wired into the Windows deprovision path via the agent's
+// deprovision-cleanup seam (injected by the CLI, which can import gatekeeper) so
+// the writer never outlives the agent (#127 invariant; #146). Best-effort: a
+// stop failure (already stopped) is ignored; an uninstall error is returned so
+// the caller can log it.
+//
+// The agent-service drift-rebuild path does NOT call this helper: it uninstalls
+// the writer inline as part of its stop→uninstall→reinstall rebuild.
+func UninstallPrincipalsWriterService(ctx context.Context, serviceExe string) error {
 	_ = exec.CommandContext(ctx, "net", "stop", agent.WindowsPrincipalsWriterServiceName).Run()
 	svc, err := buildPrincipalsWriterService(serviceExe)
 	if err != nil {

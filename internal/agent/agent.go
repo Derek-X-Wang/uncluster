@@ -40,6 +40,16 @@ type Agent struct {
 	policyStateVal policyState       // last-applied policy state; guarded by policyMu
 	applyCh        chan applyRequest // serialised policy-apply channel; set in Run; nil until Run called
 
+	// deprovisionCleanup is an optional hook run during onRevoked (after the
+	// principals wipe) to tear down resources that must not outlive the agent —
+	// on Windows, the LocalSystem UnclusterPrincipalsWriter service (#127
+	// invariant "the writer never outlives the agent"; #146). It is injected by
+	// the CLI, which can import gatekeeper (this package cannot, to avoid a
+	// cycle). Nil on Unix and wherever no writer exists, leaving onRevoked's
+	// behavior unchanged. Best-effort: a hook error is logged and deprovision
+	// still completes.
+	deprovisionCleanup func(ctx context.Context) error
+
 	// Fail-closed-after: wipe principals if no successful heartbeat for this long.
 	fcaMu              sync.Mutex
 	failClosedAfterSec *int64    // nil = disabled; updated from heartbeat response
@@ -66,6 +76,15 @@ func (a *Agent) WithHealthProvider(hp HealthProvider) *Agent {
 // WithEndpointProvider attaches an optional endpoint detection override.
 func (a *Agent) WithEndpointProvider(ep EndpointProvider) *Agent {
 	a.endpointProvider = ep
+	return a
+}
+
+// WithDeprovisionCleanup attaches an optional cleanup hook run during
+// deprovision (onRevoked), after the principals wipe. On Windows the CLI wires
+// this to the LocalSystem writer uninstall so the writer never outlives the
+// agent (#146). A nil hook is a no-op (the Unix default).
+func (a *Agent) WithDeprovisionCleanup(fn func(ctx context.Context) error) *Agent {
+	a.deprovisionCleanup = fn
 	return a
 }
 
@@ -246,6 +265,15 @@ func (a *Agent) onRevoked(ctx context.Context) error {
 	principalsDir := a.cfg.ExpectedPaths.PrincipalsDir
 	if principalsDir != "" {
 		a.wipePrincipals(ctx, principalsDir)
+	}
+	// Tear down resources that must not outlive the agent — on Windows the
+	// LocalSystem principals-writer service (#127 "the writer never outlives the
+	// agent"; #146). Best-effort: log and continue so deprovision (marker + exit)
+	// always completes even if the hook fails (e.g. access-denied). Nil on Unix.
+	if a.deprovisionCleanup != nil {
+		if err := a.deprovisionCleanup(ctx); err != nil {
+			a.logger.Warn("deprovision: cleanup hook failed; a resource may be left installed", "err", err)
+		}
 	}
 	// Write .deprovisioned marker NEXT TO agent.toml so the supervisor sees
 	// it on next start (#46). Pre-fix the marker was derived from
