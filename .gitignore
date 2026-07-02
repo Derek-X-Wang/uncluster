@@ -22,3 +22,7 @@ coverage.html
 /.local/
 dist/
 bin/
+.dogfood/
+
+# agent worktrees (cmux / Agent isolation)
+.claude/worktrees/
