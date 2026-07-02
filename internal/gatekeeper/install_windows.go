@@ -177,54 +177,16 @@ func checkSSHDWindows(ctx context.Context) error {
 	return nil
 }
 
-// containsState checks whether the sc.exe output contains the given state.
+// containsState checks whether the sc.exe output contains the given state
+// (case-insensitive, per line).
 func containsState(output, state string) bool {
-	for _, line := range splitLines(output) {
-		if containsInsensitive(line, state) {
+	stateLow := strings.ToLower(state)
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(strings.ToLower(line), stateLow) {
 			return true
 		}
 	}
 	return false
-}
-
-// splitLines splits s on newlines.
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i, c := range s {
-		if c == '\n' {
-			lines = append(lines, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
-}
-
-// containsInsensitive checks if s contains substr case-insensitively.
-func containsInsensitive(s, substr string) bool {
-	sLow := toLower(s)
-	subLow := toLower(substr)
-	for i := 0; i <= len(sLow)-len(subLow); i++ {
-		if sLow[i:i+len(subLow)] == subLow {
-			return true
-		}
-	}
-	return false
-}
-
-func toLower(s string) string {
-	b := make([]byte, len(s))
-	for i := range s {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		b[i] = c
-	}
-	return string(b)
 }
 
 // NOTE (#127): the pre-role-split grantPrincipalsAccessWindows — which granted
@@ -373,20 +335,7 @@ func reloadSSHDWindows(ctx context.Context) error {
 
 // isAlreadyInstalledErr checks if the error indicates the service already exists.
 func isAlreadyInstalledErr(err error) bool {
-	s := err.Error()
-	return containsInsensitive(s, "already") || containsInsensitive(s, "exists") ||
-		containsInsensitive(s, "1073")
-}
-
-// writePrincipalsFile writes the principals file for the given username.
-// On Windows, ensures the directory exists first (mode bits not relevant).
-func writePrincipalsFile(dir, username string, principals []string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	content := ""
-	for _, p := range principals {
-		content += p + "\n"
-	}
-	return os.WriteFile(dir+"\\"+username, []byte(content), 0o644)
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "already") || strings.Contains(s, "exists") ||
+		strings.Contains(s, "1073")
 }

@@ -147,11 +147,6 @@ type CreateACLRequest struct {
 	Username string `json:"username"` // SSH username
 }
 
-// CreateACLResponse is the body returned by POST /v1/acl.
-type CreateACLResponse struct {
-	ACLEntrySummary
-}
-
 // --- agents list / detail ---
 
 // AgentEndpointSummary is one subnet→address binding in the agent detail response.

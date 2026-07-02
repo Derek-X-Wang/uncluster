@@ -4,8 +4,6 @@ package gatekeeper
 
 import (
 	"errors"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
@@ -57,19 +55,6 @@ func TestContainsState(t *testing.T) {
 	}
 }
 
-// TestContainsInsensitive verifies case-insensitive search.
-func TestContainsInsensitive(t *testing.T) {
-	if !containsInsensitive("Already installed", "already") {
-		t.Error("should find 'already' case-insensitively")
-	}
-	if !containsInsensitive("SERVICE_EXISTS", "exists") {
-		t.Error("should find 'exists' case-insensitively")
-	}
-	if containsInsensitive("nothing here", "running") {
-		t.Error("false positive")
-	}
-}
-
 // TestIsAlreadyInstalledErr verifies error detection for duplicate SCM service.
 func TestIsAlreadyInstalledErr(t *testing.T) {
 	tests := []struct {
@@ -86,24 +71,6 @@ func TestIsAlreadyInstalledErr(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("isAlreadyInstalledErr(%q) = %v, want %v", tc.msg, got, tc.want)
 		}
-	}
-}
-
-// TestWritePrincipalsFile verifies the helper creates directories and writes files.
-func TestWritePrincipalsFile(t *testing.T) {
-	dir := t.TempDir()
-	subdir := filepath.Join(dir, "auth_principals")
-
-	if err := writePrincipalsFile(subdir, "alice", []string{"alice", "alice-team"}); err != nil {
-		t.Fatalf("writePrincipalsFile: %v", err)
-	}
-	content, err := os.ReadFile(filepath.Join(subdir, "alice"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "alice\nalice-team\n"
-	if string(content) != want {
-		t.Errorf("content = %q, want %q", content, want)
 	}
 }
 
