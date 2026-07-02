@@ -9,16 +9,14 @@ import (
 )
 
 const (
-	// launchdAgentLabel is the launchd service identifier for the Uncluster Agent.
-	launchdAgentLabel = "com.uncluster.agent"
-
 	// launchdAgentPlist is the on-disk plist path that launchctl bootstrap takes
-	// as its argument. Matches serviceUnitPath() for darwin.
-	launchdAgentPlist = "/Library/LaunchDaemons/com.uncluster.agent.plist"
+	// as its argument. Matches serviceUnitPath() for darwin. Derived from the
+	// single agentServiceName constant (service_cmd_unix.go).
+	launchdAgentPlist = "/Library/LaunchDaemons/" + agentServiceName + ".plist"
 
 	// launchdAgentDomainTarget is the domain-qualified service target used by
 	// kickstart and bootout (system/<label>).
-	launchdAgentDomainTarget = "system/" + launchdAgentLabel
+	launchdAgentDomainTarget = "system/" + agentServiceName
 )
 
 // darwinLaunchctlBootstrap calls `launchctl bootstrap system <plist>`.

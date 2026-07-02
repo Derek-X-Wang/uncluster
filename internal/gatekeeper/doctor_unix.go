@@ -89,18 +89,17 @@ func checkSSHDBinary() CheckResult {
 }
 
 func checkSSHDRunning() CheckResult {
-	var cmd *exec.Cmd
+	var err error
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("launchctl", "list", "com.openssh.sshd")
+		err = runServiceCmd("launchctl", "list", "com.openssh.sshd")
 	default:
-		cmd = exec.Command("systemctl", "is-active", "--quiet", "ssh")
-		if cmd.Run() == nil {
+		if runServiceCmd("systemctl", "is-active", "--quiet", "ssh") == nil {
 			return CheckResult{Name: "sshd-running", Status: CheckOK, Message: "sshd active"}
 		}
-		cmd = exec.Command("systemctl", "is-active", "--quiet", "sshd")
+		err = runServiceCmd("systemctl", "is-active", "--quiet", "sshd")
 	}
-	if cmd.Run() != nil {
+	if err != nil {
 		return CheckResult{Name: "sshd-running", Status: CheckFail, Message: "sshd not running"}
 	}
 	return CheckResult{Name: "sshd-running", Status: CheckOK, Message: "sshd active"}
@@ -209,14 +208,14 @@ func lookupServiceGroupName() string {
 func checkServiceRunning() CheckResult {
 	switch runtime.GOOS {
 	case "darwin":
-		if exec.Command("launchctl", "list", "com.uncluster.agent").Run() == nil {
+		if runServiceCmd("launchctl", "list", agentServiceName) == nil {
 			return CheckResult{Name: "service-running", Status: CheckOK,
-				Message: "com.uncluster.agent loaded"}
+				Message: agentServiceName + " loaded"}
 		}
 		return CheckResult{Name: "service-running", Status: CheckFail,
-			Message: "com.uncluster.agent not loaded (run install)"}
+			Message: agentServiceName + " not loaded (run install)"}
 	default:
-		if exec.Command("systemctl", "is-active", "--quiet", "com.uncluster.agent").Run() == nil {
+		if runServiceCmd("systemctl", "is-active", "--quiet", agentServiceName) == nil {
 			return CheckResult{Name: "service-running", Status: CheckOK,
 				Message: "uncluster-agent service active"}
 		}
@@ -226,7 +225,7 @@ func checkServiceRunning() CheckResult {
 }
 
 func checkSSHDEffectiveConfig(paths agent.ExpectedPaths) CheckResult {
-	out, err := exec.Command("sshd", "-T").Output()
+	out, err := runServiceCmdOutput("sshd", "-T")
 	if err != nil {
 		return CheckResult{Name: "sshd-effective-config", Status: CheckWarn,
 			Message: fmt.Sprintf("sshd -T failed: %v", err)}
