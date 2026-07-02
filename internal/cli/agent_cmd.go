@@ -67,14 +67,9 @@ func RunAgent(ctx context.Context, stderrW io.Writer) error {
 				// copy. DoctorResults.HealthChecks is the SINGLE
 				// doctor → wire-shape mapping (#104) — the same one
 				// `agent doctor --json` uses — so the heartbeat and
-				// doctor never drift.
-				results := append(
-					gatekeeper.DoctorResults{
-						gatekeeper.CheckConfigLoadedPath(p),
-						gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
-					},
-					gatekeeper.Doctor(ctx, cfg)...,
-				)
+				// doctor never drift. FullDoctor is the single check
+				// composition shared by every call site (#143).
+				results := gatekeeper.FullDoctor(ctx, cfg, p)
 				return results.HealthChecks()
 			},
 		)
@@ -230,13 +225,7 @@ dogfood all parse ONE definition of "healthy". Exit code is still 0=ok,
 			// Prepend the loaded-path check so the operator sees up-front
 			// which file doctor is reasoning about. Especially useful
 			// post-install to confirm the system path was populated (#77).
-			results := append(
-				gatekeeper.DoctorResults{
-					gatekeeper.CheckConfigLoadedPath(cfgPath),
-					gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
-				},
-				gatekeeper.Doctor(cmd.Context(), cfg)...,
-			)
+			results := gatekeeper.FullDoctor(cmd.Context(), cfg, cfgPath)
 
 			code := results.ExitCode()
 
@@ -363,11 +352,11 @@ is self-healing.`,
 			}
 
 			cfg := agent.Config{
-				Server:     server,
-				AgentID:    resp.AgentID,
-				AgentName:  name,
-				AgentToken: resp.AgentToken,
-				CAPubkey:   resp.CAPubkey,
+				Server:         server,
+				AgentID:        resp.AgentID,
+				AgentName:      name,
+				AgentToken:     resp.AgentToken,
+				CAPubkey:       resp.CAPubkey,
 				ServerHTTPSPin: resp.ServerHTTPSPin,
 				ExpectedPaths: agent.ExpectedPaths{
 					CAPubkey:      resp.ExpectedPaths.CAPubkey,

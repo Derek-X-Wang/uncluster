@@ -199,13 +199,7 @@ func runDoctorCheck(ctx context.Context) validate.CheckResult {
 	if err != nil {
 		return validate.CheckResult{Name: "doctor", State: "fail", Raw: "load agent config: " + err.Error()}
 	}
-	results := append(
-		gatekeeper.DoctorResults{
-			gatekeeper.CheckConfigLoadedPath(cfgPath),
-			gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
-		},
-		gatekeeper.Doctor(ctx, cfg)...,
-	)
+	results := gatekeeper.FullDoctor(ctx, cfg, cfgPath)
 	var buf bytes.Buffer
 	_ = writeDoctorJSON(&buf, results, results.ExitCode())
 
@@ -257,13 +251,7 @@ func runInstallSmokeCheck(ctx context.Context) validate.CheckResult {
 			return gatekeeper.Install(ctx, cfg, exe)
 		},
 		Verify: func() (bool, string) {
-			results := append(
-				gatekeeper.DoctorResults{
-					gatekeeper.CheckConfigLoadedPath(cfgPath),
-					gatekeeper.CheckUpdateHostAllowlist(cfg.AllowedUpdateHosts()),
-				},
-				gatekeeper.Doctor(ctx, cfg)...,
-			)
+			results := gatekeeper.FullDoctor(ctx, cfg, cfgPath)
 			var buf bytes.Buffer
 			_ = writeDoctorJSON(&buf, results, results.ExitCode())
 			// Healthy only when doctor has zero failing checks (exit code != 2).
@@ -300,7 +288,7 @@ func runRebootSurvivalCheck(ctx context.Context, allowReboot bool) validate.Chec
 			if e != nil {
 				return e
 			}
-			if code := gatekeeper.Doctor(ctx, cfg).ExitCode(); code == 2 {
+			if code := gatekeeper.FullDoctor(ctx, cfg, cfgPath).ExitCode(); code == 2 {
 				return fmt.Errorf("agent not healthy pre-reboot (doctor exit 2); install/repair before arming reboot-survival")
 			}
 			return nil
@@ -343,7 +331,7 @@ func realServiceLiveness(ctx context.Context) func() (bool, string) {
 		if err != nil {
 			return false, "load config: " + err.Error()
 		}
-		results := gatekeeper.Doctor(ctx, cfg)
+		results := gatekeeper.FullDoctor(ctx, cfg, cfgPath)
 		var buf bytes.Buffer
 		_ = writeDoctorJSON(&buf, results, results.ExitCode())
 		return results.ExitCode() != 2, buf.String()
