@@ -32,26 +32,11 @@ The caller token and SSH key path are read from the CLI config
 		Args:               cobra.MinimumNArgs(1),
 		DisableFlagParsing: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			agentArg := args[0]
-			var extraSSHArgs []string
-			// Remaining args after "--" are passed to ssh.
-			for i, a := range args[1:] {
-				if a == "--" {
-					extraSSHArgs = args[i+2:]
-					break
-				}
-				// No "--" found; pass them all to ssh.
-				if i == len(args)-2 {
-					extraSSHArgs = args[1:]
-				}
-			}
+			agentArg, extraSSHArgs := splitSSHArgs(args)
 
-			cfg, err := LoadCLIConfig()
+			cfg, client, err := loadConfiguredCLI()
 			if err != nil {
 				return err
-			}
-			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config set server=URL` and `uncluster config set token --stdin`")
 			}
 
 			sshKeyPath := cfg.SSHKeyPath
@@ -72,11 +57,9 @@ The caller token and SSH key path are read from the CLI config
 				}
 			}
 
-			client := NewClient(cfg.Server, cfg.Token)
-
-			// 1. Resolve agent.
-			var agent api.AgentDetail
-			if err := client.Do(cmd.Context(), "GET", "/v1/agents/"+agentArg, nil, &agent); err != nil {
+			// 1. Resolve agent through the typed Control-plane client.
+			agent, err := client.GetAgent(cmd.Context(), agentArg)
+			if err != nil {
 				return fmt.Errorf("resolve agent: %w", err)
 			}
 
@@ -94,12 +77,12 @@ The caller token and SSH key path are read from the CLI config
 			}
 
 			// 4. Request cert from control plane.
-			var certResp api.CertResponse
-			if err := client.Do(cmd.Context(), "POST", "/v1/certs", api.CertRequest{
+			certResp, err := client.RequestCert(cmd.Context(), api.CertRequest{
 				Agent:    agent.ID,
 				Username: principal,
 				Pubkey:   strings.TrimSpace(string(pubkeyBytes)),
-			}, &certResp); err != nil {
+			})
+			if err != nil {
 				return fmt.Errorf("cert request: %w", err)
 			}
 
@@ -143,6 +126,22 @@ The caller token and SSH key path are read from the CLI config
 	cmd.Flags().StringVar(&asUser, "as", "", "SSH username (overrides config ssh_principal_default)")
 	cmd.Flags().StringVar(&subnet, "subnet", "", "subnet name to use for endpoint selection")
 	return cmd
+}
+
+// splitSSHArgs separates the agent argument (args[0]) from the extra arguments
+// forwarded to ssh. Everything after the first "--" is forwarded; when there is
+// no "--", all arguments after the agent are forwarded (the no-"--" fallback, so
+// `uncluster ssh box whoami` and `uncluster ssh box -- whoami` behave alike).
+// Pure and side-effect-free so it is unit-testable off the command closure.
+func splitSSHArgs(args []string) (agentArg string, sshArgs []string) {
+	agentArg = args[0]
+	rest := args[1:]
+	for i, a := range rest {
+		if a == "--" {
+			return agentArg, rest[i+1:]
+		}
+	}
+	return agentArg, rest
 }
 
 // pickEndpoint selects the best endpoint address from a list.
