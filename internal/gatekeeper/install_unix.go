@@ -125,20 +125,20 @@ func checkSSHD() error {
 	if _, err := exec.LookPath("sshd"); err != nil {
 		return fmt.Errorf("sshd not found in PATH. Install it first:\n%s", sshdInstallHint())
 	}
-	// Check running.
-	var checkCmd *exec.Cmd
+	// Check running. Routed through runServiceCmd so the probe is unit-testable
+	// without a live init system (#151); default behavior is unchanged.
+	var runErr error
 	switch runtime.GOOS {
 	case "darwin":
 		// On macOS, sshd is managed by launchd.
-		checkCmd = exec.Command("launchctl", "list", "com.openssh.sshd")
+		runErr = runServiceCmd("launchctl", "list", "com.openssh.sshd")
 	default:
-		checkCmd = exec.Command("systemctl", "is-active", "--quiet", "ssh")
+		runErr = runServiceCmd("systemctl", "is-active", "--quiet", "ssh")
 	}
-	if err := checkCmd.Run(); err != nil {
+	if runErr != nil {
 		// Try alternate name on Debian/Ubuntu.
 		if runtime.GOOS == "linux" {
-			alt := exec.Command("systemctl", "is-active", "--quiet", "sshd")
-			if alt.Run() != nil {
+			if runServiceCmd("systemctl", "is-active", "--quiet", "sshd") != nil {
 				return fmt.Errorf("sshd is not running. Start it with:\n%s", sshdStartHint())
 			}
 		} else {
@@ -535,17 +535,18 @@ func startService(ctx context.Context) error {
 	}
 }
 
-// reloadSSHD sends a graceful reload to sshd.
+// reloadSSHD sends a graceful reload to sshd. Routed through runServiceCmd so the
+// restart path is unit-testable without root (#151); real behavior is unchanged.
 func reloadSSHD() error {
 	switch runtime.GOOS {
 	case "darwin":
-		return exec.Command("launchctl", "kickstart", "-k", "system/com.openssh.sshd").Run()
+		return runServiceCmd("launchctl", "kickstart", "-k", "system/com.openssh.sshd")
 	default:
 		// Try both service names used by different distros.
-		if exec.Command("systemctl", "reload", "ssh").Run() == nil {
+		if runServiceCmd("systemctl", "reload", "ssh") == nil {
 			return nil
 		}
-		return exec.Command("systemctl", "reload", "sshd").Run()
+		return runServiceCmd("systemctl", "reload", "sshd")
 	}
 }
 

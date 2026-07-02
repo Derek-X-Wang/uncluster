@@ -16,7 +16,7 @@ func buildService(cfg agent.Config, serviceExe string) (service.Service, error) 
 	username := serviceAccountName()
 
 	svcCfg := &service.Config{
-		Name:        "com.uncluster.agent",
+		Name:        agentServiceName,
 		DisplayName: "Uncluster Agent",
 		Description: "Uncluster node agent (SSH certificate gatekeeper)",
 		Executable:  serviceExe,
