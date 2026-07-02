@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/derek-x-wang/uncluster/internal/policyhash"
 	"github.com/derek-x-wang/uncluster/internal/store"
-	"lukechampine.com/blake3"
 )
 
 // TestGetPolicySnapshot_HashMatchesPrincipals proves the fix for #41: a
@@ -139,20 +139,18 @@ func TestGetPolicySnapshot_HashMatchesPrincipals(t *testing.T) {
 	}
 }
 
-// canonicalPolicyHash mirrors the computePolicyHash serialisation: sorted
-// "username:caller1,caller2\n" lines. The store sorts via SQL ORDER BY
-// username, caller_token_id which is what GetPolicySnapshot returns; so the
-// snap.Principals slice is already in canonical order and we don't re-sort.
+// canonicalPolicyHash recomputes the policy hash from a snapshot's grouped
+// Principals by flattening them back to (username, caller) grants and asking the
+// canonical-form module — the SAME module the store hashes through — so this
+// test no longer re-implements the serialization/hash. It only reshapes data;
+// the format (sorted one-line-per-grant "username:caller\n" + blake3) lives
+// solely in internal/policyhash.
 func canonicalPolicyHash(principals []store.PolicyPrincipal) string {
-	var lines []byte
+	var grants []policyhash.Grant
 	for _, p := range principals {
 		for _, c := range p.CallerTokenIDs {
-			lines = append(lines, []byte(p.Username+":"+c+"\n")...)
+			grants = append(grants, policyhash.Grant{Username: p.Username, CallerTokenID: c})
 		}
 	}
-	if len(lines) == 0 {
-		return ""
-	}
-	sum := blake3.Sum256(lines)
-	return fmt.Sprintf("blake3:%x", sum)
+	return policyhash.Hash(grants)
 }
