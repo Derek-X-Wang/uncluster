@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,9 +18,10 @@ import (
 // principals files (#127), so the wipe MUST go through the writer. Best-effort:
 // a writer failure/timeout is logged by doApplyPolicy and ignored here, because
 // deprovision (marker + exit) must proceed regardless; the supervisor will not
-// restart the agent, and a stale principal expires at TTL anyway.
-func (a *Agent) wipePrincipals(_ string) {
-	if err := a.doApplyPolicy("", api.PolicyPayload{Version: 0, Hash: "", Principals: nil}); err != nil {
+// restart the agent, and a stale principal expires at TTL anyway. ctx lets the
+// wipe's writer wait return promptly on Agent shutdown (#153).
+func (a *Agent) wipePrincipals(ctx context.Context, _ string) {
+	if err := a.doApplyPolicy(ctx, "", api.PolicyPayload{Version: 0, Hash: "", Principals: nil}); err != nil {
 		a.logger.Warn("deprovision: writer wipe failed; principals may persist until TTL/next apply", "err", err)
 	}
 }
@@ -58,7 +60,11 @@ const applyPollInterval = 250 * time.Millisecond
 // The `dir` argument is accepted for signature parity with the Unix path but is
 // intentionally NOT forwarded to the writer: the writer's target dir is
 // hardcoded (WindowsPrincipalsDir) so a compromised agent cannot redirect it.
-func (a *Agent) doApplyPolicy(_ string, snap api.PolicyPayload) error {
+//
+// ctx is the Agent's shutdown context: the applied-status poll honours it via
+// pollApplied so a shutdown returns promptly even when the writer is absent or
+// slow, instead of blocking out the full applyTimeout (#153).
+func (a *Agent) doApplyPolicy(ctx context.Context, _ string, snap api.PolicyPayload) error {
 	// Local validation: reject obviously bad policy before it reaches the spool.
 	if err := validatePolicyPayload(snap); err != nil {
 		return err
@@ -77,26 +83,30 @@ func (a *Agent) doApplyPolicy(_ string, snap api.PolicyPayload) error {
 		return fmt.Errorf("write spool desired-state: %w", err)
 	}
 
-	// Poll for the writer's applied-status matching this version+hash.
+	// Poll for the writer's applied-status matching this version+hash, honouring
+	// ctx cancellation so shutdown does not stall on the writer wait (#153).
 	deadline := time.Now().Add(applyTimeout)
-	for {
-		st, ok := readMatchingAppliedStatus(spoolAppliedPath(), d)
-		if ok {
-			if st.Status == "ok" {
-				return nil
-			}
-			// Writer reported a failure for THIS desired-state.
-			if st.Error != "" {
-				return fmt.Errorf("principals writer failed: %s", st.Error)
-			}
-			return fmt.Errorf("principals writer reported failed apply (version %d)", st.AppliedVersion)
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("principals writer did not apply version %d within %s (is the UnclusterPrincipalsWriter service running?)",
-				snap.Version, applyTimeout)
-		}
-		time.Sleep(applyPollInterval)
+	st, resolved, err := pollApplied(ctx, deadline, applyPollInterval, func() (appliedStatus, bool) {
+		return readMatchingAppliedStatus(spoolAppliedPath(), d)
+	})
+	if err != nil {
+		// ctx cancelled (agent shutting down). The apply is not confirmed, so
+		// appliedVersion must NOT advance — surface it as a failed apply and let
+		// the control plane re-send on next start (ADR-0007 version handshake).
+		return fmt.Errorf("principals writer apply interrupted (version %d): %w", snap.Version, err)
 	}
+	if !resolved {
+		return fmt.Errorf("principals writer did not apply version %d within %s (is the UnclusterPrincipalsWriter service running?)",
+			snap.Version, applyTimeout)
+	}
+	if st.Status == "ok" {
+		return nil
+	}
+	// Writer reported a failure for THIS desired-state.
+	if st.Error != "" {
+		return fmt.Errorf("principals writer failed: %s", st.Error)
+	}
+	return fmt.Errorf("principals writer reported failed apply (version %d)", st.AppliedVersion)
 }
 
 // readMatchingAppliedStatus reads applied.json and returns (status, true) only

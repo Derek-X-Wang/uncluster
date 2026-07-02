@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,8 +31,10 @@ type applyRequest struct {
 }
 
 // runApplyPolicy performs the atomic principals-dir rewrite for a given policy
-// snapshot. It updates a.policyState on completion.
-func (a *Agent) runApplyPolicy(snap api.PolicyPayload) {
+// snapshot. It updates a.policyState on completion. ctx is the Agent's shutdown
+// context: on Windows the apply may wait for the LocalSystem PrincipalsWriter,
+// and that wait honours ctx so shutdown returns promptly (#153).
+func (a *Agent) runApplyPolicy(ctx context.Context, snap api.PolicyPayload) {
 	now := time.Now().Unix()
 	dir := a.cfg.ExpectedPaths.PrincipalsDir
 	if dir == "" {
@@ -39,7 +42,7 @@ func (a *Agent) runApplyPolicy(snap api.PolicyPayload) {
 		return
 	}
 
-	if err := a.doApplyPolicy(dir, snap); err != nil {
+	if err := a.doApplyPolicy(ctx, dir, snap); err != nil {
 		errStr := err.Error()
 		a.logger.Warn("policy apply failed", "version", snap.Version, "err", err)
 		a.policyMu.Lock()
@@ -216,4 +219,3 @@ func validateUsername(s string) error {
 	}
 	return nil
 }
-

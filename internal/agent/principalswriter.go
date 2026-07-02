@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/derek-x-wang/uncluster/internal/api"
 )
@@ -116,6 +118,45 @@ func unmarshalAppliedStatus(b []byte) (appliedStatus, error) {
 // polls for the writer to catch up to the version+hash it just submitted.
 func (s appliedStatus) matchesDesired(d desiredState) bool {
 	return s.AppliedVersion == d.Version && s.AppliedHash == d.Hash
+}
+
+// pollApplied waits for the writer's applied-status by calling read() every
+// interval until one of three things happens:
+//
+//   - read() returns (status, true): the writer reported a status matching the
+//     submitted desired-state → returns (status, true, nil). The caller inspects
+//     status.Status ("ok" vs "failed").
+//   - ctx is cancelled: the Agent is shutting down → returns (zero, false,
+//     ctx.Err()) PROMPTLY, without blocking out the remaining deadline. This is
+//     the #153 fix: on Windows the wait could otherwise stall Agent Run()
+//     shutdown for the full applyTimeout when the LocalSystem PrincipalsWriter is
+//     absent or slow, tripping the shutdown-race stress test's per-iteration
+//     deadline.
+//   - deadline elapses: returns (zero, false, nil) so the caller renders the
+//     visible "writer did not apply within N" timeout error (#127: a writer
+//     failure must surface as a failed apply, never a silent hang).
+//
+// The read closure is injected so this loop is platform-neutral and unit-testable
+// on any host; the Windows apply path supplies a closure over
+// readMatchingAppliedStatus(spoolAppliedPath(), d).
+func pollApplied(ctx context.Context, deadline time.Time, interval time.Duration, read func() (appliedStatus, bool)) (appliedStatus, bool, error) {
+	for {
+		if st, ok := read(); ok {
+			return st, true, nil
+		}
+		if !time.Now().Before(deadline) {
+			return appliedStatus{}, false, nil
+		}
+		// Interruptible sleep: wake on the poll interval OR on shutdown. Waiting
+		// via select (not time.Sleep) is what makes the wait cancellable.
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return appliedStatus{}, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // desiredStateDigest is a short stable digest of the serialised desired-state.

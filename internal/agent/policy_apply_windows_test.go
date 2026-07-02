@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -54,7 +55,7 @@ func TestWindowsApplyHandoff_RoundTrip(t *testing.T) {
 			{Username: "derek", CallerTokenIDs: []string{"caller_rt"}},
 		},
 	}
-	if err := a.doApplyPolicy(a.cfg.ExpectedPaths.PrincipalsDir, snap); err != nil {
+	if err := a.doApplyPolicy(context.Background(), a.cfg.ExpectedPaths.PrincipalsDir, snap); err != nil {
 		t.Fatalf("doApplyPolicy round-trip failed: %v", err)
 	}
 
@@ -69,6 +70,45 @@ func TestWindowsApplyHandoff_RoundTrip(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// TestWindowsApplyHandoff_CancelReturnsPromptly is the #153 Windows-side proof:
+// with NO writer running, cancelling the context makes doApplyPolicy return
+// promptly (well under applyTimeout) with a context error, instead of blocking
+// out the full 30s writer wait — the stall that tripped the shutdown-race
+// stress test's per-iteration deadline on windows-latest.
+func TestWindowsApplyHandoff_CancelReturnsPromptly(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("PROGRAMDATA", base)
+
+	a := &Agent{
+		cfg:    Config{ExpectedPaths: ExpectedPaths{PrincipalsDir: WindowsPrincipalsDir}},
+		logger: slog.Default(),
+	}
+	snap := api.PolicyPayload{
+		Version: 5, Hash: "blake3:cancel",
+		Principals: []api.PolicyPrincipal{{Username: "derek", CallerTokenIDs: []string{"caller_c"}}},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err := a.doApplyPolicy(ctx, a.cfg.ExpectedPaths.PrincipalsDir, snap)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error when the apply is cancelled with no writer running")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected a context.Canceled-wrapped error, got: %v", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("doApplyPolicy did not return promptly on cancel: %v (applyTimeout is %v)", elapsed, applyTimeout)
+	}
 }
 
 // TestWindowsApplyHandoff_WriterDownTimesOut verifies that if NO writer is

@@ -14,7 +14,6 @@ import (
 	"time"
 )
 
-
 // TestErrRevoked_IsDistinctFromErrUnauthorized verifies the two sentinel errors
 // are distinct values.
 func TestErrRevoked_IsDistinctFromErrUnauthorized(t *testing.T) {
@@ -91,7 +90,7 @@ func TestOnRevoked_WipesPrincipals(t *testing.T) {
 		logger:     testLogger(t),
 	}
 
-	err := a.onRevoked()
+	err := a.onRevoked(context.Background())
 	if !errors.Is(err, ErrDeprovisioned) {
 		t.Errorf("expected ErrDeprovisioned, got: %v", err)
 	}
@@ -135,7 +134,7 @@ func TestOnRevoked_WritesDeprovisionedMarker(t *testing.T) {
 		configPath: filepath.Join(configDir, "agent.toml"),
 		logger:     testLogger(t),
 	}
-	_ = a.onRevoked()
+	_ = a.onRevoked(context.Background())
 
 	content, err := os.ReadFile(filepath.Join(configDir, ".deprovisioned"))
 	if err != nil {
@@ -172,7 +171,7 @@ func TestCheckFailClosed_WipesWhenElapsed(t *testing.T) {
 	go func() {
 		defer close(done)
 		for req := range a.applyCh {
-			a.runApplyPolicy(req.snapshot)
+			a.runApplyPolicy(context.Background(), req.snapshot)
 		}
 	}()
 
@@ -182,7 +181,7 @@ func TestCheckFailClosed_WipesWhenElapsed(t *testing.T) {
 	a.lastHeartbeatOK = time.Now().Add(-5 * time.Second) // well past the 1s threshold
 	a.fcaMu.Unlock()
 
-	a.checkFailClosed()
+	a.checkFailClosed(context.Background())
 
 	// Give the apply goroutine time to process.
 	time.Sleep(50 * time.Millisecond)
@@ -216,7 +215,7 @@ func TestCheckFailClosed_NoopWhenNotElapsed(t *testing.T) {
 	a.lastHeartbeatOK = time.Now() // fresh heartbeat
 	a.fcaMu.Unlock()
 
-	a.checkFailClosed()
+	a.checkFailClosed(context.Background())
 
 	// File should still be there.
 	if _, err := os.Stat(filepath.Join(dir, "bob")); os.IsNotExist(err) {
@@ -239,7 +238,7 @@ func TestCheckFailClosed_NoopWhenDisabled(t *testing.T) {
 	}
 	// failClosedAfterSec is nil (disabled)
 
-	a.checkFailClosed()
+	a.checkFailClosed(context.Background())
 
 	if _, err := os.Stat(filepath.Join(dir, "carol")); os.IsNotExist(err) {
 		t.Error("carol principals file should NOT be wiped when fail-closed disabled")
@@ -258,7 +257,7 @@ func TestHeartbeatOnceV2_UpdatesLastHeartbeatOK(t *testing.T) {
 
 	a := &Agent{
 		cfg: Config{
-			AgentID: "ag_test",
+			AgentID:       "ag_test",
 			ExpectedPaths: ExpectedPaths{PrincipalsDir: t.TempDir()},
 		},
 		client: NewServerClient(srv.URL, "tok"),
@@ -295,7 +294,7 @@ func TestHeartbeatOnceV2_SetsFailClosedAfterFromResponse(t *testing.T) {
 
 	a := &Agent{
 		cfg: Config{
-			AgentID: "ag_test",
+			AgentID:       "ag_test",
 			ExpectedPaths: ExpectedPaths{PrincipalsDir: t.TempDir()},
 		},
 		client: NewServerClient(srv.URL, "tok"),
