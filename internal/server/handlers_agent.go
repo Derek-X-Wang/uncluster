@@ -18,23 +18,12 @@ import (
 var hashSecret = token.HashSecret
 
 // expectedPaths returns the canonical SSH-related paths for the given GOOS
-// platform string (as reported in metadata["os"] by the Agent). Defaults to
-// POSIX paths for unknown platforms.
+// platform string (as reported in metadata["os"] by the Agent). Delegates to
+// api.ExpectedPathsFor — the single source of truth also consumed by the
+// installer, the Windows principals writer, and doctor (#145) — so this
+// enrollment response can never promise a path the installer doesn't create.
 func expectedPaths(goos string) api.ExpectedPaths {
-	switch goos {
-	case "windows":
-		return api.ExpectedPaths{
-			CAPubkey:      `C:\ProgramData\ssh\uncluster_ca.pub`,
-			SSHDropIn:     `C:\ProgramData\ssh\sshd_config.d\uncluster.conf`,
-			PrincipalsDir: `C:\ProgramData\ssh\auth_principals`,
-		}
-	default: // linux, darwin, and anything else
-		return api.ExpectedPaths{
-			CAPubkey:      "/etc/ssh/uncluster_ca.pub",
-			SSHDropIn:     "/etc/ssh/sshd_config.d/uncluster.conf",
-			PrincipalsDir: "/etc/ssh/auth_principals",
-		}
-	}
+	return api.ExpectedPathsFor(goos)
 }
 
 // osFromMetadata extracts the "os" string from request metadata. Returns an

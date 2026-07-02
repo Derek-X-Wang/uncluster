@@ -5,15 +5,18 @@ package agent
 import (
 	"os"
 	"path/filepath"
+
+	"github.com/derek-x-wang/uncluster/internal/api"
 )
 
-// PrincipalsDir is the fixed, hardcoded location of the per-user
+// WindowsPrincipalsDir is the fixed, compiled-in location of the per-user
 // AuthorizedPrincipalsFile directory on Windows. The UnclusterPrincipalsWriter
-// NEVER reads this path from the (untrusted) spool desired-state — it is
-// compiled in, so a compromised agent cannot redirect the writer to render
-// files anywhere else (#127). This MUST match the gatekeeper installer's
-// windowsPaths.PrincipalsDir.
-const WindowsPrincipalsDir = `C:\ProgramData\ssh\auth_principals`
+// NEVER reads this path from the (untrusted) spool desired-state, so a
+// compromised agent cannot redirect the writer to render files anywhere else
+// (#127). It is the SAME canonical constant the gatekeeper installer and the
+// Control plane's expected_paths use (api.WindowsPrincipalsDirPath), so "where
+// the writer writes" and "where sshd reads" can never drift (#145).
+const WindowsPrincipalsDir = api.WindowsPrincipalsDirPath
 
 // SpoolDir returns the agent↔writer spool directory, e.g.
 // C:\ProgramData\uncluster\spool. It is derived from the same ProgramData base
