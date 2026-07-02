@@ -60,7 +60,7 @@ func RunAgent(ctx context.Context, stderrW io.Writer) error {
 		WithConfigPath(p).
 		WithDeprovisionCleanup(deprovisionCleanupHook()).
 		WithHealthProvider(
-			func(ctx context.Context) []api.AgentHealthCheck {
+			func(ctx context.Context) ([]api.AgentHealthCheck, error) {
 				// Surface the loaded config path first so the
 				// operator can confirm via the agent's heartbeat
 				// that the service is reading the system path,
@@ -70,8 +70,15 @@ func RunAgent(ctx context.Context, stderrW io.Writer) error {
 				// `agent doctor --json` uses — so the heartbeat and
 				// doctor never drift. FullDoctor is the single check
 				// composition shared by every call site (#143).
+				//
+				// FullDoctor does not return an error today (it maps
+				// every probe to a check with its own state), so this
+				// returns nil; the (checks, error) contract exists so
+				// a future erroring source — or a panic, which the
+				// agent recovers — surfaces as a synthetic failed
+				// check rather than an empty health slice (#150).
 				results := gatekeeper.FullDoctor(ctx, cfg, p)
-				return results.HealthChecks()
+				return results.HealthChecks(), nil
 			},
 		)
 	// Refuse to start if a .deprovisioned marker exists next to

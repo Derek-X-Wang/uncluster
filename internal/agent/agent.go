@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -22,7 +23,13 @@ var ErrDeprovisioned = errors.New("agent: deprovisioned by control plane")
 // to include in V2 heartbeat payloads. It is injected by the CLI layer (which
 // can safely import `gatekeeper`) to avoid an import cycle.
 // If nil, the agent sends an empty health slice.
-type HealthProvider func(ctx context.Context) []api.AgentHealthCheck
+//
+// The provider returns an error so a failure of the health source itself is
+// reportable rather than silent: a returned error (or a panic, which the agent
+// recovers) is converted into a synthetic FAILED health check on the heartbeat
+// wire. ADR-0009 makes the doctor the single health truth; the truth source
+// must therefore fail visibly, not vanish into an empty health slice (#150).
+type HealthProvider func(ctx context.Context) ([]api.AgentHealthCheck, error)
 
 // EndpointProvider is an optional hook for reporting agent network endpoints.
 // If nil, DetectEndpoints(nil) is called.
@@ -288,6 +295,51 @@ func (a *Agent) onRevoked(ctx context.Context) error {
 	return ErrDeprovisioned
 }
 
+// healthProviderFailCheck builds the synthetic FAILED check that stands in for
+// a health provider that errored or panicked. It names the failure so the
+// operator sees an unhealthy Agent on the heartbeat wire (and via `agent
+// doctor`) instead of an empty — falsely-healthy-looking — health slice (#150).
+func healthProviderFailCheck(msg string) api.AgentHealthCheck {
+	code := "provider_failure"
+	return api.AgentHealthCheck{
+		Component: "health_provider",
+		Check:     "collect",
+		State:     "fail",
+		ErrorCode: &code,
+		Message:   &msg,
+	}
+}
+
+// collectHealth runs the injected health provider and returns its checks, or a
+// single synthetic FAILED check when the provider errors or panics. Returns nil
+// when no provider is wired (the heartbeat then carries an empty health slice,
+// which is correct — there is no truth source to have failed). Provider failure
+// is logged once, at error level, in addition to travelling the wire.
+func (a *Agent) collectHealth(ctx context.Context) []api.AgentHealthCheck {
+	if a.healthProvider == nil {
+		return nil
+	}
+	checks, err := a.callHealthProvider(ctx)
+	if err != nil {
+		a.logger.Error("agent: health provider failed", "error", err)
+		return []api.AgentHealthCheck{healthProviderFailCheck(err.Error())}
+	}
+	return checks
+}
+
+// callHealthProvider invokes the provider, converting a recovered panic into an
+// error so collectHealth handles panic and error through one path. The heartbeat
+// must survive a broken doctor; a panic here would otherwise crash the beat.
+func (a *Agent) callHealthProvider(ctx context.Context) (checks []api.AgentHealthCheck, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			checks = nil
+			err = fmt.Errorf("health provider panicked: %v", r)
+		}
+	}()
+	return a.healthProvider(ctx)
+}
+
 func (a *Agent) heartbeatOnce(ctx context.Context) error {
 	return a.heartbeatOnceV2(ctx)
 }
@@ -301,14 +353,10 @@ func (a *Agent) heartbeatOnceV2(ctx context.Context) error {
 		endpoints = DetectEndpoints(nil)
 	}
 
-	// Collect health checks; panics/errors must NOT block heartbeat.
-	var health []api.AgentHealthCheck
-	if a.healthProvider != nil {
-		func() {
-			defer func() { recover() }() //nolint:errcheck
-			health = a.healthProvider(ctx)
-		}()
-	}
+	// Collect health checks. A provider error or panic must NOT block the
+	// heartbeat, and — unlike the prior silent recover — must NOT vanish: it
+	// becomes a synthetic FAILED check so an unhealthy truth-source surfaces.
+	health := a.collectHealth(ctx)
 
 	// Snapshot current policy state (last-applied).
 	a.policyMu.Lock()
