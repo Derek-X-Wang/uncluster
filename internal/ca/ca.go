@@ -252,21 +252,25 @@ type SignCertParams struct {
 // Returns the cert in authorized_keys form (ready to write next to the user's
 // private key as <key>-cert.pub).
 func Sign(caSigner ssh.Signer, p SignCertParams) ([]byte, error) {
+	// Input-validation failures below all wrap ErrInvalidInput so the caller can
+	// classify them (400) with errors.Is, independent of the message wording
+	// (#142). Server-side failures (e.g. the SignCert call) do NOT wrap it and
+	// classify as 500.
 	userKey, _, _, _, err := ssh.ParseAuthorizedKey(p.UserPublicKey)
 	if err != nil {
-		return nil, fmt.Errorf("ca: parse user pubkey: %w", err)
+		return nil, fmt.Errorf("%w: parse user pubkey: %v", ErrInvalidInput, err)
 	}
 	if strings.Contains(userKey.Type(), "cert-v01@openssh.com") {
-		return nil, errors.New("ca: input is itself a certificate; only raw user pubkeys can be signed")
+		return nil, fmt.Errorf("%w: input is itself a certificate; only raw user pubkeys can be signed", ErrInvalidInput)
 	}
 	if !p.ValidBefore.After(p.ValidAfter) {
-		return nil, errors.New("ca: ValidBefore must be strictly after ValidAfter")
+		return nil, fmt.Errorf("%w: ValidBefore must be strictly after ValidAfter", ErrInvalidInput)
 	}
 	if len(p.Principals) == 0 {
-		return nil, errors.New("ca: at least one principal required")
+		return nil, fmt.Errorf("%w: at least one principal required", ErrInvalidInput)
 	}
 	if p.KeyID == "" {
-		return nil, errors.New("ca: KeyID required (use FormatKeyID)")
+		return nil, fmt.Errorf("%w: KeyID required (use FormatKeyID)", ErrInvalidInput)
 	}
 
 	cert := &ssh.Certificate{
