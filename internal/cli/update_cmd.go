@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"io"
 
 	"github.com/spf13/cobra"
 
@@ -39,22 +41,16 @@ The asset-url-template and sha256-url-template accept {os}, {arch}, and
 			if version == "" {
 				return fmt.Errorf("--version is required")
 			}
-			cfg, err := LoadCLIConfig()
+			client, err := newConfiguredControlPlaneClient()
 			if err != nil {
 				return err
 			}
-			client := NewClient(cfg.Server, cfg.Token)
-			req := api.SetUpdatePolicyRequest{
+			return runServerUpdateSet(cmd.Context(), client, cmd.OutOrStdout(), api.SetUpdatePolicyRequest{
 				ExpectedVersion:   version,
 				AssetURLTemplate:  assetTmpl,
 				SHA256URLTemplate: sha256Tmpl,
 				Force:             force,
-			}
-			if err := client.Do(cmd.Context(), "POST", "/v1/server/update", req, nil); err != nil {
-				return err
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "update policy set: expected_version=%s\n", version)
-			return nil
+			})
 		},
 	}
 	set.Flags().StringVar(&version, "version", "", "expected agent version, e.g. v2.1.0 (required)")
@@ -64,6 +60,16 @@ The asset-url-template and sha256-url-template accept {os}, {arch}, and
 	cmd.AddCommand(set)
 
 	return cmd
+}
+
+// runServerUpdateSet pushes the agent update policy through the typed client and
+// confirms the expected version.
+func runServerUpdateSet(ctx context.Context, client ControlPlaneClient, out io.Writer, req api.SetUpdatePolicyRequest) error {
+	if err := client.SetUpdatePolicy(ctx, req); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "update policy set: expected_version=%s\n", req.ExpectedVersion)
+	return nil
 }
 
 // newAgentUpdateCmd returns the `uncluster agent update` command.

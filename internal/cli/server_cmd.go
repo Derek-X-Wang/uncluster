@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -13,7 +14,6 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/ca"
 	"github.com/derek-x-wang/uncluster/internal/server"
 	"github.com/derek-x-wang/uncluster/internal/store"
@@ -79,22 +79,11 @@ func newServerCmd() *cobra.Command {
 		Use:   "create",
 		Short: "Create a token (join, cli, or caller). Prints plaintext ONCE.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := LoadCLIConfig()
+			client, err := newConfiguredControlPlaneClient()
 			if err != nil {
 				return err
 			}
-			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config set server=URL` and `uncluster config set token --stdin`")
-			}
-			client := NewClient(cfg.Server, cfg.Token)
-			var out api.CreateTokenResponse
-			if err := client.Do(cmd.Context(), "POST", "/v1/tokens",
-				api.CreateTokenRequest{Kind: kind, Label: label}, &out); err != nil {
-				return err
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "token: %s\n", out.Token)
-			fmt.Fprintf(cmd.OutOrStdout(), "id:    %s\n", out.ID)
-			return nil
+			return runTokenCreate(cmd.Context(), client, cmd.OutOrStdout(), kind, label)
 		},
 	}
 	create.Flags().StringVar(&kind, "kind", "", "join | cli | caller (required)")
@@ -106,24 +95,14 @@ func newServerCmd() *cobra.Command {
 		Use:   "ls",
 		Short: "List tokens",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, _ := LoadCLIConfig()
-			client := NewClient(cfg.Server, cfg.Token)
-			var out []api.TokenSummary
-			if err := client.Do(cmd.Context(), "GET", "/v1/tokens", nil, &out); err != nil {
+			// Previously this skipped the config guard (LoadCLIConfig error
+			// ignored) and silently built a client against empty server/token;
+			// it now shares the one guard like every other command (#149).
+			client, err := newConfiguredControlPlaneClient()
+			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%-18s %-7s %-20s %-10s\n", "ID", "KIND", "LABEL", "STATE")
-			for _, t := range out {
-				state := "active"
-				switch {
-				case t.RevokedAt != nil:
-					state = "revoked"
-				case t.UsedAt != nil:
-					state = "used"
-				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%-18s %-7s %-20s %-10s\n", t.ID, t.Kind, t.Label, state)
-			}
-			return nil
+			return runTokenList(cmd.Context(), client, cmd.OutOrStdout())
 		},
 	}
 	tok.AddCommand(ls)
@@ -133,9 +112,11 @@ func newServerCmd() *cobra.Command {
 		Short: "Revoke a token",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _ := LoadCLIConfig()
-			client := NewClient(cfg.Server, cfg.Token)
-			return client.Do(cmd.Context(), "DELETE", "/v1/tokens/"+args[0], nil, nil)
+			client, err := newConfiguredControlPlaneClient()
+			if err != nil {
+				return err
+			}
+			return runTokenRevoke(cmd.Context(), client, args[0])
 		},
 	}
 	tok.AddCommand(revoke)
@@ -231,6 +212,44 @@ func newServerCmd() *cobra.Command {
 	cmd.AddCommand(newServerUpdateCmd())
 
 	return cmd
+}
+
+// runTokenCreate mints a token through the typed client and prints the
+// plaintext (shown once) plus its id.
+func runTokenCreate(ctx context.Context, client ControlPlaneClient, out io.Writer, kind, label string) error {
+	resp, err := client.CreateToken(ctx, kind, label)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "token: %s\n", resp.Token)
+	fmt.Fprintf(out, "id:    %s\n", resp.ID)
+	return nil
+}
+
+// runTokenList lists tokens through the typed client, rendering active/used/
+// revoked state.
+func runTokenList(ctx context.Context, client ControlPlaneClient, out io.Writer) error {
+	tokens, err := client.ListTokens(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%-18s %-7s %-20s %-10s\n", "ID", "KIND", "LABEL", "STATE")
+	for _, t := range tokens {
+		state := "active"
+		switch {
+		case t.RevokedAt != nil:
+			state = "revoked"
+		case t.UsedAt != nil:
+			state = "used"
+		}
+		fmt.Fprintf(out, "%-18s %-7s %-20s %-10s\n", t.ID, t.Kind, t.Label, state)
+	}
+	return nil
+}
+
+// runTokenRevoke revokes a token by id through the typed client.
+func runTokenRevoke(ctx context.Context, client ControlPlaneClient, id string) error {
+	return client.RevokeToken(ctx, id)
 }
 
 // resolveDBPath returns the supplied path, or the XDG default if empty.

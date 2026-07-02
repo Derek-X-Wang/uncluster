@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -33,116 +35,12 @@ func newAgentsLsCmd() *cobra.Command {
 		Use:   "ls",
 		Short: "List registered agents",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := LoadCLIConfig()
+			cfg, client, err := loadConfiguredCLI()
 			if err != nil {
 				return err
 			}
-			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config init`")
-			}
-			client := NewClient(cfg.Server, cfg.Token)
-
-			var agents []api.AgentDetail
-			if err := client.Do(cmd.Context(), "GET", "/v1/agents", nil, &agents); err != nil {
-				return err
-			}
-
-			// Compute staleness and filter.
-			now := time.Now()
-			type row struct {
-				ag      api.AgentDetail
-				seen    time.Duration // negative means never
-				status  string        // computed: online|stale|offline
-				bestEP  string        // best endpoint address for caller's subnets
-				subnets string        // comma-sep subnet names
-			}
-			var rows []row
-			for _, ag := range agents {
-				var seen time.Duration
-				var computedStatus string
-				if ag.LastSeenAt == nil {
-					computedStatus = "offline"
-				} else {
-					seen = now.Sub(time.Unix(*ag.LastSeenAt, 0))
-					switch {
-					case seen < 30*time.Second:
-						computedStatus = "online"
-					case seen < time.Hour:
-						computedStatus = "stale"
-					default:
-						computedStatus = "offline"
-					}
-				}
-
-				// Filter by status.
-				if statusFilter != "" && computedStatus != statusFilter {
-					continue
-				}
-
-				// Build subnet list and best endpoint.
-				var subnetNames []string
-				for _, ep := range ag.Endpoints {
-					subnetNames = append(subnetNames, ep.Subnet)
-				}
-
-				// Filter by subnet.
-				if subnetFilter != "" {
-					found := false
-					for _, sn := range subnetNames {
-						if sn == subnetFilter {
-							found = true
-							break
-						}
-					}
-					if !found {
-						continue
-					}
-				}
-
-				// Pick best endpoint: first overlap with caller's subnets, then first.
-				bestEP := ""
-				if len(ag.Endpoints) > 0 {
-					bestEP = ag.Endpoints[0].Address
-					if len(cfg.Subnets) > 0 {
-						callerSet := map[string]bool{}
-						for _, s := range cfg.Subnets {
-							callerSet[s] = true
-						}
-						for _, ep := range ag.Endpoints {
-							if callerSet[ep.Subnet] {
-								bestEP = ep.Address
-								break
-							}
-						}
-					}
-				}
-
-				rows = append(rows, row{
-					ag:      ag,
-					seen:    seen,
-					status:  computedStatus,
-					bestEP:  bestEP,
-					subnets: strings.Join(subnetNames, ","),
-				})
-			}
-
-			if jsonOut {
-				b, _ := json.MarshalIndent(agents, "", "  ")
-				fmt.Fprintln(cmd.OutOrStdout(), string(b))
-				return nil
-			}
-
-			fmt.Fprintf(cmd.OutOrStdout(), "%-20s %-20s %-8s %-20s %-12s %s\n",
-				"NAME", "ID", "STATUS", "ENDPOINT", "SEEN", "VERSION")
-			for _, r := range rows {
-				seenStr := "never"
-				if r.ag.LastSeenAt != nil {
-					seenStr = relTime(r.seen)
-				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%-20s %-20s %-8s %-20s %-12s %s\n",
-					r.ag.Name, r.ag.ID, r.status, r.bestEP, seenStr, r.ag.AgentVersion)
-			}
-			return nil
+			return runAgentsList(cmd.Context(), client, cmd.OutOrStdout(),
+				cfg.Subnets, time.Now(), jsonOut, subnetFilter, statusFilter)
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "JSON output")
@@ -151,27 +49,125 @@ func newAgentsLsCmd() *cobra.Command {
 	return cmd
 }
 
+// runAgentsList lists agents through the typed client, computing status/best
+// endpoint relative to now (injected for deterministic tests) and honoring the
+// subnet/status filters. callerSubnets biases best-endpoint selection.
+func runAgentsList(ctx context.Context, client ControlPlaneClient, out io.Writer,
+	callerSubnets []string, now time.Time, jsonOut bool, subnetFilter, statusFilter string) error {
+	agents, err := client.ListAgents(ctx)
+	if err != nil {
+		return err
+	}
+
+	type row struct {
+		ag     api.AgentDetail
+		seen   time.Duration // negative means never
+		status string        // computed: online|stale|offline
+		bestEP string        // best endpoint address for caller's subnets
+	}
+	var rows []row
+	for _, ag := range agents {
+		var seen time.Duration
+		var computedStatus string
+		if ag.LastSeenAt == nil {
+			computedStatus = "offline"
+		} else {
+			seen = now.Sub(time.Unix(*ag.LastSeenAt, 0))
+			switch {
+			case seen < 30*time.Second:
+				computedStatus = "online"
+			case seen < time.Hour:
+				computedStatus = "stale"
+			default:
+				computedStatus = "offline"
+			}
+		}
+
+		// Filter by status.
+		if statusFilter != "" && computedStatus != statusFilter {
+			continue
+		}
+
+		// Build subnet list for the subnet filter.
+		var subnetNames []string
+		for _, ep := range ag.Endpoints {
+			subnetNames = append(subnetNames, ep.Subnet)
+		}
+		if subnetFilter != "" {
+			found := false
+			for _, sn := range subnetNames {
+				if sn == subnetFilter {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+
+		// Pick best endpoint: first overlap with caller's subnets, then first.
+		bestEP := ""
+		if len(ag.Endpoints) > 0 {
+			bestEP = ag.Endpoints[0].Address
+			if len(callerSubnets) > 0 {
+				callerSet := map[string]bool{}
+				for _, s := range callerSubnets {
+					callerSet[s] = true
+				}
+				for _, ep := range ag.Endpoints {
+					if callerSet[ep.Subnet] {
+						bestEP = ep.Address
+						break
+					}
+				}
+			}
+		}
+
+		rows = append(rows, row{ag: ag, seen: seen, status: computedStatus, bestEP: bestEP})
+	}
+
+	if jsonOut {
+		b, _ := json.MarshalIndent(agents, "", "  ")
+		fmt.Fprintln(out, string(b))
+		return nil
+	}
+
+	fmt.Fprintf(out, "%-20s %-20s %-8s %-20s %-12s %s\n",
+		"NAME", "ID", "STATUS", "ENDPOINT", "SEEN", "VERSION")
+	for _, r := range rows {
+		seenStr := "never"
+		if r.ag.LastSeenAt != nil {
+			seenStr = relTime(r.seen)
+		}
+		fmt.Fprintf(out, "%-20s %-20s %-8s %-20s %-12s %s\n",
+			r.ag.Name, r.ag.ID, r.status, r.bestEP, seenStr, r.ag.AgentVersion)
+	}
+	return nil
+}
+
 func newAgentsRmCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "rm <name|id>",
 		Short: "Revoke and remove an agent",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := LoadCLIConfig()
+			client, err := newConfiguredControlPlaneClient()
 			if err != nil {
 				return err
 			}
-			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config set server=URL` and `uncluster config set token --stdin`")
-			}
-			client := NewClient(cfg.Server, cfg.Token)
-			if err := client.Do(cmd.Context(), "DELETE", "/v1/agents/"+args[0], nil, nil); err != nil {
-				return err
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "agent %s revoked\n", args[0])
-			return nil
+			return runAgentsRemove(cmd.Context(), client, cmd.OutOrStdout(), args[0])
 		},
 	}
+}
+
+// runAgentsRemove revokes and removes an agent through the typed client.
+func runAgentsRemove(ctx context.Context, client ControlPlaneClient, out io.Writer, idOrName string) error {
+	if err := client.RemoveAgent(ctx, idOrName); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "agent %s revoked\n", idOrName)
+	return nil
 }
 
 func newAgentsSetCmd() *cobra.Command {
@@ -181,35 +177,34 @@ func newAgentsSetCmd() *cobra.Command {
 		Short: "Update agent settings",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := LoadCLIConfig()
+			client, err := newConfiguredControlPlaneClient()
 			if err != nil {
 				return err
 			}
-			if cfg.Server == "" || cfg.Token == "" {
-				return fmt.Errorf("CLI not configured; run `uncluster config set server=URL` and `uncluster config set token --stdin`")
-			}
-			client := NewClient(cfg.Server, cfg.Token)
-
-			body := map[string]any{}
-			if cmd.Flags().Changed("fail-closed-after") {
-				if failClosedAfter == "" || failClosedAfter == "0" {
-					body["fail_closed_after"] = nil
-				} else {
-					secs, err := parseDurationToSeconds(failClosedAfter)
-					if err != nil {
-						return fmt.Errorf("invalid --fail-closed-after: %w", err)
-					}
-					body["fail_closed_after"] = secs
-				}
-			}
-			if len(body) == 0 {
-				return fmt.Errorf("no fields to update; use --fail-closed-after=<duration>")
-			}
-			return client.Do(cmd.Context(), "PATCH", "/v1/agents/"+args[0], body, nil)
+			return runAgentsSet(cmd.Context(), client, args[0],
+				cmd.Flags().Changed("fail-closed-after"), failClosedAfter)
 		},
 	}
 	cmd.Flags().StringVar(&failClosedAfter, "fail-closed-after", "", "Duration after which principals are wiped on disconnect (e.g. 1h, 30m, 3600s, or 0 to clear)")
 	return cmd
+}
+
+// runAgentsSet updates agent settings through the typed client. failClosedChanged
+// reports whether the --fail-closed-after flag was set; an empty or "0" value
+// clears the window (nil seconds), any other value parses to seconds.
+func runAgentsSet(ctx context.Context, client ControlPlaneClient, idOrName string, failClosedChanged bool, failClosedAfter string) error {
+	if !failClosedChanged {
+		return fmt.Errorf("no fields to update; use --fail-closed-after=<duration>")
+	}
+	var seconds *int64
+	if failClosedAfter != "" && failClosedAfter != "0" {
+		secs, err := parseDurationToSeconds(failClosedAfter)
+		if err != nil {
+			return fmt.Errorf("invalid --fail-closed-after: %w", err)
+		}
+		seconds = &secs
+	}
+	return client.SetAgentFailClosedAfter(ctx, idOrName, seconds)
 }
 
 // parseDurationToSeconds parses a Go duration string or plain seconds integer
