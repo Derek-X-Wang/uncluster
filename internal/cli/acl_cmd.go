@@ -82,28 +82,33 @@ func newACLRevokeCmd() *cobra.Command {
 			}
 			client := NewClient(cfg.Server, cfg.Token)
 
-			// List to find matching entry.
+			// Resolve the agent name/id to its canonical Agent ID via the control
+			// plane first — the same resolution the grant path performs
+			// server-side. Without it, matching by name across the caller's rows
+			// deletes the first same-caller+username row across ALL agents, which
+			// can revoke the wrong Agent's access (#141). An unresolvable name is
+			// an error here, never a silent first-match delete.
+			var agent api.AgentDetail
+			if err := client.Do(cmd.Context(), "GET", "/v1/agents/"+args[1], nil, &agent); err != nil {
+				return fmt.Errorf("resolve agent %q: %w", args[1], err)
+			}
+
+			// List the caller's rows and select the one for the resolved agent.
 			q := url.Values{}
 			q.Set("caller", args[0])
 			var entries []api.ACLEntrySummary
 			if err := client.Do(cmd.Context(), "GET", "/v1/acl?"+q.Encode(), nil, &entries); err != nil {
 				return err
 			}
-			for _, e := range entries {
-				if e.Username == username {
-					// Agent matching: check by id or name (API returned agent_id).
-					// If args[1] looks like an id (ag_ prefix), compare directly.
-					// Otherwise the caller supplied a name; we trust the list result.
-					if args[1] == e.AgentID || !isAgentID(args[1]) {
-						if err := client.Do(cmd.Context(), "DELETE", "/v1/acl/"+e.ID, nil, nil); err != nil {
-							return err
-						}
-						fmt.Fprintf(cmd.OutOrStdout(), "revoked: id=%s\n", e.ID)
-						return nil
-					}
-				}
+			entry, err := selectACLEntry(entries, agent.ID, username)
+			if err != nil {
+				return fmt.Errorf("%w (caller=%s agent=%s)", err, args[0], args[1])
 			}
-			return fmt.Errorf("no ACL entry found for caller=%s agent=%s username=%s", args[0], args[1], username)
+			if err := client.Do(cmd.Context(), "DELETE", "/v1/acl/"+entry.ID, nil, nil); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "revoked: id=%s\n", entry.ID)
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&username, "as", "", "SSH username (required)")
@@ -167,6 +172,16 @@ func newACLLsCmd() *cobra.Command {
 	return cmd
 }
 
-func isAgentID(s string) bool {
-	return len(s) > 3 && s[:3] == "ag_"
+// selectACLEntry returns the ACL row matching both agentID and username. The
+// agentID must already be the canonical Agent ID (resolved from a name via the
+// control plane); matching on the resolved ID — not on the raw name argument —
+// is what keeps revoke from deleting a different Agent's row when a Caller holds
+// the same username on more than one Agent (#141). It errors when no row matches.
+func selectACLEntry(entries []api.ACLEntrySummary, agentID, username string) (api.ACLEntrySummary, error) {
+	for _, e := range entries {
+		if e.AgentID == agentID && e.Username == username {
+			return e, nil
+		}
+	}
+	return api.ACLEntrySummary{}, fmt.Errorf("no ACL entry found for agent=%s username=%s", agentID, username)
 }
