@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/derek-x-wang/uncluster/internal/policyhash"
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
-	"lukechampine.com/blake3"
 )
 
 type sqliteStore struct {
@@ -327,11 +327,11 @@ func (s *sqliteStore) SetAgentFailClosedAfter(ctx context.Context, id string, se
 
 func scanAgent(r rowScanner) (Agent, error) {
 	var (
-		a                Agent
-		lastSeen         sql.NullInt64
-		agentVersion     sql.NullString
-		failClosedAfter  sql.NullInt64
-		createdAt        int64
+		a               Agent
+		lastSeen        sql.NullInt64
+		agentVersion    sql.NullString
+		failClosedAfter sql.NullInt64
+		createdAt       int64
 	)
 	if err := r.Scan(&a.ID, &a.Name, &createdAt, &lastSeen, &a.Status, &agentVersion, &failClosedAfter); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -668,9 +668,17 @@ type dbQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// computePolicyHash calculates blake3:<hex> over the canonical serialisation:
-// sorted "username:caller1,caller2\n" lines (callers sorted within each user).
-// Returns "" for an empty ACL.
+// computePolicyHash returns the canonical blake3 policy hash for an agent's
+// current ACL, or "" for an empty ACL. The canonical form — one
+// "username:caller\n" line PER GRANT, sorted by (username, caller) — and the
+// hash live in internal/policyhash, the single owner of the format, so the store
+// and its tests cannot drift from it. (The prior comment here claimed grouped
+// "username:caller1,caller2" lines; the code has always emitted one line per
+// grant, and that is the byte-exact truth the version handshake depends on.)
+//
+// The SQL ORDER BY is retained so the scan is deterministic; policyhash re-sorts
+// identically — the ACL columns carry no COLLATE, so SQLite's BINARY ordering
+// equals Go's byte-wise string comparison for the ASCII usernames/token IDs.
 func computePolicyHash(ctx context.Context, db dbQueryer, agentID string) (string, error) {
 	rows, err := db.QueryContext(ctx,
 		`SELECT username, caller_token_id FROM acl WHERE agent_id = ? ORDER BY username, caller_token_id`, agentID)
@@ -679,22 +687,18 @@ func computePolicyHash(ctx context.Context, db dbQueryer, agentID string) (strin
 	}
 	defer rows.Close()
 
-	var lines []byte
+	var grants []policyhash.Grant
 	for rows.Next() {
-		var u, c string
-		if err := rows.Scan(&u, &c); err != nil {
+		var g policyhash.Grant
+		if err := rows.Scan(&g.Username, &g.CallerTokenID); err != nil {
 			return "", err
 		}
-		lines = append(lines, []byte(u+":"+c+"\n")...)
+		grants = append(grants, g)
 	}
 	if err := rows.Err(); err != nil {
 		return "", err
 	}
-	if len(lines) == 0 {
-		return "", nil
-	}
-	sum := blake3.Sum256(lines)
-	return fmt.Sprintf("blake3:%x", sum), nil
+	return policyhash.Hash(grants), nil
 }
 
 // ------------- agent endpoints (V2) -------------
