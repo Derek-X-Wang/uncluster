@@ -58,6 +58,7 @@ func RunAgent(ctx context.Context, stderrW io.Writer) error {
 	slog.Info("agent: loaded config", "path", p)
 	a := agent.New(cfg, nil).
 		WithConfigPath(p).
+		WithDeprovisionCleanup(deprovisionCleanupHook()).
 		WithHealthProvider(
 			func(ctx context.Context) []api.AgentHealthCheck {
 				// Surface the loaded config path first so the
