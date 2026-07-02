@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
+	"github.com/derek-x-wang/uncluster/internal/api"
 )
 
 // windowsBaseSSHDConfig is the stock Win32-OpenSSH base config that the
@@ -30,16 +31,12 @@ const windowsIncludeLine = "Include __PROGRAMDATA__/ssh/sshd_config.d/*"
 const dropInIncludeMarker = "# Added by uncluster agent install"
 
 // windowsPaths holds the canonical Windows paths for all SSH-related files
-// managed by the Uncluster gatekeeper.
-var windowsPaths = struct {
-	CAPubkey      string
-	SSHDropIn     string
-	PrincipalsDir string
-}{
-	CAPubkey:      `C:\ProgramData\ssh\uncluster_ca.pub`,
-	SSHDropIn:     `C:\ProgramData\ssh\sshd_config.d\uncluster.conf`,
-	PrincipalsDir: `C:\ProgramData\ssh\auth_principals`,
-}
+// managed by the Uncluster gatekeeper. It resolves from api.ExpectedPathsFor —
+// the single source of truth also used by the Control plane's expected_paths
+// response, the Windows principals writer, and doctor — so the installer can
+// never create files in a directory sshd (per the same canonical paths) does
+// not read (#145).
+var windowsPaths = api.ExpectedPathsFor("windows")
 
 // Install performs the privileged gatekeeper setup for Windows.
 // It is idempotent: re-running repairs drift without clobbering existing state.
@@ -172,9 +169,9 @@ func checkSSHDWindows(ctx context.Context) error {
 	// Check if state is RUNNING.
 	if !containsState(string(out), "RUNNING") {
 		return fmt.Errorf(
-			"OpenSSH Server (sshd) is installed but not running.\n"+
-				"Start it with:\n\n"+
-				"  Start-Service sshd\n"+
+			"OpenSSH Server (sshd) is installed but not running.\n" +
+				"Start it with:\n\n" +
+				"  Start-Service sshd\n" +
 				"  Set-Service sshd -StartupType Automatic\n")
 	}
 	return nil
