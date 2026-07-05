@@ -8,11 +8,20 @@ on:
 jobs:
   test:
     strategy:
+      # Do not cancel sibling OS legs when one fails — we want the Windows
+      # -race signal independently even if another leg is red (#165). All legs
+      # must still pass for `all-tests-pass`, so this does not weaken the gate.
+      fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  race: "-race" }
-          - { os: windows-latest, race: ""       }
-          - { os: macos-latest,   race: "-race" }
+          # ubuntu carries the coverage profile (it already runs -race, so the
+          # cover mode must be `atomic`) and is the only leg that uploads it.
+          - { os: ubuntu-latest,  race: "-race", cover: "-covermode=atomic -coverprofile=coverage.out" }
+          # windows now runs the race detector too (#165): the most
+          # concurrency-heavy code (policy apply, spool handoff, SCM service
+          # handlers) is Windows-tagged and previously had no race coverage.
+          - { os: windows-latest, race: "-race", cover: "" }
+          - { os: macos-latest,   race: "-race", cover: "" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -20,10 +29,59 @@ jobs:
         with:
           go-version: "1.25"
           cache: true
+      - name: verify C compiler present (race detector needs cgo)
+        if: runner.os == 'Windows'
+        # Go's race detector forces CGO_ENABLED=1 and requires a working C
+        # compiler + external linker. windows-latest ships gcc (mingw-w64) on
+        # PATH; assert it here so a missing/renamed toolchain fails legibly
+        # (=> report BLOCKED with this evidence) instead of surfacing as a
+        # confusing link error inside the test step (#165).
+        run: |
+          go env CC
+          gcc --version
       - name: go vet
         run: go vet ./...
       - name: go test
-        run: go test ./... ${{ matrix.race }} -count=1
+        run: go test ./... ${{ matrix.race }} ${{ matrix.cover }} -count=1
+      - name: upload coverage profile
+        # Visibility only — no gate/ratchet yet (#165). 14-day retention.
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile-${{ github.run_id }}
+          path: coverage.out
+          if-no-files-found: warn
+          retention-days: 14
+
+  # govulncheck — ADVISORY per #165. Runs on every PR but is intentionally NOT
+  # wired into `all-tests-pass`, so an upstream vuln-DB update that flags a
+  # dependency (or an as-yet-unpatched stdlib CVE) does not block unrelated
+  # PRs. The operator promotes it to a required gate later. Findings surface as
+  # a ::warning:: annotation while the job itself stays green (step-level
+  # continue-on-error), so an advisory signal never renders as a scary red X.
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: govulncheck (advisory)
+        id: vuln
+        continue-on-error: true
+        run: govulncheck ./...
+      - name: advisory outcome
+        if: always()
+        run: |
+          if [[ "${{ steps.vuln.outcome }}" != "success" ]]; then
+              echo "::warning::govulncheck reported findings (ADVISORY — not a merge gate per #165). See the 'govulncheck (advisory)' step log; bump the affected module or wait for a stdlib patch."
+          else
+              echo "govulncheck: no called vulnerabilities."
+          fi
 
   # T1a Compose smoke per ADR-0008. Failure-taxonomy:
   #   * [REQUIRED] markers in test output → red gate (product failure)
