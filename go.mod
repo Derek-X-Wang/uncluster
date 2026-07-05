@@ -9,8 +9,8 @@ require (
 	github.com/kardianos/service v1.2.4
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/crypto v0.50.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/crypto v0.52.0
+	golang.org/x/sys v0.45.0
 	lukechampine.com/blake3 v1.4.1
 	modernc.org/sqlite v1.49.1
 )
