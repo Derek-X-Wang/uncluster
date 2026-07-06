@@ -692,7 +692,6 @@ func checkServiceUnitDrift(intendedExe, intendedUser string) (string, error) {
 	return detectServiceUnitDrift(string(data), intendedExe, intendedUser, "agent", "launch"), nil
 }
 
-
 // serviceUnitPath returns the on-disk location of the agent's system service
 // unit file (systemd .service or launchd .plist).
 func serviceUnitPath() string {

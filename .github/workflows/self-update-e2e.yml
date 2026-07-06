@@ -1,42 +1,40 @@
-# Self-update E2E — Agent binary self-update MECHANISM, hosted-runner (#169).
+# Self-update E2E — Agent self-update through the REAL low-priv install (#187).
 #
-# ADR-0006 self-update flow: `server update set` → heartbeat `check_update` →
-# GET /v1/agent/update-plan → download → SHA256 verify → atomic swap →
-# service restart → next heartbeat reports the new version. Before this job the
-# flow had UNIT coverage only; nothing exercised it end-to-end on a real host.
+# ADR-0006 self-update flow, #187 hybrid-launcher shape: `server update set` →
+# heartbeat `check_update` → GET /v1/agent/update-plan → download → SHA256 verify
+# → STAGE+ACTIVATE in the service-writable payload store → pending-update marker →
+# the root-owned launcher restarts the child onto the new version → next heartbeat
+# reports it. No root at runtime: the agent never writes a root-owned binary and
+# never restarts the system service itself.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# SCOPE: this validates the self-update MECHANISM ONLY, NOT the privilege model.
+# SCOPE: this now validates self-update through the FAITHFUL LOW-PRIV install.
 # ─────────────────────────────────────────────────────────────────────────────
-# The Agent is deliberately run AS ROOT here (via a systemd override, below) so
-# it can write its own binary and restart its own service. That isolates the
-# download/verify/swap/restart/heartbeat mechanism from the ORTHOGONAL low-priv
-# privilege question.
+# The service runs as the unprivileged `uncluster` account (the T2-linux posture)
+# via `agent launch` — the resident launcher installed at the root-owned
+# /opt/uncluster/uncluster, supervising the versioned payload store under
+# /var/lib/uncluster. This is #187's regression witness: it proves a low-priv
+# agent self-updates the PAYLOAD (staged+activated in its writable store, launcher
+# restarts onto it) while the root-owned LAUNCHER stays put — the same
+# flip-once-the-fix-lands pattern PR #184 followed for #185.
 #
-# Through a faithful low-priv install (the T2-linux pattern: service runs as the
-# unprivileged `uncluster` account) self-update is currently BROKEN — the account
-# cannot write the root-owned binary (`<bin>.new` in /usr/local/bin → EACCES) nor
-# restart the system unit (`systemctl restart` needs root). That is tracked as a
-# design fork in **#187** (the Linux/macOS analog of the #185/#127 privilege-model
-# gap). When #187's fix lands, THIS workflow flips from the agent-as-root override
-# to the real low-priv install and becomes that fix's regression witness — the
-# same pattern PR #184 follows for #185. Until then, agent-as-root keeps the
-# self-update MECHANISM under continuous test rather than leaving it uncovered.
+# Historical note: before #187 this job ran the agent AS ROOT (a systemd
+# User=root override) to isolate the download/verify/swap MECHANISM from the
+# then-broken low-priv path. #187 removed that override; the low-priv path is the
+# product path now.
 #
-# OUT OF SCOPE — failed-start rollback (the supervisor revert to `<bin>.prev`
-# after a bad binary fails to start within 30s, ADR-0006). That is a disruptive,
-# two-phase resumable check (a bad binary must actually crash the service and the
-# supervisor must revert), which belongs to T4 / local-agent validation per
-# ADR-0009, NOT hosted CI. This job proves the forward path + the verify GATE
-# (corrupt checksum ⇒ no swap); it does not prove recovery from a swapped-but-bad
-# binary. Do not add a rollback assertion here.
+# OUT OF SCOPE — Windows self-update relocation (#139): Windows keeps its in-place
+# posture and is not exercised here. Also out of scope: a swapped-but-bad binary
+# failing its health commit and the launcher rolling back — that disruptive,
+# two-phase check belongs to T4 / local-agent validation per ADR-0009, not hosted
+# CI. This job proves the forward path + the verify GATE (corrupt checksum ⇒ no
+# stage/activate). Do not add a launcher-rollback assertion here.
 #
 # CADENCE — schedule (nightly) + workflow_dispatch, NOT per-PR (counsel: stabilize
 # before promoting). PROMOTION PATH TO PER-PR: after this job is empirically green
 # for N consecutive nightly/dispatch runs (operator's call, suggest N=20), move
-# the trigger to `pull_request`, add the job to ci.yml's `all-tests-pass` needs
-# list, and drop the agent-as-root override in favor of the real low-priv install
-# once #187 lands. File a one-line follow-up issue when ready.
+# the trigger to `pull_request` and add the job to ci.yml's `all-tests-pass` needs
+# list. File a one-line follow-up issue when ready.
 #
 # FAILURE TAXONOMY (ADR-0008) — step names carry bootstrap:/rendezvous:/product:
 # prefixes; scripts/ci/classify-step.sh computes the gate class deliberately so an
@@ -208,31 +206,26 @@ jobs:
           sudo sed -i '1i update_host_allowlist = ["127.0.0.1"]' /etc/uncluster/agent.toml
           echo "system agent.toml after pin:"; sudo head -3 /etc/uncluster/agent.toml
 
-      - name: bootstrap:agent-as-root
-        id: as-root
-        # Isolate the self-update MECHANISM from the low-priv privilege model
-        # (#187): a systemd override runs the service as root so it can write the
-        # root-owned binary and restart its own unit. This is test scaffolding,
-        # NOT the product path — the real low-priv path is broken pending #187 and
-        # this override is removed once that fix lands (see the header). The
-        # restart also reloads agent.toml with the update-host pin above.
+      - name: bootstrap:restart-after-pin
+        id: restart-pin
+        # Restart the LOW-PRIV service so it reloads agent.toml with the
+        # update-host pin added above. #187 removed the agent-as-root override —
+        # the service runs as the unprivileged `uncluster` account via `agent
+        # launch` (the resident launcher), which is the product path. Confirm it
+        # comes back as `uncluster`, NOT root.
         run: |
           set -euo pipefail
-          sudo mkdir -p /etc/systemd/system/com.uncluster.agent.service.d
-          printf '[Service]\nUser=root\nGroup=root\n' | \
-              sudo tee /etc/systemd/system/com.uncluster.agent.service.d/override.conf >/dev/null
-          sudo systemctl daemon-reload
           sudo systemctl restart com.uncluster.agent
-          # Confirm it actually came back as root.
           for _ in $(seq 1 15); do
-              if [[ "$(systemctl show -p User --value com.uncluster.agent)" == "root" ]] \
+              user="$(systemctl show -p User --value com.uncluster.agent)"
+              if [[ "${user}" == "uncluster" ]] \
                  && systemctl is-active --quiet com.uncluster.agent; then
-                  echo "service running as root"
+                  echo "service running as low-priv account: ${user}"
                   exit 0
               fi
               sleep 1
           done
-          echo "service did not come up as root"
+          echo "service did not come up as the uncluster account (User='${user:-none}')"
           sudo systemctl status com.uncluster.agent --no-pager || true
           exit 1
 
@@ -296,17 +289,25 @@ jobs:
           sudo journalctl -u com.uncluster.agent --no-pager | tail -60 || true
           exit 1
 
-      - name: product:assert-binary-swapped
+      - name: product:assert-payload-activated
         id: assert-swap
-        # On-disk corroboration of the swap: the live binary now reports v0.0.2 and
-        # the previous binary was preserved at <bin>.prev (Unix suffix) for the
-        # rollback path that lives outside this job's scope.
+        # On-disk corroboration of the #187 payload swap: the managed store's
+        # `current` pointer now resolves to v0.0.2, `previous` retains v0.0.1
+        # (last-known-good for the launcher's rollback path), and — the crux of
+        # the launcher/payload split — the ROOT-OWNED LAUNCHER at
+        # /opt/uncluster/uncluster is UNCHANGED (still v0.0.1): the low-priv agent
+        # self-updated only the payload, never the strict-chain launcher/sshd
+        # AuthorizedPrincipalsCommand binary.
         run: |
           set -euo pipefail
-          test "$(sudo /usr/local/bin/uncluster --version)" = "uncluster version v0.0.2"
-          sudo test -f /usr/local/bin/uncluster.prev
-          test "$(sudo /usr/local/bin/uncluster.prev --version)" = "uncluster version v0.0.1"
-          echo "binary swapped on disk; v0.0.1 preserved at uncluster.prev"
+          test "$(sudo /var/lib/uncluster/current --version)"  = "uncluster version v0.0.2"
+          test "$(sudo /var/lib/uncluster/previous --version)" = "uncluster version v0.0.1"
+          # The launcher is service-owned but never self-updated.
+          test "$(sudo /opt/uncluster/uncluster --version)"    = "uncluster version v0.0.1"
+          # current/previous live under versions/<v>/ in the service-writable store.
+          sudo readlink -f /var/lib/uncluster/current  | grep -q '/versions/v0.0.2/uncluster$'
+          sudo readlink -f /var/lib/uncluster/previous | grep -q '/versions/v0.0.1/uncluster$'
+          echo "payload activated v0.0.2 (previous=v0.0.1 retained); launcher stays v0.0.1"
 
       - name: product:trigger-update-corrupt
         id: trigger-corrupt
@@ -360,9 +361,14 @@ jobs:
               fi
               sleep 1
           done
-          # On-disk: still v0.0.2, and no v0.0.3 leaked into place.
-          test "$(sudo /usr/local/bin/uncluster --version)" = "uncluster version v0.0.2"
-          echo "corrupt update correctly rejected: old-good v0.0.2 still running + heartbeating"
+          # On-disk: payload still activated at v0.0.2, and no v0.0.3 was staged
+          # (the verify gate blocks a corrupt download before it reaches the store).
+          test "$(sudo /var/lib/uncluster/current --version)" = "uncluster version v0.0.2"
+          if sudo test -e /var/lib/uncluster/versions/v0.0.3; then
+              echo "v0.0.3 must NOT have been staged on a corrupt download"
+              exit 1
+          fi
+          echo "corrupt update correctly rejected: old-good v0.0.2 still activated + heartbeating"
 
       - name: collect:artifacts
         if: always()
@@ -376,9 +382,10 @@ jobs:
           cp /tmp/cp.log self-update-artifacts/cp.log 2>/dev/null || true
           cp /tmp/asset-server.log self-update-artifacts/asset-server.log 2>/dev/null || true
           sudo systemctl status com.uncluster.agent --no-pager 2>&1 | tee self-update-artifacts/svc-status.txt >/dev/null
-          sudo cat /etc/systemd/system/com.uncluster.agent.service.d/override.conf 2>&1 | tee self-update-artifacts/svc-override.conf >/dev/null
+          sudo cat /etc/systemd/system/com.uncluster.agent.service.d/restart.conf 2>&1 | tee self-update-artifacts/svc-restart-dropin.conf >/dev/null
           sudo cat /etc/uncluster/agent.toml 2>&1 | tee self-update-artifacts/agent-toml.txt >/dev/null
-          sudo ls -la /usr/local/bin/uncluster* 2>&1 | tee self-update-artifacts/binary-listing.txt >/dev/null
+          sudo ls -la /opt/uncluster 2>&1 | tee self-update-artifacts/launcher-listing.txt >/dev/null
+          sudo ls -laR /var/lib/uncluster 2>&1 | tee self-update-artifacts/payload-store-listing.txt >/dev/null
           find /tmp/assets -type f 2>&1 | tee self-update-artifacts/asset-listing.txt >/dev/null
           ls -la self-update-artifacts
         continue-on-error: true
@@ -406,11 +413,11 @@ jobs:
               "product:agent-join=${{ steps.agent-join.outcome }}" \
               "product:agent-install=${{ steps.agent-install.outcome }}" \
               "bootstrap:pin-update-host=${{ steps.pin-host.outcome }}" \
-              "bootstrap:agent-as-root=${{ steps.as-root.outcome }}" \
+              "bootstrap:restart-after-pin=${{ steps.restart-pin.outcome }}" \
               "product:assert-baseline-v001=${{ steps.assert-old.outcome }}" \
               "product:trigger-update-happy=${{ steps.trigger-happy.outcome }}" \
               "product:assert-updated-v002=${{ steps.assert-updated.outcome }}" \
-              "product:assert-binary-swapped=${{ steps.assert-swap.outcome }}" \
+              "product:assert-payload-activated=${{ steps.assert-swap.outcome }}" \
               "product:trigger-update-corrupt=${{ steps.trigger-corrupt.outcome }}" \
               "product:assert-no-swap-on-corrupt=${{ steps.assert-no-swap.outcome }}" \
               > /tmp/classify.out
