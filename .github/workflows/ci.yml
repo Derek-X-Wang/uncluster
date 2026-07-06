@@ -1051,29 +1051,31 @@ jobs:
               throw "principals not wiped"
           }
 
-      - name: advisory:writer-gone-probe
+      - name: product:writer-gone-after-deprovision
         id: writerprobe
         if: always()
-        # ADVISORY discovery (#166) — never gates (always exits 0; not passed to
-        # classify-step.sh). #182 landed spool-mediated writer self-removal, so this
-        # probe should now observe UnclusterPrincipalsWriter ABSENT after a successful
-        # deprovision (the agent submits a deprovision desired-state; the LocalSystem
-        # writer, which holds the DELETE the low-priv agent lacks per #146/#159, removes
-        # its OWN service).
+        continue-on-error: true
+        # REQUIRED product gate (#192). #182 landed spool-mediated writer self-removal:
+        # after a SUCCESSFUL deprovision the LocalSystem UnclusterPrincipalsWriter (which
+        # holds the DELETE the low-priv agent lacks per #146/#159) removes its OWN service,
+        # so this probe MUST observe the writer ABSENT. A SURVIVED-after-successful-deprovision
+        # is the #127 invariant violation #182 fixed and now fails the build.
         #
-        # Kept ADVISORY for THIS PR on purpose: this is the first real-Windows execution
-        # of the self-removal path, and standing up a brand-new REQUIRED gate on a first
-        # run risks bricking every PR on a false negative — the issue's "promote once
-        # green over several runs" guidance. A tiny follow-up PR flips advisory→required
-        # once ABSENT is witnessed over a couple of runs.
+        # Promoted advisory→required per #192 after ABSENT was witnessed over multiple
+        # real-Windows runs (PR #191's run, PR #184's run, and main runs f9fadce8 /
+        # 37c229cf / 9f09a053). This step carries `continue-on-error: true` and the
+        # SURVIVED branch exits 1 so the outcome is surfaced to the taxonomy classifier
+        # (enforce-taxonomy) as `product:writer-gone-after-deprovision`, which gates the
+        # merge — rather than failing the job inline and short-circuiting artifact
+        # collection.
         #
-        # The absence check is already async-aware so the future required flip inherits
-        # a robust probe: self-removal is asynchronous (Delete() marks the service for
-        # deletion; SCM finalizes it once the writer stops), so we POLL up to 90s for
-        # absence before concluding SURVIVED — a StopPending/marked-for-deletion service
-        # right after deprovision is NOT a regression (mirrors the d611086 marker-wait
-        # widening for the async Windows wipe). A non-success deprovision is inconclusive
-        # here — the deprovision product step already gates that failure.
+        # The absence check is async-aware: self-removal is asynchronous (Delete() marks
+        # the service for deletion; SCM finalizes it once the writer stops), so we POLL up
+        # to 90s for absence before concluding SURVIVED — a StopPending/marked-for-deletion
+        # service right after deprovision is NOT a regression (mirrors the d611086
+        # marker-wait widening for the async Windows wipe). A non-success deprovision is
+        # inconclusive here (exit 0) — the deprovision product step already gates that
+        # failure.
         run: |
           New-Item -ItemType Directory -Force -Path t2-windows-artifacts | Out-Null
           $probe = 't2-windows-artifacts\writer-gone-probe.txt'
@@ -1096,10 +1098,11 @@ jobs:
               $msg | Tee-Object -FilePath $probe
               Write-Host "::notice::T2-windows $msg"
           } else {
-              $msg = "writer-gone-probe: UnclusterPrincipalsWriter SURVIVED a SUCCESSFUL deprovision (status=$($svc.Status)) after a 90s wait — self-removal regression (#182). ADVISORY this PR; promoted to a required gate in a follow-up."
+              $msg = "writer-gone-probe: UnclusterPrincipalsWriter SURVIVED a SUCCESSFUL deprovision (status=$($svc.Status)) after a 90s wait — self-removal regression (#182/#127). REQUIRED gate (#192): failing the build."
               $msg | Tee-Object -FilePath $probe
               & sc.exe qc UnclusterPrincipalsWriter 2>&1 | Out-File -Append $probe
-              Write-Host "::warning::T2-windows $msg"
+              Write-Host "::error::T2-windows $msg"
+              exit 1
           }
           exit 0
 
@@ -1214,6 +1217,7 @@ jobs:
               "product:wait-principal-absent=${{ steps.waitabsent.outcome }}" \
               "product:negative-postrevoke-denied=${{ steps.neg2.outcome }}" \
               "product:deprovision-and-marker=${{ steps.deprov.outcome }}" \
+              "product:writer-gone-after-deprovision=${{ steps.writerprobe.outcome }}" \
               > /tmp/classify.out
           cat /tmp/classify.out
           class="$(grep -E '^class=' /tmp/classify.out | cut -d= -f2)"
