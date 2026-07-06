@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
 	"github.com/derek-x-wang/uncluster/internal/version"
@@ -514,6 +515,15 @@ func installLauncherBinary(srcExe, launcherPath string) error {
 	if err := os.Chmod(dir, 0o755); err != nil {
 		return fmt.Errorf("chmod launcher dir %s: %w", dir, err)
 	}
+	// sshd's AuthorizedPrincipalsCommand safe-path check rejects the launcher if
+	// ANY ancestor of its path is group/world-writable (#185/#195). Hosted CI
+	// runners (and some misconfigured hosts) ship /opt and /usr/local
+	// group/world-writable (mode 0777) for sudo-less tooling — the installer that
+	// points sshd at the launcher must make that path chain sane, just as it
+	// chowns the principals dir.
+	if err := tightenChain(dir, os.Lstat, os.Chmod); err != nil {
+		return fmt.Errorf("tighten launcher path chain: %w", err)
+	}
 	if !sameFile(srcExe, launcherPath) {
 		if err := copyFileAtomic(srcExe, launcherPath, 0o755); err != nil {
 			return err
@@ -524,6 +534,36 @@ func installLauncherBinary(srcExe, launcherPath string) error {
 	}
 	if err := os.Chmod(launcherPath, 0o755); err != nil {
 		return fmt.Errorf("chmod launcher %s: %w", launcherPath, err)
+	}
+	return nil
+}
+
+// tightenChain strips group/world-write bits from any ROOT-OWNED ancestor of
+// startDir (up to, but not including, "/") that carries them, so sshd's
+// AuthorizedPrincipalsCommand safe-path check accepts a launcher installed under
+// it. Only root-owned dirs are touched (a non-root ancestor is an operator
+// problem the doctor reports, not one the installer should paper over by
+// chowning), and only write bits are removed (never loosened). lstat/chmod are
+// injected for testability. Root ("/") is standard-strict and never chmod'd.
+func tightenChain(startDir string, lstat func(string) (os.FileInfo, error), chmod func(string, os.FileMode) error) error {
+	p := startDir
+	for {
+		fi, err := lstat(p)
+		if err != nil {
+			return fmt.Errorf("stat launcher ancestor %s: %w", p, err)
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Uid == 0 {
+			if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+				if err := chmod(p, perm&^0o022); err != nil {
+					return fmt.Errorf("tighten %s (mode %04o): %w", p, perm, err)
+				}
+			}
+		}
+		parent := filepath.Dir(p)
+		if parent == p || parent == "/" {
+			break
+		}
+		p = parent
 	}
 	return nil
 }
