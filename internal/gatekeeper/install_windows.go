@@ -207,11 +207,22 @@ func ensureWindowsInclude() error {
 }
 
 // ensureWindowsIncludeAt reads the base config at path; if it lacks a covering
-// drop-in Include directive, it appends windowsIncludeLine (tagged with
-// dropInIncludeMarker). A missing base config is tolerated (not an error) — on
-// such a host sshd_config.d may still be honored, and failing install here
-// would be worse than a no-op. Pure detection lives in
-// sshdConfigHasDropInInclude so the matrix can unit-test it.
+// GLOBAL (pre-Match) drop-in Include directive, it inserts windowsIncludeLine
+// (tagged with dropInIncludeMarker) BEFORE the first `Match` block so the
+// included directives (TrustedUserCAKeys, AuthorizedPrincipalsFile) apply
+// globally — not only to the connections a trailing Match matches.
+//
+// This is load-bearing (#177): the Win32-OpenSSH stock sshd_config ends with a
+// `Match Group administrators` block, so APPENDING the Include at EOF (the old
+// behaviour) scoped every drop-in directive to administrators only. For a
+// non-admin connection the CA trust never applied and a CA-signed cert was
+// rejected — Windows cert login never worked. A host carrying that old
+// post-Match Include self-heals here, because sshdConfigHasDropInInclude only
+// counts a pre-Match Include as covering.
+//
+// A missing base config is tolerated (not an error). Pure detection +
+// transformation live in sshdConfigHasDropInInclude / insertIncludeBeforeFirstMatch
+// so the matrix can unit-test the placement.
 func ensureWindowsIncludeAt(path string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -222,18 +233,43 @@ func ensureWindowsIncludeAt(path string) error {
 		}
 		return fmt.Errorf("read %s: %w", path, err)
 	}
-	if sshdConfigHasDropInInclude(string(b)) {
-		return nil // already covered — idempotent
+	content := string(b)
+	if sshdConfigHasDropInInclude(content) {
+		return nil // already covered by a global (pre-Match) include — idempotent
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open %s for append: %w", path, err)
-	}
-	defer f.Close()
-	if _, err := fmt.Fprintf(f, "\n%s\n%s\n", dropInIncludeMarker, windowsIncludeLine); err != nil {
-		return fmt.Errorf("append include to %s: %w", path, err)
+	if err := os.WriteFile(path, []byte(insertIncludeBeforeFirstMatch(content)), 0o644); err != nil {
+		return fmt.Errorf("write include into %s: %w", path, err)
 	}
 	return nil
+}
+
+// insertIncludeBeforeFirstMatch returns content with the drop-in Include block
+// (marker + windowsIncludeLine) inserted immediately before the first `Match`
+// line so the include is global. If there is no Match block, the block is
+// appended at EOF (still global). A leading blank line separates it from
+// surrounding content.
+func insertIncludeBeforeFirstMatch(content string) string {
+	block := "\n" + dropInIncludeMarker + "\n" + windowsIncludeLine + "\n"
+	if idx := firstMatchLineOffset(content); idx >= 0 {
+		return content[:idx] + block[1:] + content[idx:] // no leading blank before a Match line
+	}
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	return content + block
+}
+
+// firstMatchLineOffset returns the byte offset of the start of the first line
+// whose first token is `Match` (case-insensitive), or -1 if there is none.
+func firstMatchLineOffset(content string) int {
+	offset := 0
+	for _, line := range strings.SplitAfter(content, "\n") {
+		if fields := strings.Fields(strings.TrimSpace(line)); len(fields) > 0 && strings.EqualFold(fields[0], "Match") {
+			return offset
+		}
+		offset += len(line)
+	}
+	return -1
 }
 
 // sshdConfigHasDropInInclude reports whether the given sshd_config content
@@ -247,6 +283,12 @@ func ensureWindowsIncludeAt(path string) error {
 //
 // It looks for the literal `sshd_config.d` path component (normalised to
 // forward slashes) so an Include of some unrelated file does not match.
+//
+// Only a GLOBAL include counts (#177): an Include that appears AFTER the first
+// `Match` line is scoped to that conditional block, so it does NOT make the
+// drop-in's directives apply globally. Scanning stops at the first `Match` — an
+// include found only past it is treated as not-covering, which is what lets a
+// host with the old post-Match include self-heal on re-install.
 func sshdConfigHasDropInInclude(content string) bool {
 	sc := bufio.NewScanner(strings.NewReader(content))
 	for sc.Scan() {
@@ -255,10 +297,14 @@ func sshdConfigHasDropInInclude(content string) bool {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		if len(fields) == 0 {
 			continue
 		}
-		if !strings.EqualFold(fields[0], "Include") {
+		// A Match block begins here; any Include past it is not global.
+		if strings.EqualFold(fields[0], "Match") {
+			return false
+		}
+		if len(fields) < 2 || !strings.EqualFold(fields[0], "Include") {
 			continue
 		}
 		// Normalise the remainder's separators and look for the drop-in dir.
