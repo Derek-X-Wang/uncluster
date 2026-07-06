@@ -98,14 +98,16 @@ env:
 
 jobs:
   # ----------------------------------------------------------------------
-  # preflight: gate the whole workflow on whether the Tailscale auth
-  # credential is provisioned. Cross-machine E2E is impossible without a
-  # tailnet, and a missing credential is a configuration/rendezvous state,
-  # NOT a product failure — per ADR-0008's failure taxonomy it must not
-  # red-gate (which would spam fail-emails nightly until the secret is set).
-  # When unprovisioned, every role job below skips (skipped != failed), so
-  # the workflow goes green-with-a-notice. The moment the operator runs the
-  # `gh secret set TS_*` commands in the header, this auto-enables.
+  # preflight: gate the role jobs on whether the Tailscale auth credential is
+  # provisioned. Cross-machine E2E is impossible without a tailnet, and a missing
+  # credential is a configuration/rendezvous state, NOT a product failure — so it
+  # must not red-gate as a PRODUCT failure. When unprovisioned, every role job
+  # below skips. #186: a skipped-for-credentials run is NO LONGER a silent green
+  # — the `skip-integrity` job (bottom of file) turns it into a distinguishable
+  # ADVISORY failure (loud annotation + quarantine escalation after 3 consecutive)
+  # so vacuous zero-coverage can't masquerade as validated coverage. The moment
+  # the operator runs the `gh secret set TS_*` commands in the header, the role
+  # jobs run and skip-integrity is itself skipped — behavior returns to normal.
   # ----------------------------------------------------------------------
   preflight:
     name: preflight
@@ -125,7 +127,7 @@ jobs:
             echo "Tailscale credentials present — running cross-machine E2E."
           else
             echo "ts_configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Tailscale credentials not provisioned (TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET or TS_AUTHKEY) — skipping cross-machine E2E. Provision per this workflow's header to enable. Expected advisory skip, not a failure."
+            echo "::notice::Tailscale credentials not provisioned (TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET or TS_AUTHKEY) — role jobs will skip. The skip-integrity job (#186) surfaces this as an ADVISORY failure so the run does not masquerade as validated coverage. Provision per this workflow's header to enable real cross-machine validation."
           fi
 
   # ----------------------------------------------------------------------
@@ -1280,3 +1282,45 @@ jobs:
           done
 
           echo "All roles classified success — clean run."
+
+  # skip-integrity: the honest counterpart to the preflight gate (#186). When the
+  # Tailscale credentials are absent, every role job skips and enforce-taxonomy is
+  # also gated off — so the run would otherwise report a bare SUCCESS, i.e. "green
+  # nights" that validated NOTHING (the vacuous-green discovered during #185's
+  # reconciliation; the quarantine watchdog can't see it because skips aren't
+  # failures). This job runs ONLY in that credentials-absent case and makes it
+  # LOUD without weakening any gate:
+  #   * a prominent warning annotation + a job summary spelling out zero coverage;
+  #   * a plain `[ADVISORY]` log line so the EXISTING quarantine watchdog
+  #     (quarantine-rule.sh greps failed logs for `[ADVISORY]`) classifies the run
+  #     as an advisory failure and opens a needs-triage issue after 3 consecutive —
+  #     the ADR-0008 escalation path, reused unchanged (no quarantine.yml edit); and
+  #   * a non-zero exit so the run concludes FAILURE and is visually distinguishable
+  #     from a product-green run in the run list.
+  # Design judgment (the issue offers neutral|failure): a nightly that validated
+  # nothing should read RED, not green — the honest nudge to provision the TS_*
+  # secrets (see header). With credentials PRESENT this job is SKIPPED and the real
+  # role jobs + enforce-taxonomy gate exactly as before (behavior unchanged).
+  skip-integrity:
+    name: skip-integrity
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    if: ${{ always() && needs.preflight.outputs.ts_configured != 'true' }}
+    steps:
+      - name: report zero cross-machine coverage
+        run: |
+          msg="[ADVISORY] T3 cross-machine E2E validated NOTHING this run: Tailscale credentials (TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET or TS_AUTHKEY) are not provisioned, so every role job (cp, agent-linux, agent-macos, agent-windows, caller) skipped. This is a credentials/rendezvous gap, NOT product coverage."
+          # Plain log line first so quarantine-rule.sh's [ADVISORY] grep matches
+          # this failed step's log (it treats a failure carrying [ADVISORY] as an
+          # advisory failure and escalates after 3 consecutive).
+          echo "${msg}"
+          echo "::warning::${msg}"
+          {
+            echo "## T3 skipped — zero cross-machine coverage"
+            echo ""
+            echo "${msg}"
+            echo ""
+            echo "Provision the Tailscale secrets per this workflow's header to enable real cross-machine validation. Until then this run is intentionally RED (not a silent green); the quarantine watchdog opens a needs-triage issue after 3 consecutive."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Non-zero → the run concludes FAILURE (distinguishable in the run list).
+          exit 1
