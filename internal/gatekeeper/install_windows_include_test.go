@@ -60,6 +60,18 @@ func TestSSHDConfigHasInclude(t *testing.T) {
 			content: "PasswordAuthentication yes\n# Added by uncluster agent install\nInclude __PROGRAMDATA__\\ssh\\sshd_config.d\\*\n",
 			want:    true,
 		},
+		{
+			// #177: an Include AFTER a Match block is scoped to that block, so it
+			// does NOT make the drop-in global — must not count as covering.
+			name:    "include after a Match block is not global",
+			content: "PasswordAuthentication yes\nMatch Group administrators\n       AuthorizedKeysFile x\nInclude __PROGRAMDATA__/ssh/sshd_config.d/*\n",
+			want:    false,
+		},
+		{
+			name:    "include before a Match block is global",
+			content: "Include __PROGRAMDATA__/ssh/sshd_config.d/*\nMatch Group administrators\n       AuthorizedKeysFile x\n",
+			want:    true,
+		},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -152,4 +164,72 @@ func TestEnsureWindowsIncludeAt(t *testing.T) {
 			t.Errorf("missing base config should be tolerated, got: %v", err)
 		}
 	})
+
+	// #177: the stock Win32-OpenSSH config ends with `Match Group administrators`.
+	// The Include MUST be inserted before that block so CA trust + principals apply
+	// to non-admin connections (appending at EOF scoped them to admins only).
+	t.Run("inserts_before_trailing_Match_block", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := filepath.Join(dir, "sshd_config")
+		const stock = "PasswordAuthentication yes\nSubsystem sftp sftp-server.exe\n\n" +
+			"Match Group administrators\n" +
+			"       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys\n"
+		if err := os.WriteFile(cfg, []byte(stock), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureWindowsIncludeAt(cfg); err != nil {
+			t.Fatalf("ensureWindowsIncludeAt: %v", err)
+		}
+		s := readFileString(t, cfg)
+		inc := strings.Index(s, "sshd_config.d")
+		mat := strings.Index(s, "Match Group administrators")
+		if inc < 0 || mat < 0 || inc > mat {
+			t.Errorf("Include must be placed before the Match block (inc=%d, mat=%d):\n%s", inc, mat, s)
+		}
+		if !sshdConfigHasDropInInclude(s) {
+			t.Errorf("global (pre-Match) include not detected after insert:\n%s", s)
+		}
+		if !strings.Contains(s, "administrators_authorized_keys") {
+			t.Errorf("Match block content lost:\n%s", s)
+		}
+	})
+
+	t.Run("self_heals_post_Match_include", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := filepath.Join(dir, "sshd_config")
+		// The old buggy state: Include appended AFTER the Match block.
+		const buggy = "PasswordAuthentication yes\n" +
+			"Match Group administrators\n       AuthorizedKeysFile x\n\n" +
+			"# Added by uncluster agent install\n" +
+			"Include __PROGRAMDATA__/ssh/sshd_config.d/*\n"
+		if err := os.WriteFile(cfg, []byte(buggy), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureWindowsIncludeAt(cfg); err != nil {
+			t.Fatalf("ensureWindowsIncludeAt: %v", err)
+		}
+		s := readFileString(t, cfg)
+		if !sshdConfigHasDropInInclude(s) {
+			t.Errorf("did not self-heal to a global include:\n%s", s)
+		}
+		if inc, mat := strings.Index(s, "sshd_config.d"), strings.Index(s, "Match Group administrators"); inc > mat {
+			t.Errorf("first include still after the Match block (inc=%d, mat=%d):\n%s", inc, mat, s)
+		}
+		// A healed config is now idempotent.
+		if err := ensureWindowsIncludeAt(cfg); err != nil {
+			t.Fatalf("second ensureWindowsIncludeAt: %v", err)
+		}
+		if again := readFileString(t, cfg); again != s {
+			t.Errorf("second run mutated a healed config:\nfirst:\n%s\nsecond:\n%s", s, again)
+		}
+	})
+}
+
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
