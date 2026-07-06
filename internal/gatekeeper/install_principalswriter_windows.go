@@ -204,11 +204,51 @@ func restrictPrincipalsDirACLWindows(dir string) error {
 	return setProtectedSystemAdminsACL(dir, true /* inheritable */)
 }
 
+// agentSpoolAccessMask is the access the low-priv agent needs on the spool dir
+// (inherited onto the spool files): read (poll applied.json), write (create the
+// policy.json.tmp), and DELETE.
+//
+// DELETE is load-bearing (#175): the agent submits desired-state via an atomic
+// tmp→rename (agent.atomicWriteSpoolFile), and on NTFS renaming/replacing a file
+// requires DELETE on the source (GENERIC_WRITE maps to FILE_GENERIC_WRITE, which
+// does NOT include DELETE). Without it the rename — and even the failed-path
+// os.Remove(tmp) cleanup — fail, so policy.json is never produced and NO Policy
+// ever reaches the principals files. This regressed silently because the only
+// Windows apply CI exercised was deprovision (an empty policy onto an
+// already-empty dir), which never needs the write path.
+//
+// Threat model (ADR-0004): DELETE on the spool grants the agent NO escalation.
+// The worst a compromised agent gains is deleting/replacing its OWN spool files
+// (policy.json / applied.json) — self-DoS on its own control channel, already
+// achievable by simply not applying policy. The mask deliberately omits
+// WRITE_DAC/WRITE_OWNER, so the agent cannot weaken the spool ACL; the writer
+// re-validates every payload and only ever writes under the hardcoded,
+// agent-inaccessible principals dir. The spool's safety is its PROTECTED DACL,
+// not the withholding of DELETE.
+const agentSpoolAccessMask windows.ACCESS_MASK = windows.GENERIC_READ | windows.GENERIC_WRITE | windows.DELETE
+
+// agentSpoolACE builds the inheritable EXPLICIT_ACCESS the installer grants the
+// low-priv agent SID on the spool dir. Extracted so the exact mask (incl.
+// DELETE) is unit-testable at the level the #175 bug escaped.
+func agentSpoolACE(agentSID *windows.SID) windows.EXPLICIT_ACCESS {
+	return windows.EXPLICIT_ACCESS{
+		AccessPermissions: agentSpoolAccessMask,
+		AccessMode:        windows.SET_ACCESS,
+		Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+		Trustee: windows.TRUSTEE{
+			TrusteeForm:  windows.TRUSTEE_IS_SID,
+			TrusteeType:  windows.TRUSTEE_IS_USER,
+			TrusteeValue: windows.TrusteeValueFromSID(agentSID),
+		},
+	}
+}
+
 // createSpoolDirWithACL creates the agent↔writer spool dir and applies its ACL:
 //   - SYSTEM: full (the writer reads the desired-state and writes applied.json);
 //   - Administrators: full (operator inspection);
-//   - NT SERVICE\UnclusterAgent: read + write (submit desired-state, read
-//     applied.json).
+//   - NT SERVICE\UnclusterAgent: read + write + DELETE (submit desired-state
+//     via atomic tmp→rename, read applied.json — see agentSpoolAccessMask for
+//     why DELETE is required and why it is safe, #175).
 //
 // This is the ONE place the agent is granted write — and it is the spool, not
 // auth_principals. A compromised agent can at most drop a desired-state here;
@@ -233,20 +273,12 @@ func createSpoolDirWithACL(dir string) error {
 		fullControlACE(systemSID, true),
 		fullControlACE(adminSID, true),
 	}
-	// Agent: read + write only (no full control — it must not be able to rewrite
-	// the spool ACL or delete the writer's applied.json arbitrarily beyond
-	// normal file replacement).
+	// Agent: read + write + DELETE (still not full control — no WRITE_DAC/
+	// WRITE_OWNER, so it cannot rewrite the spool's own ACL). See
+	// agentSpoolACE / agentSpoolAccessMask for why DELETE is load-bearing and
+	// why it grants no escalation (#175).
 	if agentSID, _, _, lerr := windows.LookupSID("", windowsServiceAccountName); lerr == nil && agentSID != nil {
-		ea = append(ea, windows.EXPLICIT_ACCESS{
-			AccessPermissions: windows.GENERIC_READ | windows.GENERIC_WRITE,
-			AccessMode:        windows.SET_ACCESS,
-			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_USER,
-				TrusteeValue: windows.TrusteeValueFromSID(agentSID),
-			},
-		})
+		ea = append(ea, agentSpoolACE(agentSID))
 	}
 
 	acl, err := windows.ACLFromEntries(ea, nil)
