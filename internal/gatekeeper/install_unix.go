@@ -5,7 +5,9 @@ package gatekeeper
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
+	"github.com/derek-x-wang/uncluster/internal/version"
 )
 
 // sshdConfigIncludeLine is added to the base sshd_config on macOS pre-Sonoma
@@ -23,7 +26,20 @@ const sshdConfigIncludeLine = "Include /etc/ssh/sshd_config.d/*"
 // Install performs the privileged gatekeeper setup for Linux/macOS.
 // It is idempotent: re-running repairs drift without clobbering existing state.
 // Must run as root.
-func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
+//
+// installExe is the binary the operator invoked (e.g. /usr/local/bin/uncluster).
+// Under the #187 hybrid-launcher model the installer does NOT point the service
+// at that package-manager/user path (#139 coherence item 6). Instead it:
+//
+//   - copies installExe to the stable, root-owned LAUNCHER path
+//     (agent.LauncherPath(), /opt/uncluster/uncluster), used for BOTH the
+//     service ExecStart (`agent launch`) and sshd's AuthorizedPrincipalsCommand
+//     — its whole path chain is root-owned so sshd's safe-path check passes;
+//   - seeds a service-account-writable versioned PAYLOAD store
+//     (agent.ManagedPayloadDir()) with installExe as the first version. The
+//     low-priv agent self-updates the payload there, never the root-owned
+//     launcher, and never touches sshd's command path.
+func Install(ctx context.Context, cfg agent.Config, installExe string) error {
 	paths := cfg.ExpectedPaths
 
 	// 1. Verify sshd installed + running.
@@ -31,15 +47,25 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 		return err
 	}
 
-	// 2. Write CA pubkey.
+	// 2. Install the stable, root-owned launcher binary. Done before the drop-in
+	// so sshd's AuthorizedPrincipalsCommand points at a binary that already
+	// exists with a strict path chain.
+	launcherPath := agent.LauncherPath()
+	if err := installLauncherBinary(installExe, launcherPath); err != nil {
+		return fmt.Errorf("install launcher binary: %w", err)
+	}
+
+	// 3. Write CA pubkey.
 	if err := writeCAPubkey(paths, cfg.CAPubkey); err != nil {
 		return fmt.Errorf("write ca pubkey: %w", err)
 	}
 
-	// 3. Write sshd drop-in (#185: AuthorizedPrincipalsCommand form). serviceExe
-	// is the absolute path sshd runs as the AuthorizedPrincipalsCommand; the
-	// service account is the AuthorizedPrincipalsCommandUser sshd drops to.
-	if err := writeSSHDropIn(paths, serviceExe, serviceAccountName()); err != nil {
+	// 4. Write sshd drop-in (#185: AuthorizedPrincipalsCommand form). The
+	// launcher path is what sshd runs as the AuthorizedPrincipalsCommand — a
+	// root-owned, strict-chain, NON-self-updating binary — NOT the service-
+	// writable payload (pointing sshd there would re-break every cert login,
+	// #187/#185). The service account is the AuthorizedPrincipalsCommandUser.
+	if err := writeSSHDropIn(paths, launcherPath, serviceAccountName()); err != nil {
 		return fmt.Errorf("write sshd drop-in: %w", err)
 	}
 
@@ -63,6 +89,14 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 	// 7. Grant service account write access to principals dir.
 	if err := grantPrincipalsAccess(paths.PrincipalsDir); err != nil {
 		return fmt.Errorf("grant principals dir access: %w", err)
+	}
+
+	// 7b. Set up the service-account-writable managed payload store and seed it
+	// with the install-time binary (#187). Done AFTER ensureServiceAccount so the
+	// account exists to own the tree. The low-priv agent self-updates the payload
+	// here; the launcher execs the current version.
+	if err := setupPayloadStore(installExe); err != nil {
+		return fmt.Errorf("set up managed payload store: %w", err)
 	}
 
 	// 8. Save agent.toml to the system path with the correct ownership.
@@ -102,9 +136,19 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 		return fmt.Errorf("grant config dir access: %w", err)
 	}
 
-	// 9. Install system service (kardianos/service: launchd or systemd).
-	if err := installService(ctx, cfg, serviceExe); err != nil {
+	// 9. Install system service (kardianos/service: launchd or systemd). The
+	// ExecStart is the root-owned launcher running `agent launch` (buildService),
+	// NOT the operator's install path.
+	if err := installService(ctx, cfg, launcherPath); err != nil {
 		return fmt.Errorf("install service: %w", err)
+	}
+
+	// 9b. Bound launcher-crash restart to ≤30s (ADR-0006). kardianos hardcodes
+	// RestartSec=120 in v1.2.4; a systemd drop-in overrides it. Restart only on
+	// failure so a clean shutdown or deprovision (launcher exits 0) does not
+	// flap-restart. Linux/systemd only.
+	if err := writeSystemdRestartOverride(ctx); err != nil {
+		return fmt.Errorf("configure launcher restart timing: %w", err)
 	}
 
 	// 10. Start service.
@@ -420,6 +464,177 @@ func grantPrincipalsAccess(dir string) error {
 	}
 }
 
+// restartOverrideConf is the systemd drop-in content that bounds launcher-crash
+// restart to ≤30s (ADR-0006) and restarts only on failure. Exposed as a const so
+// a unit test can assert its shape without a live systemd.
+const restartOverrideConf = "[Service]\nRestart=on-failure\nRestartSec=5\n"
+
+// writeSystemdRestartOverride drops a RestartSec/Restart override next to the
+// kardianos-generated unit and reloads systemd. Linux only (launchd has its own
+// respawn throttle and is not adjusted here; the launcher's in-process rollback,
+// not the service restart, is what meets the ≤30s budget on a bad UPDATE — the
+// service restart only matters if the launcher itself crashes).
+func writeSystemdRestartOverride(ctx context.Context) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	unitPath := serviceUnitPath()
+	if unitPath == "" {
+		return fmt.Errorf("unknown systemd unit path for GOOS=%s", runtime.GOOS)
+	}
+	dropInDir := unitPath + ".d"
+	if err := os.MkdirAll(dropInDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir drop-in dir %s: %w", dropInDir, err)
+	}
+	override := filepath.Join(dropInDir, "restart.conf")
+	if err := os.WriteFile(override, []byte(restartOverrideConf), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", override, err)
+	}
+	if out, err := exec.CommandContext(ctx, "systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl daemon-reload: %w\n%s", err, out)
+	}
+	return nil
+}
+
+// installLauncherBinary copies the install-time binary to the stable, root-owned
+// launcher path and locks down ownership/mode so sshd's AuthorizedPrincipalsCommand
+// safe-path check accepts it (the binary AND every ancestor dir must be root-
+// owned and not group/world-writable). The copy is atomic (temp + rename) so a
+// concurrent cert auth never execs a half-written launcher. A no-op copy when the
+// operator invoked the launcher binary itself (re-install), but ownership/mode
+// are still re-asserted.
+func installLauncherBinary(srcExe, launcherPath string) error {
+	dir := filepath.Dir(launcherPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir launcher dir %s: %w", dir, err)
+	}
+	if err := os.Chown(dir, 0, 0); err != nil {
+		return fmt.Errorf("chown launcher dir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return fmt.Errorf("chmod launcher dir %s: %w", dir, err)
+	}
+	if !sameFile(srcExe, launcherPath) {
+		if err := copyFileAtomic(srcExe, launcherPath, 0o755); err != nil {
+			return err
+		}
+	}
+	if err := os.Chown(launcherPath, 0, 0); err != nil {
+		return fmt.Errorf("chown launcher %s: %w", launcherPath, err)
+	}
+	if err := os.Chmod(launcherPath, 0o755); err != nil {
+		return fmt.Errorf("chmod launcher %s: %w", launcherPath, err)
+	}
+	return nil
+}
+
+// sameFile reports whether a and b resolve to the same on-disk file.
+func sameFile(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
+}
+
+// copyFileAtomic copies src to dst via a temp file in dst's dir + rename, so a
+// reader/executor never observes a partial file.
+func copyFileAtomic(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, ".install-*")
+	if err != nil {
+		return fmt.Errorf("create temp in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("copy %s to %s: %w", src, dst, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("fsync %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpName, err)
+	}
+	if err := os.Chmod(tmpName, mode); err != nil {
+		return fmt.Errorf("chmod %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmpName, dst, err)
+	}
+	cleanup = false
+	return nil
+}
+
+// setupPayloadStore creates the service-account-writable managed payload dir,
+// initialises the versioned store, and — on a FRESH install only — seeds it with
+// the install-time binary as the first version and activates it. Seeding once is
+// deliberate: on re-install the store may already hold a newer, self-updated
+// current version (Current() resolves), which the installer must not downgrade.
+// The whole tree is then handed to the service account so the low-priv agent can
+// stage+activate future updates and the launcher (same account) can exec current.
+func setupPayloadStore(installExe string) error {
+	dir := agent.ManagedPayloadDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir payload dir %s: %w", dir, err)
+	}
+	// Not world-writable (doctor hygiene requirement).
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return fmt.Errorf("chmod payload dir %s: %w", dir, err)
+	}
+	store := agent.NewPayloadStore(dir)
+	if err := store.Init(); err != nil {
+		return err
+	}
+	if _, _, err := store.Current(); errors.Is(err, agent.ErrNoCurrent) {
+		f, err := os.Open(installExe)
+		if err != nil {
+			return fmt.Errorf("open install binary %s: %w", installExe, err)
+		}
+		defer f.Close()
+		if _, err := store.Stage(version.Version, f); err != nil {
+			return fmt.Errorf("seed payload version %s: %w", version.Version, err)
+		}
+		if err := store.Activate(version.Version); err != nil {
+			return fmt.Errorf("activate seed payload %s: %w", version.Version, err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("resolve current payload: %w", err)
+	}
+	if err := chownTreeToServiceAccount(dir); err != nil {
+		return fmt.Errorf("chown payload tree to service account: %w", err)
+	}
+	return nil
+}
+
+// chownTreeToServiceAccount recursively chowns dir to the low-priv service
+// account (user only) so it can create version dirs, swap the current/previous
+// symlinks, and write markers. The launcher (same account) execs the current
+// version's binary. Exec permission comes from the 0755 file mode staging sets;
+// write permission comes from the account owning the directories.
+func chownTreeToServiceAccount(dir string) error {
+	if out, err := exec.Command("chown", "-R", serviceAccountName(), dir).CombinedOutput(); err != nil {
+		return fmt.Errorf("chown -R %s %s: %w\n%s", serviceAccountName(), dir, err, out)
+	}
+	return nil
+}
+
 // installService installs the system service using kardianos/service.
 // On "already installed," checks whether the on-disk unit file's executable
 // path, username, and command arguments match the intended config. If any
@@ -473,7 +688,8 @@ func checkServiceUnitDrift(intendedExe, intendedUser string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return detectServiceUnitDrift(string(data), intendedExe, intendedUser), nil
+	// #187: the Unix service ExecStart is `<launcher> agent launch`.
+	return detectServiceUnitDrift(string(data), intendedExe, intendedUser, "agent", "launch"), nil
 }
 
 

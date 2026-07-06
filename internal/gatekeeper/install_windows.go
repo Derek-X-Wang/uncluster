@@ -259,7 +259,7 @@ func installService(ctx context.Context, cfg agent.Config, serviceExe string) er
 		// Couldn't query; preserve pre-fix idempotent behaviour.
 		return nil
 	}
-	drift := detectServiceUnitDrift(string(out), serviceExe, windowsServiceAccountName)
+	drift := detectServiceUnitDrift(string(out), serviceExe, windowsServiceAccountName, "agent", "run")
 	if drift == "" {
 		return nil
 	}

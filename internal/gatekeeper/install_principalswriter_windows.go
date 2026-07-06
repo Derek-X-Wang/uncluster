@@ -42,7 +42,7 @@ func installPrincipalsWriterService(ctx context.Context, serviceExe string) erro
 	if qcErr != nil {
 		return nil // can't query; preserve idempotent behaviour
 	}
-	drift := detectServiceUnitDrift(string(out), serviceExe, windowsPrincipalsWriterAccount)
+	drift := detectServiceUnitDrift(string(out), serviceExe, windowsPrincipalsWriterAccount, "principals-writer", "run")
 	if drift == "" {
 		// Steady state: an already-installed writer with no drift is (or will be)
 		// running and may hold a live policy.json. Do NOT touch the spool here.

@@ -108,7 +108,7 @@ WantedBy=multi-user.target
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := detectServiceUnitDrift(tc.content, tc.intendedExe, tc.intendedUser)
+			got := detectServiceUnitDrift(tc.content, tc.intendedExe, tc.intendedUser, "agent", "run")
 			if tc.wantDrift == "" {
 				if got != "" {
 					t.Errorf("expected no drift, got %q", got)
