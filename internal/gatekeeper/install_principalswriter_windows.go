@@ -28,6 +28,11 @@ func installPrincipalsWriterService(ctx context.Context, serviceExe string) erro
 	}
 	err = svc.Install()
 	if err == nil {
+		// Fresh writer: clear any leftover spool desired-state so a lingering
+		// DEPROVISION signal from a prior install cannot make this new writer wipe
+		// and self-remove the instant it starts (#182). Best-effort — a failure
+		// here must not block install.
+		_ = agent.ClearSpoolDesiredState()
 		return nil
 	}
 	if !isAlreadyInstalledErr(err) {
@@ -39,6 +44,8 @@ func installPrincipalsWriterService(ctx context.Context, serviceExe string) erro
 	}
 	drift := detectServiceUnitDrift(string(out), serviceExe, windowsPrincipalsWriterAccount)
 	if drift == "" {
+		// Steady state: an already-installed writer with no drift is (or will be)
+		// running and may hold a live policy.json. Do NOT touch the spool here.
 		return nil
 	}
 	_ = exec.CommandContext(ctx, "net", "stop", agent.WindowsPrincipalsWriterServiceName).Run()
@@ -48,6 +55,8 @@ func installPrincipalsWriterService(ctx context.Context, serviceExe string) erro
 	if err := svc.Install(); err != nil {
 		return fmt.Errorf("reinstall writer service after drift (%s): %w", drift, err)
 	}
+	// Drift-rebuilt writer is fresh — same stale-signal defusal as a fresh install.
+	_ = agent.ClearSpoolDesiredState()
 	return nil
 }
 

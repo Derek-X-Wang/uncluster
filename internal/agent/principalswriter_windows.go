@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"time"
+
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 // PrincipalsWriter is the LocalSystem-side service that watches the spool for a
@@ -35,6 +37,7 @@ type PrincipalsWriter struct {
 	policyPath  string // spool desired-state path
 	appliedPath string // spool applied-status path
 	poll        time.Duration
+	serviceName string // own SCM service to self-delete on deprovision (#182)
 
 	lastDigest string // digest of the last desired-state we acted on (dedupe)
 }
@@ -51,6 +54,7 @@ func NewPrincipalsWriter(logger *slog.Logger) *PrincipalsWriter {
 		policyPath:  spoolPolicyPath(),
 		appliedPath: spoolAppliedPath(),
 		poll:        1 * time.Second,
+		serviceName: WindowsPrincipalsWriterServiceName,
 	}
 }
 
@@ -66,15 +70,20 @@ func (w *PrincipalsWriter) Run(ctx context.Context) error {
 	t := time.NewTicker(w.poll)
 	defer t.Stop()
 	// Apply once immediately so a desired-state present at startup is handled
-	// without waiting a full poll interval.
-	w.tick()
+	// without waiting a full poll interval. A true return means a deprovision
+	// signal was applied and the writer has removed its own service — self-stop.
+	if w.tick() {
+		return nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			w.logger.Info("principals-writer: stopping")
 			return nil
 		case <-t.C:
-			w.tick()
+			if w.tick() {
+				return nil
+			}
 		}
 	}
 }
@@ -88,17 +97,21 @@ func (w *PrincipalsWriter) Run(ctx context.Context) error {
 // restrictPrincipalsFileACL) lives in applyDesiredStateBytes; tick only handles
 // the spool read, dedupe, status write, and logging so the security-critical
 // path is the SAME code the cross-platform tests exercise.
-func (w *PrincipalsWriter) tick() {
+// tick returns true when it has applied a deprovision desired-state and removed
+// the writer's own service — the signal for Run to stop so the SCM finalizes the
+// deletion. It returns false in every other case (no spool file, unchanged
+// digest, normal apply, or a failed apply).
+func (w *PrincipalsWriter) tick() bool {
 	b, err := os.ReadFile(w.policyPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			w.logger.Warn("principals-writer: read spool", "err", err)
 		}
-		return
+		return false
 	}
 	digest := desiredStateDigest(b)
 	if digest == w.lastDigest {
-		return // unchanged since we last acted; nothing to do
+		return false // unchanged since we last acted; nothing to do
 	}
 
 	st := applyDesiredStateBytes(w.principals, b)
@@ -111,9 +124,55 @@ func (w *PrincipalsWriter) tick() {
 	// Only advance lastDigest on a successful apply, so a transient failure
 	// (e.g. principals dir briefly unwritable) is retried on the next tick
 	// rather than latched off until the desired-state changes again.
-	if st.Status == "ok" {
-		w.lastDigest = digest
+	if st.Status != "ok" {
+		return false
 	}
+	w.lastDigest = digest
+
+	// Terminal deprovision: the wipe succeeded and the desired-state asked the
+	// writer to remove itself. The applied-status is ALREADY written above, so the
+	// agent's apply resolves before the service goes away. Self-removal is driven
+	// by this spool read (not the agent's ack), so it happens even if the agent
+	// already stopped waiting.
+	if shouldSelfRemoveOnApply(b, st) {
+		w.logger.Info("principals-writer: deprovision signal applied — removing own service (#182)")
+		w.selfRemove()
+		return true
+	}
+	return false
+}
+
+// selfRemove marks the writer's OWN SCM service for deletion. This is the crux of
+// #182: the low-priv `NT SERVICE\UnclusterAgent` account lacks service-control
+// rights over this LocalSystem service (#146/#159), but the writer runs as
+// LocalSystem, which holds DELETE on its own service object by the default
+// service DACL — a right that privilege-stripping (SeChangeNotifyPrivilege only)
+// does not remove, since service access is DACL-based, not privilege-based.
+//
+// Delete() marks a running service for deletion; SCM finalizes the removal once
+// the service stops. The caller (tick → Run) returns immediately after, so the
+// cmd SCM handler reports STOPPED and the deletion completes. Errors are logged
+// and swallowed: a self-remove failure must not wedge the writer, and the
+// agent-side best-effort uninstall remains as a fallback.
+func (w *PrincipalsWriter) selfRemove() {
+	m, err := mgr.Connect()
+	if err != nil {
+		w.logger.Error("principals-writer: self-remove connect SCM", "err", err)
+		return
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(w.serviceName)
+	if err != nil {
+		// Already gone (e.g. a prior fallback uninstall won the race) — nothing to do.
+		w.logger.Warn("principals-writer: self-remove open service", "service", w.serviceName, "err", err)
+		return
+	}
+	defer s.Close()
+	if err := s.Delete(); err != nil {
+		w.logger.Error("principals-writer: self-remove delete service", "service", w.serviceName, "err", err)
+		return
+	}
+	w.logger.Info("principals-writer: own service marked for deletion; stopping so SCM finalizes removal", "service", w.serviceName)
 }
 
 // writeApplied atomically writes the applied-status to the spool so the agent

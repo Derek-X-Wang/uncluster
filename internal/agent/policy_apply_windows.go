@@ -12,17 +12,22 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/api"
 )
 
-// wipePrincipals on Windows submits an EMPTY desired-state to the LocalSystem
-// writer (version 0, no principals), which renders an empty dir — deleting every
-// per-user file. The agent itself holds NO delete permission on the SYSTEM-owned
-// principals files (#127), so the wipe MUST go through the writer. Best-effort:
-// a writer failure/timeout is logged by doApplyPolicy and ignored here, because
-// deprovision (marker + exit) must proceed regardless; the supervisor will not
-// restart the agent, and a stale principal expires at TTL anyway. ctx lets the
-// wipe's writer wait return promptly on Agent shutdown (#153).
+// wipePrincipals on Windows is the DEPROVISION wipe (onRevoked is its only
+// caller; fail-closed uses runApplyPolicy, not this). It submits a *deprovision*
+// desired-state to the LocalSystem writer: an empty render (version 0, no
+// principals) carrying the Deprovision flag, so the writer both deletes every
+// per-user file AND removes its OWN service (#182) — the writer holds the
+// service-control rights the low-priv `NT SERVICE\UnclusterAgent` account lacks
+// (#146/#159), so self-removal is the only path that keeps the writer from
+// outliving the agent (#127 invariant). Best-effort: a writer failure/timeout is
+// logged and ignored here because deprovision (marker + exit) must proceed
+// regardless, and the writer still self-removes off its own spool read even if
+// the agent stops waiting. The agent-side best-effort uninstall (deprovisionCleanup)
+// remains as a fallback for hosts where the writer is already dead. ctx lets the
+// writer wait return promptly on Agent shutdown (#153).
 func (a *Agent) wipePrincipals(ctx context.Context, _ string) {
-	if err := a.doApplyPolicy(ctx, "", api.PolicyPayload{Version: 0, Hash: "", Principals: nil}); err != nil {
-		a.logger.Warn("deprovision: writer wipe failed; principals may persist until TTL/next apply", "err", err)
+	if err := a.submitDesiredState(ctx, deprovisionDesiredState()); err != nil {
+		a.logger.Warn("deprovision: writer wipe/self-remove signal not confirmed; the writer self-removes off its own spool read, and deprovisionCleanup is the fallback", "err", err)
 	}
 }
 
@@ -69,12 +74,20 @@ func (a *Agent) doApplyPolicy(ctx context.Context, _ string, snap api.PolicyPayl
 	if err := validatePolicyPayload(snap); err != nil {
 		return err
 	}
+	return a.submitDesiredState(ctx, desiredStateFromPayload(snap))
+}
 
+// submitDesiredState atomically writes a desired-state to the spool and polls for
+// the LocalSystem writer's matching applied-status, honouring ctx cancellation so
+// shutdown does not stall on the writer wait (#153). It is the shared spool
+// round-trip used by both a normal policy apply (doApplyPolicy) and the
+// deprovision wipe (wipePrincipals → deprovisionDesiredState); the writer decides
+// what to do (render, or render-then-self-remove) from the desired-state's own
+// Deprovision flag, so this path is identical for both.
+func (a *Agent) submitDesiredState(ctx context.Context, d desiredState) error {
 	if err := ensureSpoolDir(); err != nil {
 		return fmt.Errorf("spool dir: %w", err)
 	}
-
-	d := desiredStateFromPayload(snap)
 	b, err := marshalDesiredState(d)
 	if err != nil {
 		return err
@@ -93,11 +106,11 @@ func (a *Agent) doApplyPolicy(ctx context.Context, _ string, snap api.PolicyPayl
 		// ctx cancelled (agent shutting down). The apply is not confirmed, so
 		// appliedVersion must NOT advance — surface it as a failed apply and let
 		// the control plane re-send on next start (ADR-0007 version handshake).
-		return fmt.Errorf("principals writer apply interrupted (version %d): %w", snap.Version, err)
+		return fmt.Errorf("principals writer apply interrupted (version %d): %w", d.Version, err)
 	}
 	if !resolved {
 		return fmt.Errorf("principals writer did not apply version %d within %s (is the UnclusterPrincipalsWriter service running?)",
-			snap.Version, applyTimeout)
+			d.Version, applyTimeout)
 	}
 	if st.Status == "ok" {
 		return nil

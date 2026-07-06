@@ -39,3 +39,17 @@ func spoolAppliedPath() string { return filepath.Join(SpoolDir(), spoolAppliedFi
 func ensureSpoolDir() error {
 	return os.MkdirAll(SpoolDir(), 0o755)
 }
+
+// ClearSpoolDesiredState removes any leftover spool desired-state (policy.json)
+// so a FRESHLY (re)installed writer never reads a stale command on startup. It
+// exists specifically to defuse a leftover DEPROVISION signal (#182): a terminal
+// deprovision desired-state that lingers after a prior deprovision would make a
+// new writer wipe + self-remove the instant it starts. The installer calls this
+// only on a fresh install / drift-rebuild (a fresh writer), NEVER against a
+// steadily-running writer serving live policy. A missing file is not an error.
+func ClearSpoolDesiredState() error {
+	if err := os.Remove(spoolPolicyPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}

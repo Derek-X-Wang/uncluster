@@ -41,6 +41,47 @@ type desiredState struct {
 	Version    int64                 `json:"version"`
 	Hash       string                `json:"hash"`
 	Principals []api.PolicyPrincipal `json:"principals"`
+
+	// Deprovision, when true, tells the LocalSystem writer that this apply is the
+	// terminal deprovision wipe: after rendering the (empty) principals it must
+	// remove its OWN service so it never outlives the agent (#127 invariant; #182
+	// spool-mediated self-removal). It is a pure boolean flag — the writer takes
+	// NO path or argument from the payload; it only ever deletes its own,
+	// compiled-in-named service. omitempty keeps every non-deprovision apply's
+	// spool bytes (and thus its digest) byte-identical to before.
+	Deprovision bool `json:"deprovision,omitempty"`
+}
+
+// deprovisionDesiredState is the terminal wipe the agent submits to the spool on
+// deprovision (410 Gone): an empty render (version 0, no principals) carrying the
+// Deprovision flag so the writer both wipes AND self-removes. Version 0 matches
+// the historical empty-wipe shape; the Deprovision field gives it a distinct
+// spool digest so the writer always acts on it even right after a version-0
+// fail-closed wipe.
+func deprovisionDesiredState() desiredState {
+	return desiredState{Deprovision: true}
+}
+
+// desiredStateRequestsDeprovision reports whether the spool bytes carry a valid
+// deprovision signal. It is the writer's recognition of the terminal signal
+// across the untrusted privilege boundary: malformed bytes are NOT a deprovision
+// (false), so a garbage spool file can never trigger a self-delete.
+func desiredStateRequestsDeprovision(b []byte) bool {
+	d, err := unmarshalDesiredState(b)
+	if err != nil {
+		return false
+	}
+	return d.Deprovision
+}
+
+// shouldSelfRemoveOnApply decides whether the writer should remove its own
+// service after an apply: only when the applied desired-state requested
+// deprovision AND the (wipe) apply succeeded. A failed apply must NOT self-remove
+// — the wipe is unconfirmed, so the writer stays up to retry. Platform-neutral so
+// the whole decision is unit-tested off Windows; the Windows tick calls it and
+// performs only the OS-specific service Delete().
+func shouldSelfRemoveOnApply(b []byte, st appliedStatus) bool {
+	return st.Status == "ok" && desiredStateRequestsDeprovision(b)
 }
 
 // appliedStatus is what the writer reports back after each apply attempt. The
