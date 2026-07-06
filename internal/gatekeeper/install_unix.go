@@ -36,8 +36,10 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 		return fmt.Errorf("write ca pubkey: %w", err)
 	}
 
-	// 3. Write sshd drop-in.
-	if err := writeSSHDropIn(paths); err != nil {
+	// 3. Write sshd drop-in (#185: AuthorizedPrincipalsCommand form). serviceExe
+	// is the absolute path sshd runs as the AuthorizedPrincipalsCommand; the
+	// service account is the AuthorizedPrincipalsCommandUser sshd drops to.
+	if err := writeSSHDropIn(paths, serviceExe, serviceAccountName()); err != nil {
 		return fmt.Errorf("write sshd drop-in: %w", err)
 	}
 

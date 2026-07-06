@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -139,8 +140,66 @@ func newAgentCmd() *cobra.Command {
 
 	cmd.AddCommand(newAgentUpdateCmd())
 	cmd.AddCommand(newAgentRollbackCmd())
+	cmd.AddCommand(newAgentPrincipalsCmd())
 
 	return cmd
+}
+
+// newAgentPrincipalsCmd returns `uncluster agent principals <username>` — the
+// sshd AuthorizedPrincipalsCommand target on Unix/macOS (#185). It is a DUMB read:
+// it prints the content of the per-user AuthorizedPrincipals file for <username>
+// and NOTHING else, so sshd can obtain a Caller's principals without StrictModes-
+// checking the agent-owned files.
+//
+// sshd runs this (as AuthorizedPrincipalsCommandUser) during cert auth with
+// %u = the login username, so <username> is attacker-influenceable. The command
+// therefore FAILS CLOSED — it prints nothing (→ sshd sees no principals → login
+// denied) on any error or unsafe input, and never resolves a path outside the
+// principals dir (filepath.Base + separator/`.`/`..` rejection defeats traversal).
+func newAgentPrincipalsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "principals <username>",
+		Short: "Print a user's AuthorizedPrincipals (sshd AuthorizedPrincipalsCommand target)",
+		Args:  cobra.ExactArgs(1),
+		// sshd captures stdout as the principal list, so emit ONLY principals (or
+		// nothing) — never a cobra usage/error dump to stdout.
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Traversal defense + read live in principalsFileContent (unit-tested).
+			cfgPath, err := agent.ResolveConfigPath()
+			if err != nil {
+				return nil
+			}
+			cfg, err := agent.LoadConfig(cfgPath)
+			if err != nil {
+				return nil
+			}
+			if out := principalsFileContent(cfg.ExpectedPaths.PrincipalsDir, args[0]); out != nil {
+				_, _ = cmd.OutOrStdout().Write(out)
+			}
+			return nil
+		},
+	}
+}
+
+// principalsFileContent returns the AuthorizedPrincipals bytes for username under
+// dir, or nil when there are none. It is the security-critical core of the
+// `agent principals` command, isolated so it is unit-tested directly: username
+// comes from sshd's %u and is attacker-influenceable, so it must never resolve a
+// path outside dir. filepath.Base strips any directory component; a username that
+// is not already its own basename (contains a separator) or is "."/".." yields nil
+// (deny), as does an empty dir or an unreadable/missing file.
+func principalsFileContent(dir, username string) []byte {
+	base := filepath.Base(username)
+	if dir == "" || base != username || base == "." || base == ".." {
+		return nil
+	}
+	b, err := os.ReadFile(filepath.Join(dir, base))
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 func newAgentInstallCmd() *cobra.Command {

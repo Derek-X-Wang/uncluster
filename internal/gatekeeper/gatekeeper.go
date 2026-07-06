@@ -105,10 +105,36 @@ func (r DoctorResults) ExitCode() int {
 	return code
 }
 
-// sshdDropInContent is the sshd_config.d snippet written by install.
+// sshdDropInContent is the FILE-based managed directive block used ONLY on
+// Windows (via managedDirectiveBlock): the SYSTEM PrincipalsWriter renders
+// root/SYSTEM-owned per-user files, which sshd StrictModes accepts, so Windows
+// stays on AuthorizedPrincipalsFile (working post-#179). Unix/macOS instead use
+// AuthorizedPrincipalsCommand (see sshdDropInContentUnix) because the low-priv
+// agent writes agent-owned files that sshd's StrictModes rejects (#185).
 func sshdDropInContent(caPubkeyPath, principalsDirPattern string) string {
 	return fmt.Sprintf("TrustedUserCAKeys %s\nAuthorizedPrincipalsFile %s\n",
 		caPubkeyPath, principalsDirPattern)
+}
+
+// sshdDropInContentUnix is the sshd_config.d snippet written by install on
+// Unix/macOS (#185). It uses AuthorizedPrincipalsCommand instead of
+// AuthorizedPrincipalsFile so sshd invokes `<uncluster> agent principals %u` to
+// obtain a Caller's principals rather than reading a file: the agent runs as the
+// low-priv service account (ADR-0004) and its atomic tmp→rename leaves per-user
+// files owned by that account in a group-writable dir, which OpenSSH StrictModes
+// rejects ("bad ownership or modes"). The command's OUTPUT is not StrictModes-
+// checked, so the agent keeps writing its low-priv files unchanged and the
+// command (a dumb read) echoes them.
+//
+// sshd DOES require the command BINARY to be an absolute path owned by root and
+// not group/world-writable — the installed `/usr/local/bin/uncluster` (root,
+// 0755) qualifies; doctor asserts it (checkPrincipalsCommandBinary). commandBin
+// is assumed whitespace-free (the install path is); sshd would need it quoted
+// otherwise.
+func sshdDropInContentUnix(caPubkeyPath, commandBin, commandUser string) string {
+	return fmt.Sprintf(
+		"TrustedUserCAKeys %s\nAuthorizedPrincipalsCommand %s agent principals %%u\nAuthorizedPrincipalsCommandUser %s\n",
+		caPubkeyPath, commandBin, commandUser)
 }
 
 // writeCAPubkey writes the CA pubkey to the path from agent config with mode 0644.
@@ -119,12 +145,18 @@ func writeCAPubkey(paths agent.ExpectedPaths, caPubkey string) error {
 	return os.WriteFile(paths.CAPubkey, []byte(strings.TrimSpace(caPubkey)+"\n"), 0o644)
 }
 
-// writeSSHDropIn writes the sshd_config.d snippet.
-func writeSSHDropIn(paths agent.ExpectedPaths) error {
+// writeSSHDropIn writes the Unix/macOS sshd_config.d snippet (#185): the
+// AuthorizedPrincipalsCommand form. commandBin is the absolute path to the
+// installed uncluster binary (root-owned, sshd runs it) and commandUser is the
+// service account sshd drops to when running it. Overwriting the file wholesale
+// self-heals from the pre-#185 AuthorizedPrincipalsFile shape on re-install.
+// (Windows writes its directives via the base-config managed block instead — see
+// install_windows.go / managedDirectiveBlock — and stays file-based.)
+func writeSSHDropIn(paths agent.ExpectedPaths, commandBin, commandUser string) error {
 	if err := os.MkdirAll(dirOf(paths.SSHDropIn), 0o755); err != nil {
 		return fmt.Errorf("mkdir sshd drop-in dir: %w", err)
 	}
-	content := sshdDropInContent(paths.CAPubkey, paths.PrincipalsDir+"/%u")
+	content := sshdDropInContentUnix(paths.CAPubkey, commandBin, commandUser)
 	return os.WriteFile(paths.SSHDropIn, []byte(content), 0o644)
 }
 

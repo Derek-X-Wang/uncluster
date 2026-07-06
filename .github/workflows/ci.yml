@@ -1366,7 +1366,10 @@ jobs:
           # leave the drop-in readable.
           test -f /etc/ssh/sshd_config.d/uncluster.conf
           sudo grep -q 'TrustedUserCAKeys' /etc/ssh/sshd_config.d/uncluster.conf
-          sudo grep -q 'AuthorizedPrincipalsFile' /etc/ssh/sshd_config.d/uncluster.conf
+          # #185: Unix/macOS drop-in uses AuthorizedPrincipalsCommand (not File)
+          # so sshd doesn't StrictModes-reject the low-priv agent's principals files.
+          sudo grep -q 'AuthorizedPrincipalsCommand' /etc/ssh/sshd_config.d/uncluster.conf
+          sudo grep -q 'AuthorizedPrincipalsCommandUser' /etc/ssh/sshd_config.d/uncluster.conf
 
       - name: product:assert-service-user-and-group
         id: assert-user

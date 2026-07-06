@@ -35,7 +35,7 @@ func (r DoctorResults) HealthChecks() []api.AgentHealthCheck {
 // healthComponent maps a doctor check name to the heartbeat `component` field.
 func healthComponent(name string) string {
 	switch name {
-	case "sshd-binary", "sshd-installed", "sshd-running", "sshd-drop-in", "sshd-effective-config", "macos-include":
+	case "sshd-binary", "sshd-installed", "sshd-running", "sshd-drop-in", "sshd-effective-config", "sshd-principals-command-binary", "macos-include":
 		return "sshd"
 	case "ca-pubkey":
 		return "ca_pubkey"
@@ -69,6 +69,8 @@ func healthCheckField(name string) string {
 		return "config_drop_in"
 	case "sshd-effective-config":
 		return "effective_config"
+	case "sshd-principals-command-binary":
+		return "principals_command_binary"
 	case "ca-pubkey":
 		return "present"
 	case "principals-dir":
