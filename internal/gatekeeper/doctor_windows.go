@@ -52,19 +52,13 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 		})
 	}
 
-	// 4. sshd drop-in present, carries the required directives, AND is Included
-	// GLOBALLY (before any Match block) by the base sshd_config. A drop-in that
-	// merely EXISTS but whose Include is appended after `Match Group
-	// administrators` applies to admins only — non-admin cert login then fails
-	// silently (#177). The old presence-only check stayed green through that
-	// whole outage: the same doctor-blindness class as #175's spool write-bit
-	// check. Assert the effective global scope by reading the base config
-	// (non-mutating, ADR-0009 inspect).
-	dropIn := paths.SSHDropIn
-	if dropIn == "" {
-		dropIn = windowsPaths.SSHDropIn
-	}
-	results = append(results, checkSSHDropInWindows(dropIn, windowsBaseSSHDConfig))
+	// 4. The uncluster CA-trust + principals directives are EFFECTIVE in the base
+	// sshd_config: present, carrying both directives, and BEFORE the first Match
+	// block (global). On Windows the service ignores sshd_config.d Includes
+	// (#179), so the directives live directly in the base config; a check that
+	// only confirmed a drop-in file existed stayed green through the whole outage
+	// (the #175/#177 doctor-blindness class). Read-only, ADR-0009 inspect.
+	results = append(results, checkBaseConfigDirectivesWindows(windowsBaseSSHDConfig))
 
 	// 5. Principals dir is locked down for the #127 role-split: it exists, is a
 	// directory, and the low-priv `NT SERVICE\UnclusterAgent` account holds NO
@@ -122,33 +116,32 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 	return results
 }
 
-// checkSSHDropInWindows verifies the sshd drop-in is actually EFFECTIVE, not just
-// present: the file exists, carries TrustedUserCAKeys + AuthorizedPrincipalsFile,
-// and the base sshd_config Includes the drop-in dir GLOBALLY (before any Match
-// block). A post-Match Include scopes the CA trust + principals to admins only,
-// so non-admin cert login fails while file-presence stays green (#177 — the same
-// blindness class as #175). Non-mutating: reads two files (ADR-0009 inspect).
-func checkSSHDropInWindows(dropInPath, baseConfigPath string) CheckResult {
+// checkBaseConfigDirectivesWindows verifies the uncluster CA-trust + principals
+// directives are EFFECTIVE in the base sshd_config: the managed block is present,
+// carries both directives, and appears BEFORE the first Match block (global). On
+// Windows the service ignores sshd_config.d Includes (#179), so the directives
+// live directly in the base config; asserting their effective presence — not a
+// drop-in file's existence — is what makes a broken config visible to doctor
+// (the #175/#177 blindness class). Non-mutating: reads one file (ADR-0009 inspect).
+//
+// Check name stays "sshd-drop-in" (health.go maps it to config_drop_in) so the
+// existing CI assertion continues to cover it.
+func checkBaseConfigDirectivesWindows(baseConfigPath string) CheckResult {
 	const name = "sshd-drop-in"
-	b, err := os.ReadFile(dropInPath)
+	b, err := os.ReadFile(baseConfigPath)
 	if err != nil {
 		return CheckResult{Name: name, Status: CheckFail,
-			Message: dropInPath + " not found. Run: uncluster agent install"}
+			Message: fmt.Sprintf("%s unreadable (%v) — run: uncluster agent install", baseConfigPath, err)}
 	}
 	content := string(b)
+	if !hasManagedBlockBeforeMatch(content) {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("%s lacks the uncluster directive block before its first Match block — CA trust + principals are not effective, so cert login fails. Run: uncluster agent install (#179)", baseConfigPath)}
+	}
 	if !strings.Contains(content, "TrustedUserCAKeys") || !strings.Contains(content, "AuthorizedPrincipalsFile") {
 		return CheckResult{Name: name, Status: CheckWarn,
-			Message: fmt.Sprintf("drop-in at %s is missing TrustedUserCAKeys/AuthorizedPrincipalsFile (run install to repair)", dropInPath)}
-	}
-	base, berr := os.ReadFile(baseConfigPath)
-	if berr != nil {
-		return CheckResult{Name: name, Status: CheckWarn,
-			Message: fmt.Sprintf("drop-in present at %s but base sshd_config %s is unreadable — cannot confirm it is Included globally (%v)", dropInPath, baseConfigPath, berr)}
-	}
-	if !sshdConfigHasDropInInclude(string(base)) {
-		return CheckResult{Name: name, Status: CheckFail,
-			Message: fmt.Sprintf("drop-in at %s is present but %s does not Include sshd_config.d BEFORE its first Match block — the CA trust + principals apply to admins only, so non-admin cert login fails. Run: uncluster agent install (#177)", dropInPath, baseConfigPath)}
+			Message: fmt.Sprintf("%s has the uncluster block but is missing TrustedUserCAKeys/AuthorizedPrincipalsFile (run install to repair)", baseConfigPath)}
 	}
 	return CheckResult{Name: name, Status: CheckOK,
-		Message: fmt.Sprintf("drop-in ok at %s (globally Included; has TrustedUserCAKeys + AuthorizedPrincipalsFile)", dropInPath)}
+		Message: fmt.Sprintf("sshd directives effective in %s (global, before first Match; TrustedUserCAKeys + AuthorizedPrincipalsFile present)", baseConfigPath)}
 }

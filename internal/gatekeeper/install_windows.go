@@ -3,7 +3,6 @@
 package gatekeeper
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -14,21 +13,13 @@ import (
 	"github.com/derek-x-wang/uncluster/internal/api"
 )
 
-// windowsBaseSSHDConfig is the stock Win32-OpenSSH base config that the
-// drop-in (sshd_config.d\uncluster.conf) is only honored through if it is
-// Included. Win32-OpenSSH ships this file WITHOUT any Include directive
-// (verified against openssh-portable contrib/win32/openssh/sshd_config), so
-// on a stock host the drop-in is never read and cert login can never work.
+// windowsBaseSSHDConfig is the stock Win32-OpenSSH base config. On Windows the
+// running OpenSSH service does NOT honour `sshd_config.d` Includes (#179 —
+// verified on OpenSSH_for_Windows_9.5p2: `sshd -T` does not expand them and a
+// service connection with the drop-in Included still rejects the cert). So the
+// gatekeeper writes its directives DIRECTLY into this file, before the first
+// `Match` block — see ensureWindowsBaseConfigDirectives.
 const windowsBaseSSHDConfig = `C:\ProgramData\ssh\sshd_config`
-
-// windowsIncludeLine is appended to the base sshd_config when no covering
-// Include is found. Forward slashes work on Win32-OpenSSH and avoid any
-// backslash-escaping ambiguity in the config grammar.
-const windowsIncludeLine = "Include __PROGRAMDATA__/ssh/sshd_config.d/*"
-
-// dropInIncludeMarker tags the line we append so re-installs can recognise
-// (and never duplicate) our own edit.
-const dropInIncludeMarker = "# Added by uncluster agent install"
 
 // windowsPaths holds the canonical Windows paths for all SSH-related files
 // managed by the Uncluster gatekeeper. It resolves from api.ExpectedPathsFor —
@@ -74,18 +65,15 @@ func Install(ctx context.Context, cfg agent.Config, serviceExe string) error {
 		return fmt.Errorf("write ca pubkey: %w", err)
 	}
 
-	// 3. Write sshd drop-in.
-	if err := writeSSHDropIn(paths); err != nil {
-		return fmt.Errorf("write sshd drop-in: %w", err)
-	}
-
-	// 3a. Ensure the base sshd_config Includes the drop-in dir. Win32-OpenSSH's
-	// stock sshd_config has NO Include directive, so without this the drop-in
-	// written in step 3 (TrustedUserCAKeys + AuthorizedPrincipalsFile) is never
-	// read and cert login can never succeed (#126). The existing sshd restart
-	// in step 9 picks up the edit. Mirrors ensureMacOSInclude on the Unix path.
-	if err := ensureWindowsInclude(); err != nil {
-		return fmt.Errorf("windows sshd_config include: %w", err)
+	// 3. Write the CA-trust + principals directives DIRECTLY into the base
+	// sshd_config (before the first Match block). Win32-OpenSSH's service does
+	// NOT honour sshd_config.d Includes (#179), so a drop-in never takes effect;
+	// a base-config directive does. Idempotent and self-healing from every older
+	// shape (post-Match Include #126, pre-Match Include #177, prior managed
+	// block), and it removes the now-unused drop-in file. The sshd restart in
+	// step 9 picks up the edit.
+	if err := ensureWindowsBaseConfigDirectives(paths); err != nil {
+		return fmt.Errorf("windows sshd base-config directives: %w", err)
 	}
 
 	// 4. Create principals directory.
@@ -199,121 +187,54 @@ func containsState(output, state string) bool {
 // install_principalswriter_windows.go). doctor FAILS if the old agent grant is
 // ever found again.
 
-// ensureWindowsInclude ensures the stock base sshd_config Includes the
-// sshd_config.d drop-in directory. It is the Windows analog of
-// ensureMacOSInclude. Idempotent — never double-appends.
-func ensureWindowsInclude() error {
-	return ensureWindowsIncludeAt(windowsBaseSSHDConfig)
-}
-
-// ensureWindowsIncludeAt reads the base config at path; if it lacks a covering
-// GLOBAL (pre-Match) drop-in Include directive, it inserts windowsIncludeLine
-// (tagged with dropInIncludeMarker) BEFORE the first `Match` block so the
-// included directives (TrustedUserCAKeys, AuthorizedPrincipalsFile) apply
-// globally — not only to the connections a trailing Match matches.
-//
-// This is load-bearing (#177): the Win32-OpenSSH stock sshd_config ends with a
-// `Match Group administrators` block, so APPENDING the Include at EOF (the old
-// behaviour) scoped every drop-in directive to administrators only. For a
-// non-admin connection the CA trust never applied and a CA-signed cert was
-// rejected — Windows cert login never worked. A host carrying that old
-// post-Match Include self-heals here, because sshdConfigHasDropInInclude only
-// counts a pre-Match Include as covering.
-//
-// A missing base config is tolerated (not an error). Pure detection +
-// transformation live in sshdConfigHasDropInInclude / insertIncludeBeforeFirstMatch
-// so the matrix can unit-test the placement.
-func ensureWindowsIncludeAt(path string) error {
-	b, err := os.ReadFile(path)
+// ensureWindowsBaseConfigDirectives writes the uncluster-managed directive block
+// (TrustedUserCAKeys + AuthorizedPrincipalsFile) DIRECTLY into the base
+// sshd_config, before the first `Match` block, so the running Win32-OpenSSH
+// service actually honours it (#179 — it ignores sshd_config.d Includes; probe
+// on OpenSSH_for_Windows_9.5p2 in PR #174). It is idempotent and self-heals from
+// every older shape (post-Match Include #126, pre-Match Include #177, a prior
+// managed block) via upsertManagedBlock, and it removes the now-unused drop-in
+// file. A missing base config is tolerated (not an error); doctor surfaces that.
+func ensureWindowsBaseConfigDirectives(paths agent.ExpectedPaths) error {
+	block := managedDirectiveBlock(paths.CAPubkey, paths.PrincipalsDir+"/%u")
+	b, err := os.ReadFile(windowsBaseSSHDConfig)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Base config absent — nothing to patch. sshd_config.d may still
-			// be honored implicitly; do not fail the install.
 			return nil
 		}
-		return fmt.Errorf("read %s: %w", path, err)
+		return fmt.Errorf("read %s: %w", windowsBaseSSHDConfig, err)
 	}
-	content := string(b)
-	if sshdConfigHasDropInInclude(content) {
-		return nil // already covered by a global (pre-Match) include — idempotent
+	if updated := upsertManagedBlock(string(b), block); updated != string(b) {
+		if err := os.WriteFile(windowsBaseSSHDConfig, []byte(updated), 0o644); err != nil {
+			return fmt.Errorf("write directives into %s: %w", windowsBaseSSHDConfig, err)
+		}
 	}
-	if err := os.WriteFile(path, []byte(insertIncludeBeforeFirstMatch(content)), 0o644); err != nil {
-		return fmt.Errorf("write include into %s: %w", path, err)
+	// Self-heal: the drop-in file was never honoured on Windows; remove it.
+	if paths.SSHDropIn != "" {
+		_ = os.Remove(paths.SSHDropIn)
 	}
 	return nil
 }
 
-// insertIncludeBeforeFirstMatch returns content with the drop-in Include block
-// (marker + windowsIncludeLine) inserted immediately before the first `Match`
-// line so the include is global. If there is no Match block, the block is
-// appended at EOF (still global). A leading blank line separates it from
-// surrounding content.
-func insertIncludeBeforeFirstMatch(content string) string {
-	block := "\n" + dropInIncludeMarker + "\n" + windowsIncludeLine + "\n"
-	if idx := firstMatchLineOffset(content); idx >= 0 {
-		return content[:idx] + block[1:] + content[idx:] // no leading blank before a Match line
+// RemoveWindowsManagedDirectives removes the uncluster-managed directive block
+// from the base sshd_config (deprovision). Exported for the CLI deprovision
+// cleanup hook. Removing an absent block is a no-op.
+func RemoveWindowsManagedDirectives() error {
+	b, err := os.ReadFile(windowsBaseSSHDConfig)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", windowsBaseSSHDConfig, err)
 	}
-	if content != "" && !strings.HasSuffix(content, "\n") {
-		content += "\n"
+	updated := removeManagedBlock(string(b))
+	if updated == string(b) {
+		return nil
 	}
-	return content + block
-}
-
-// firstMatchLineOffset returns the byte offset of the start of the first line
-// whose first token is `Match` (case-insensitive), or -1 if there is none.
-func firstMatchLineOffset(content string) int {
-	offset := 0
-	for _, line := range strings.SplitAfter(content, "\n") {
-		if fields := strings.Fields(strings.TrimSpace(line)); len(fields) > 0 && strings.EqualFold(fields[0], "Match") {
-			return offset
-		}
-		offset += len(line)
+	if err := os.WriteFile(windowsBaseSSHDConfig, []byte(updated), 0o644); err != nil {
+		return fmt.Errorf("remove directives from %s: %w", windowsBaseSSHDConfig, err)
 	}
-	return -1
-}
-
-// sshdConfigHasDropInInclude reports whether the given sshd_config content
-// already carries an uncommented `Include` directive that pulls in the
-// sshd_config.d drop-in directory. Matching is:
-//   - case-insensitive on the `Include` keyword (sshd treats it so);
-//   - tolerant of both `\` and `/` path separators;
-//   - blind to whether the include ends in a glob (`*`) — a bare directory
-//     include still pulls in the drop-in files;
-//   - skips commented (`#`-prefixed) lines.
-//
-// It looks for the literal `sshd_config.d` path component (normalised to
-// forward slashes) so an Include of some unrelated file does not match.
-//
-// Only a GLOBAL include counts (#177): an Include that appears AFTER the first
-// `Match` line is scoped to that conditional block, so it does NOT make the
-// drop-in's directives apply globally. Scanning stops at the first `Match` — an
-// include found only past it is treated as not-covering, which is what lets a
-// host with the old post-Match include self-heal on re-install.
-func sshdConfigHasDropInInclude(content string) bool {
-	sc := bufio.NewScanner(strings.NewReader(content))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		// A Match block begins here; any Include past it is not global.
-		if strings.EqualFold(fields[0], "Match") {
-			return false
-		}
-		if len(fields) < 2 || !strings.EqualFold(fields[0], "Include") {
-			continue
-		}
-		// Normalise the remainder's separators and look for the drop-in dir.
-		rest := strings.ToLower(strings.ReplaceAll(line, `\`, "/"))
-		if strings.Contains(rest, "sshd_config.d") {
-			return true
-		}
-	}
-	return false
+	return nil
 }
 
 // installService installs the Windows SCM service.
