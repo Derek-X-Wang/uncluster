@@ -1,0 +1,86 @@
+# Security-surface fuzzing (#171).
+#
+# Go native fuzz targets over the parsers/validators that gate security
+# decisions live next to their code as `Fuzz*` functions:
+#   * internal/token       FuzzParse                  — bearer credential format
+#   * internal/agent       FuzzValidateUsername       — auth_principals filename safety
+#   * internal/agent       FuzzValidateCallerTokenID  — auth_principals principal safety
+#   * internal/agent       FuzzValidateUpdateURL      — self-update host allowlist
+#   * internal/agent       FuzzUnmarshalDesiredState  — Windows spool privileged-boundary input
+#   * internal/policyhash  FuzzCanonicalHash          — Policy canonical form + hash
+#   * internal/ca          FuzzSign                   — cert signing over arbitrary Caller pubkey bytes
+#
+# Each fuzz func's SEED corpus (its f.Add cases) runs for FREE in the normal
+# per-PR `go test ./...` (the `test` job in ci.yml) — no separate wiring needed,
+# so a regression in the asserted invariants is caught on every PR. This
+# workflow runs the ACTUAL fuzzing engine (`-fuzz`, a bounded per-target budget)
+# on a nightly + workflow_dispatch cadence — too slow/non-deterministic to gate
+# every PR, but the right place to keep exploring the input space.
+#
+# On a crash (`go test -fuzz` exits non-zero and writes the failing input to
+# <pkg>/testdata/fuzz/<FuzzName>/), the run goes RED and the failing corpus entry
+# is uploaded as an artifact. Committing that entry back into testdata/fuzz/ turns
+# it into a permanent per-PR regression seed.
+#
+# fail-fast is off so one target's crash never cancels the others — every crash
+# artifact is collected in a single run.
+
+name: fuzz
+
+on:
+  schedule:
+    - cron: "37 5 * * *"  # nightly, offset from the other scheduled workflows
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "Per-target fuzz budget (Go duration, e.g. 180s, 5m)"
+        required: false
+        default: "180s"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pkg: ./internal/token/,      fn: FuzzParse }
+          - { pkg: ./internal/policyhash/, fn: FuzzCanonicalHash }
+          - { pkg: ./internal/ca/,         fn: FuzzSign }
+          - { pkg: ./internal/agent/,      fn: FuzzValidateUsername }
+          - { pkg: ./internal/agent/,      fn: FuzzValidateCallerTokenID }
+          - { pkg: ./internal/agent/,      fn: FuzzValidateUpdateURL }
+          - { pkg: ./internal/agent/,      fn: FuzzUnmarshalDesiredState }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: fuzz ${{ matrix.fn }}
+        id: fuzz
+        env:
+          # Empty on schedule (inputs only exist for workflow_dispatch) → default.
+          FUZZTIME: ${{ github.event.inputs.fuzztime || '180s' }}
+        run: |
+          set -euo pipefail
+          echo "fuzzing ${{ matrix.fn }} in ${{ matrix.pkg }} for ${FUZZTIME}"
+          # -run '^$' disables the normal (non-fuzz) tests; -fuzz runs only this
+          # target. A crash exits non-zero and writes the reproducer under
+          # <pkg>/testdata/fuzz/${{ matrix.fn }}/.
+          go test "${{ matrix.pkg }}" -run '^$' -fuzz "^${{ matrix.fn }}$" -fuzztime="${FUZZTIME}" -count=1
+
+      - name: upload crash reproducer
+        if: ${{ always() && steps.fuzz.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.fn }}-${{ github.run_id }}
+          path: |
+            **/testdata/fuzz/${{ matrix.fn }}/
+          if-no-files-found: warn
+          retention-days: 30
