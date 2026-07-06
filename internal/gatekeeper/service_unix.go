@@ -12,6 +12,14 @@ import (
 
 // buildService constructs a kardianos/service.Service configured for system-
 // level (not user-level) operation on macOS/Linux.
+//
+// serviceExe is the root-owned LAUNCHER binary (agent.LauncherPath()); the
+// ExecStart runs `<launcher> agent launch`, the #187 resident supervisor, NOT
+// `agent run` directly. The launcher runs as the low-priv service account and
+// supervises the self-updatable payload. Launcher-crash restart timing is bound
+// to ≤30s by a systemd drop-in the installer writes (ADR-0006); kardianos's
+// hardcoded RestartSec=120 is not templated in v1.2.4, so the drop-in is how the
+// budget is met.
 func buildService(cfg agent.Config, serviceExe string) (service.Service, error) {
 	username := serviceAccountName()
 
@@ -20,7 +28,7 @@ func buildService(cfg agent.Config, serviceExe string) (service.Service, error) 
 		DisplayName: "Uncluster Agent",
 		Description: "Uncluster node agent (SSH certificate gatekeeper)",
 		Executable:  serviceExe,
-		Arguments:   []string{"agent", "run"},
+		Arguments:   []string{"agent", "launch"},
 		UserName:    username,
 	}
 

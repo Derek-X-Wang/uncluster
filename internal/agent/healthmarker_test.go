@@ -1,0 +1,130 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestWriteHealthMarker_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", "health") // parent dir created by WriteHealthMarker
+
+	if err := WriteHealthMarker(path, "v1.2.3"); err != nil {
+		t.Fatalf("WriteHealthMarker: %v", err)
+	}
+	got, ok, err := readMarker(path)
+	if err != nil || !ok {
+		t.Fatalf("readMarker ok=%v err=%v", ok, err)
+	}
+	if got != "v1.2.3" {
+		t.Errorf("marker version = %q, want v1.2.3", got)
+	}
+}
+
+// The on-disk body is schema-versioned JSON (forward-compat), not bare text.
+func TestWriteHealthMarker_BodyIsSchemaVersionedJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health")
+	if err := WriteHealthMarker(path, "v9"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body markerBody
+	if err := json.Unmarshal(b, &body); err != nil {
+		t.Fatalf("marker is not JSON: %v (%s)", err, b)
+	}
+	if body.SchemaVersion != markerSchemaVersion {
+		t.Errorf("schema_version = %d, want %d", body.SchemaVersion, markerSchemaVersion)
+	}
+	if body.Version != "v9" {
+		t.Errorf("version = %q, want v9", body.Version)
+	}
+}
+
+// A marker written under an unknown (future) schema version reads as absent.
+func TestReadMarker_UnknownSchemaIsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health")
+	future := markerBody{SchemaVersion: markerSchemaVersion + 99, Version: "vX"}
+	data, _ := json.Marshal(future)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := readMarker(path); ok || err != nil {
+		t.Errorf("unknown schema should read as absent; ok=%v err=%v", ok, err)
+	}
+}
+
+func TestWriteHealthMarker_EmptyPathIsNoop(t *testing.T) {
+	if err := WriteHealthMarker("", "v1"); err != nil {
+		t.Errorf("empty path should be a no-op, got %v", err)
+	}
+}
+
+func TestMarkerHealthWaiter_SucceedsWhenVersionMatches(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health")
+	w := newMarkerHealthWaiter(path)
+	w.interval = 5 * time.Millisecond
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = WriteHealthMarker(path, "v2")
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := w.WaitHealthy(ctx, "v2"); err != nil {
+		t.Errorf("WaitHealthy should succeed once marker matches, got %v", err)
+	}
+}
+
+func TestMarkerHealthWaiter_TimesOutOnWrongVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health")
+	// A stale/wrong-version marker must NOT satisfy the wait.
+	if err := WriteHealthMarker(path, "OLD"); err != nil {
+		t.Fatal(err)
+	}
+	w := newMarkerHealthWaiter(path)
+	w.interval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	if err := w.WaitHealthy(ctx, "NEW"); err == nil {
+		t.Error("WaitHealthy should time out when marker holds a different version")
+	}
+}
+
+func TestMarkerHealthWaiter_ClearRemovesStale(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health")
+	if err := WriteHealthMarker(path, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	w := newMarkerHealthWaiter(path)
+	w.clear()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("clear did not remove the marker")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	w.interval = 5 * time.Millisecond
+	if err := w.WaitHealthy(ctx, "v1"); err == nil {
+		t.Error("WaitHealthy matched a cleared marker")
+	}
+}
+
+func TestHealthMarkerPathFromEnv(t *testing.T) {
+	t.Setenv(HealthMarkerEnv, "/tmp/x/health")
+	if got := HealthMarkerPathFromEnv(); got != "/tmp/x/health" {
+		t.Errorf("HealthMarkerPathFromEnv = %q, want /tmp/x/health", got)
+	}
+}

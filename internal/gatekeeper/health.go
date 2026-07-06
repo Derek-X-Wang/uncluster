@@ -47,6 +47,8 @@ func healthComponent(name string) string {
 		return "service_account"
 	case "service-group":
 		return "service_group"
+	case "payload-dir":
+		return "payload"
 	case "service-running", "service-installed":
 		return "service"
 	case "config-loaded-path", "config-ownership":
@@ -93,6 +95,8 @@ func healthCheckField(name string) string {
 		return "ownership"
 	case "update-host-allowlist":
 		return "host_allowlist"
+	case "payload-dir":
+		return "dir"
 	default:
 		return name
 	}

@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -76,6 +78,12 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 	// the service fails to start (#96). Absent file → warn (doctor may run
 	// pre-install), wrong ownership/mode → fail.
 	results = append(results, checkConfigOwnership(agent.SystemConfigPath(), wantGroup))
+
+	// 7c. Managed payload dir hygiene (#187). The service-writable payload store
+	// must exist, be owned by the service account, not be world-writable, not be
+	// a symlink, and live on an exec-permitted mount — or the launcher cannot
+	// safely exec the self-updatable payload.
+	results = append(results, checkPayloadDir())
 
 	// 8. Service running.
 	results = append(results, checkServiceRunning())
@@ -311,6 +319,86 @@ func checkPrincipalsCommandBinary(paths agent.ExpectedPaths) CheckResult {
 			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q cannot be resolved: %v", bin, err)}
 	}
 	return walkCommandPathChain(resolved, statPathOwnership)
+}
+
+// payloadDirCheckName is the doctor check id for the managed payload dir
+// (health.go maps it to component "payload", check "dir").
+const payloadDirCheckName = "payload-dir"
+
+// payloadDirFacts are the ownership/mode/mount facts the payload-dir grade needs,
+// gathered by checkPayloadDir and graded by payloadDirResult (split so the
+// grading is unit-testable without a real service account, root, or mounts).
+type payloadDirFacts struct {
+	statErr     error       // from Lstat; nil ⇒ present
+	isSymlink   bool        // Lstat says it is a symlink (refused: hygiene)
+	isDir       bool        // it is a directory
+	perm        os.FileMode // permission bits
+	uid         uint32      // owning uid
+	wantUID     uint32      // service-account uid
+	ownerKnown  bool        // uid + wantUID are meaningful (account resolved)
+	noexec      bool        // mount is noexec
+	noexecKnown bool        // noexec bit could be read
+}
+
+// payloadDirResult grades gathered payloadDirFacts. A missing dir is a WARN
+// (doctor may run pre-install); a present-but-wrong dir is a FAIL.
+func payloadDirResult(dir string, f payloadDirFacts) CheckResult {
+	name := payloadDirCheckName
+	if f.statErr != nil {
+		if os.IsNotExist(f.statErr) {
+			return CheckResult{Name: name, Status: CheckWarn,
+				Message: fmt.Sprintf("managed payload dir %s missing (run install to create it)", dir)}
+		}
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("cannot stat payload dir %s: %v", dir, f.statErr)}
+	}
+	if f.isSymlink {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("payload dir %s is a symlink; refused (an attacker-swappable link could redirect the executed payload)", dir)}
+	}
+	if !f.isDir {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("payload path %s is not a directory", dir)}
+	}
+	if f.perm&0o002 != 0 {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("payload dir %s is world-writable (mode %04o); any local user could replace the executed payload", dir, f.perm)}
+	}
+	if f.ownerKnown && f.uid != f.wantUID {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("payload dir %s owned by uid %d, want the service account %q (uid %d)", dir, f.uid, serviceAccountName(), f.wantUID)}
+	}
+	if f.noexecKnown && f.noexec {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("payload dir %s is on a noexec mount; the launcher cannot exec the payload binary", dir)}
+	}
+	return CheckResult{Name: name, Status: CheckOK,
+		Message: fmt.Sprintf("payload dir %s present, service-account-owned, not world-writable, exec-permitted", dir)}
+}
+
+// checkPayloadDir gathers the payload dir's facts and grades them.
+func checkPayloadDir() CheckResult {
+	dir := agent.ManagedPayloadDir()
+	var f payloadDirFacts
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		f.statErr = err
+		return payloadDirResult(dir, f)
+	}
+	f.isSymlink = fi.Mode()&os.ModeSymlink != 0
+	f.isDir = fi.IsDir()
+	f.perm = fi.Mode().Perm()
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		f.uid = st.Uid
+		if u, uerr := user.Lookup(serviceAccountName()); uerr == nil {
+			if wantUID, perr := strconv.Atoi(u.Uid); perr == nil {
+				f.wantUID = uint32(wantUID)
+				f.ownerKnown = true
+			}
+		}
+	}
+	f.noexec, f.noexecKnown = payloadDirIsNoexec(dir)
+	return payloadDirResult(dir, f)
 }
 
 func checkMacOSInclude() CheckResult {
