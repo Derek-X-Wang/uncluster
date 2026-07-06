@@ -5,6 +5,7 @@ package gatekeeper
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -173,14 +174,120 @@ func parseAuthorizedPrincipalsCommandBin(content string) string {
 	return ""
 }
 
-// checkPrincipalsCommandBinary asserts the AuthorizedPrincipalsCommand binary is
-// sshd-acceptable (#185): sshd refuses to run the command unless its binary is an
-// absolute path owned by root and not group/world-writable. This is the
-// StrictModes-equivalent that now gates cert login on Unix — the principals FILES
-// no longer are (they are the command's output, which sshd does not stat). Parses
-// the actual path from the drop-in so it verifies exactly what sshd verifies.
+// principalsCommandCheckName is the doctor check id for the
+// AuthorizedPrincipalsCommand path-chain check (health.go maps it to
+// "principals_command_binary").
+const principalsCommandCheckName = "sshd-principals-command-binary"
+
+// errUnsupportedStatPlatform signals that a path's POSIX ownership is not
+// readable via *syscall.Stat_t. Unreachable on real Unix (this file is
+// //go:build !windows), kept so walkCommandPathChain can degrade to the same
+// defensive CheckWarn the prior leaf-only check emitted rather than a false
+// fail.
+var errUnsupportedStatPlatform = errors.New("ownership not readable on this platform")
+
+// pathOwnership holds the ownership/mode facts sshd's safe_path needs about one
+// path component. Extracted (with an injectable stat) so walkCommandPathChain is
+// unit-testable on any OS without requiring real root-owned files (#195).
+type pathOwnership struct {
+	uid       uint32
+	perm      os.FileMode // permission bits only
+	isRegular bool
+}
+
+func statPathOwnership(p string) (pathOwnership, error) {
+	info, err := os.Stat(p)
+	if err != nil {
+		return pathOwnership{}, err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return pathOwnership{}, errUnsupportedStatPlatform
+	}
+	return pathOwnership{uid: st.Uid, perm: info.Mode().Perm(), isRegular: info.Mode().IsRegular()}, nil
+}
+
+func principalsChainComponentKind(leaf bool) string {
+	if leaf {
+		return "binary"
+	}
+	return "ancestor directory"
+}
+
+// walkCommandPathChain mirrors sshd's safe_path (openssh misc.c) exactly as it
+// is invoked for AuthorizedPrincipalsCommand. auth2-pubkey.c runs the command
+// via subprocess(), which — with no SSH_SUBPROCESS_UNSAFE_PATH flag — calls
+// safe_path(av[0], &st, NULL, /*uid=*/0, ...). safe_path walks the canonical
+// path from the command binary up to "/" and rejects any component that is
+// neither root-owned (platform_sys_dir_uid accepts only uid 0 on Linux/macOS;
+// uid 2 "bin" only where PLATFORM_SYS_DIR_UID is compiled in, which excludes
+// Linux/Darwin) nor owned by the passed uid (0 here) — and any component that is
+// group/other-writable (mode & 022). The leaf must additionally be a regular
+// file. So EVERY component of the command path must be root-owned and not
+// group/world-writable; a loose ancestor (e.g. a non-root-strict /usr/local/bin
+// on a hosted runner, #168/#184) is rejected by sshd even when the leaf binary
+// is fine.
+//
+// #195: the prior check stat-ed only the leaf binary, so a loose ancestor passed
+// doctor while sshd rejected the command ("Unsafe AuthorizedPrincipalsCommand
+// ...: bad ownership or modes for directory /usr/local/bin") and cert login
+// failed — the same doctor-blindness class as #175/#177/#179. This walks the
+// full chain and names the offending component, mirroring sshd's own message.
+//
+// Note the AuthorizedPrincipalsCommandUser does NOT relax this: sshd runs the
+// command as that user but still safe_path-checks with uid=0, so command-user
+// ownership of a path component is rejected regardless. stat is injected for
+// testability.
+func walkCommandPathChain(bin string, stat func(string) (pathOwnership, error)) CheckResult {
+	name := principalsCommandCheckName
+	p := bin
+	leaf := true
+	for {
+		own, err := stat(p)
+		if err != nil {
+			if errors.Is(err, errUnsupportedStatPlatform) {
+				return CheckResult{Name: name, Status: CheckWarn,
+					Message: "cannot read ownership of the command path on this platform"}
+			}
+			return CheckResult{Name: name, Status: CheckFail,
+				Message: fmt.Sprintf("AuthorizedPrincipalsCommand %s %q not stat-able: %v",
+					principalsChainComponentKind(leaf), p, err)}
+		}
+		if leaf && !own.isRegular {
+			return CheckResult{Name: name, Status: CheckFail,
+				Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q is not a regular file; sshd rejects it", p)}
+		}
+		if own.uid != 0 {
+			return CheckResult{Name: name, Status: CheckFail,
+				Message: fmt.Sprintf("AuthorizedPrincipalsCommand %s %q owned by uid %d; sshd requires root (uid 0) for every component of the command path",
+					principalsChainComponentKind(leaf), p, own.uid)}
+		}
+		if own.perm&0o022 != 0 {
+			return CheckResult{Name: name, Status: CheckFail,
+				Message: fmt.Sprintf("AuthorizedPrincipalsCommand %s %q is group/world-writable (mode %04o); sshd rejects the command path",
+					principalsChainComponentKind(leaf), p, own.perm)}
+		}
+		parent := filepath.Dir(p)
+		if parent == p { // reached "/" (or a volume root) — walk complete
+			break
+		}
+		p = parent
+		leaf = false
+	}
+	return CheckResult{Name: name, Status: CheckOK,
+		Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q and its full path chain (to /) are root-owned and not group/world-writable", bin)}
+}
+
+// checkPrincipalsCommandBinary asserts the AuthorizedPrincipalsCommand path is
+// sshd-acceptable (#185): sshd refuses to run the command unless the binary AND
+// every ancestor directory up to "/" is root-owned and not group/world-writable.
+// This is the StrictModes-equivalent that now gates cert login on Unix — the
+// principals FILES no longer are (they are the command's output, which sshd does
+// not stat). Parses the actual path from the drop-in and canonicalises it
+// (realpath, like sshd) so it verifies exactly what sshd verifies, walking the
+// whole chain (#195), not just the leaf binary.
 func checkPrincipalsCommandBinary(paths agent.ExpectedPaths) CheckResult {
-	const name = "sshd-principals-command-binary"
+	name := principalsCommandCheckName
 	b, err := os.ReadFile(paths.SSHDropIn)
 	if err != nil {
 		return CheckResult{Name: name, Status: CheckFail,
@@ -195,26 +302,15 @@ func checkPrincipalsCommandBinary(paths agent.ExpectedPaths) CheckResult {
 		return CheckResult{Name: name, Status: CheckFail,
 			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q is not absolute (sshd requires an absolute path)", bin)}
 	}
-	info, err := os.Stat(bin)
+	// sshd canonicalises via realpath(3) before walking, so a symlinked install
+	// dir is graded on its real components. Mirror that; a broken/unresolvable
+	// path is a fail (sshd's realpath failure).
+	resolved, err := filepath.EvalSymlinks(bin)
 	if err != nil {
 		return CheckResult{Name: name, Status: CheckFail,
-			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q not stat-able: %v", bin, err)}
+			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q cannot be resolved: %v", bin, err)}
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return CheckResult{Name: name, Status: CheckWarn,
-			Message: "cannot read ownership of the command binary on this platform"}
-	}
-	if st.Uid != 0 {
-		return CheckResult{Name: name, Status: CheckFail,
-			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q owned by uid %d; sshd requires root (uid 0)", bin, st.Uid)}
-	}
-	if perm := info.Mode().Perm(); perm&0o022 != 0 {
-		return CheckResult{Name: name, Status: CheckFail,
-			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q is group/world-writable (mode %o); sshd rejects it", bin, perm)}
-	}
-	return CheckResult{Name: name, Status: CheckOK,
-		Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q is root-owned and not group/world-writable", bin)}
+	return walkCommandPathChain(resolved, statPathOwnership)
 }
 
 func checkMacOSInclude() CheckResult {

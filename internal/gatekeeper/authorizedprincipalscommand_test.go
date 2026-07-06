@@ -129,3 +129,96 @@ func TestCheckPrincipalsCommandBinary(t *testing.T) {
 		t.Errorf("root-owned non-writable command binary %q should be ok, got %v: %s", rootBin, got.Status, got.Message)
 	}
 }
+
+// TestWalkCommandPathChain exercises the #195 full-path-chain walk against a
+// fake filesystem (injected stat) so both the all-strict OK path and the
+// loose-ancestor FAIL paths are deterministic on any OS without needing real
+// root-owned files. Mirrors sshd's safe_path (misc.c), which for
+// AuthorizedPrincipalsCommand is invoked with uid=0 — so every component from
+// the binary up to "/" must be root-owned and not group/other-writable.
+func TestWalkCommandPathChain(t *testing.T) {
+	statFrom := func(fs map[string]pathOwnership) func(string) (pathOwnership, error) {
+		return func(p string) (pathOwnership, error) {
+			own, ok := fs[p]
+			if !ok {
+				return pathOwnership{}, os.ErrNotExist
+			}
+			return own, nil
+		}
+	}
+	dir := pathOwnership{uid: 0, perm: 0o755, isRegular: false}
+	bin := pathOwnership{uid: 0, perm: 0o755, isRegular: true}
+	const leaf = "/usr/local/bin/uncluster"
+
+	// All-strict chain (binary + every ancestor to /) → ok.
+	strict := map[string]pathOwnership{
+		leaf:             bin,
+		"/usr/local/bin": dir,
+		"/usr/local":     dir,
+		"/usr":           dir,
+		"/":              dir,
+	}
+	if got := walkCommandPathChain(leaf, statFrom(strict)); got.Status != CheckOK {
+		t.Errorf("all-strict chain should be ok, got %v: %s", got.Status, got.Message)
+	}
+
+	// Loose ANCESTOR: /usr/local/bin is group/world-writable while the leaf
+	// binary itself is root-owned & strict. This is the exact #195 gap — the
+	// old leaf-only check passed here while sshd rejected the command.
+	looseWritable := map[string]pathOwnership{
+		leaf:             bin,
+		"/usr/local/bin": {uid: 0, perm: 0o777, isRegular: false},
+		"/usr/local":     dir,
+		"/usr":           dir,
+		"/":              dir,
+	}
+	if got := walkCommandPathChain(leaf, statFrom(looseWritable)); got.Status != CheckFail ||
+		!strings.Contains(got.Message, "/usr/local/bin") {
+		t.Errorf("world-writable ancestor should fail naming /usr/local/bin, got %v: %s", got.Status, got.Message)
+	}
+
+	// Non-root ANCESTOR: /usr/local owned by uid 1000 → fail naming it.
+	looseOwner := map[string]pathOwnership{
+		leaf:             bin,
+		"/usr/local/bin": dir,
+		"/usr/local":     {uid: 1000, perm: 0o755, isRegular: false},
+		"/usr":           dir,
+		"/":              dir,
+	}
+	if got := walkCommandPathChain(leaf, statFrom(looseOwner)); got.Status != CheckFail ||
+		!strings.Contains(got.Message, "/usr/local") {
+		t.Errorf("non-root ancestor should fail naming /usr/local, got %v: %s", got.Status, got.Message)
+	}
+
+	// Non-root LEAF → fail naming the binary.
+	looseLeaf := map[string]pathOwnership{
+		leaf:             {uid: 1000, perm: 0o755, isRegular: true},
+		"/usr/local/bin": dir,
+		"/usr/local":     dir,
+		"/usr":           dir,
+		"/":              dir,
+	}
+	if got := walkCommandPathChain(leaf, statFrom(looseLeaf)); got.Status != CheckFail ||
+		!strings.Contains(got.Message, "uncluster") {
+		t.Errorf("non-root leaf should fail naming the binary, got %v: %s", got.Status, got.Message)
+	}
+
+	// Non-regular LEAF (e.g. a directory at the command path) → fail.
+	nonRegularLeaf := map[string]pathOwnership{
+		leaf:             {uid: 0, perm: 0o755, isRegular: false},
+		"/usr/local/bin": dir,
+		"/usr/local":     dir,
+		"/usr":           dir,
+		"/":              dir,
+	}
+	if got := walkCommandPathChain(leaf, statFrom(nonRegularLeaf)); got.Status != CheckFail {
+		t.Errorf("non-regular leaf should fail, got %v: %s", got.Status, got.Message)
+	}
+
+	// Platform without POSIX ownership → warn (not a false fail), preserving
+	// the leaf-only check's prior defensive behavior.
+	warnStat := func(string) (pathOwnership, error) { return pathOwnership{}, errUnsupportedStatPlatform }
+	if got := walkCommandPathChain(leaf, warnStat); got.Status != CheckWarn {
+		t.Errorf("unsupported-platform stat should warn, got %v: %s", got.Status, got.Message)
+	}
+}
