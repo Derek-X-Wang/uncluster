@@ -615,6 +615,229 @@ jobs:
         shell: bash
         run: scripts/ci/assert-doctor-json.sh --ok principals/dir_writable < doctor.json
 
+      # ---- #166: real SSH certificate login + negative controls ----
+      # Until now T2-Windows only asserted the principals ACL statically; it
+      # never performed an SSH login, so the Win32-OpenSSH secure-permission
+      # check (w32-sshfileperm) that motivated the #127 role split was only
+      # validated on paper. These product steps do a real cert login as a
+      # THROWAWAY, non-admin local user (counsel: runneradmin is admin, which
+      # would mask permission bugs) with negative controls on both sides. The
+      # deterministic wait is always "poll the per-user principals file for the
+      # caller token id" (== the cert principal) — never a fixed sleep.
+      - name: product:ssh-fixture-setup
+        id: fixture
+        # Create the throwaway local user + an ephemeral keypair, harden the
+        # private-key ACL so ssh.exe accepts it, and mint a throwaway Caller
+        # (a fresh caller with no ACL rows keeps the pre-grant negative clean).
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path C:\ssh-ci | Out-Null
+          # Throwaway local account. Password satisfies default complexity so
+          # network/cert logon is permitted (blank-password local accounts are
+          # console-only by default policy). MUST be <=14 chars: `net user`
+          # interactively prompts "longer than 14 characters..." for longer
+          # passwords, which aborts non-interactively (exit -1).
+          & net user ciuser 'P@ssw0rd166!' /add
+          if ($LASTEXITCODE -ne 0) { throw "net user ciuser failed: exit $LASTEXITCODE" }
+          # Ephemeral keypair. Use cmd for the empty-passphrase (-N "") arg so
+          # pwsh does not drop the empty string.
+          & cmd /c 'ssh-keygen -q -t ed25519 -N "" -C ci-cert-login -f C:\ssh-ci\id'
+          if ($LASTEXITCODE -ne 0) { throw "ssh-keygen failed: exit $LASTEXITCODE" }
+          # ssh.exe rejects a private key any other principal can read. Strip
+          # inheritance and grant only the current (runner) user.
+          & icacls C:\ssh-ci\id /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+          # Mint a throwaway Caller (bearer = bootstrap caller token). Response
+          # carries {id, token}: the id is what the ACL is keyed on AND the cert
+          # principal; the token is the bearer this caller uses for /v1/certs.
+          $boot = (Get-Content C:\caller-token -Raw).Trim()
+          $r = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:17777/v1/tokens `
+              -Headers @{ Authorization = "Bearer $boot" } -ContentType 'application/json' `
+              -Body '{"kind":"caller","label":"ci-ssh"}'
+          $callerId = $r.id
+          if (-not $callerId) { $callerId = ($r.token -split '_')[2] }  # fallback: id is the 3rd token field
+          if (-not $callerId) { throw "could not determine caller id" }
+          Set-Content -Path C:\ssh-ci\caller.id    -Value $callerId -NoNewline -Encoding ASCII
+          Set-Content -Path C:\ssh-ci\caller.token -Value $r.token  -NoNewline -Encoding ASCII
+          Write-Host "throwaway caller id=$callerId"
+          # The hosted runner's sshd restricts logins to AllowGroups
+          # {administrators, "openssh users"} (its default global config). Put the
+          # throwaway user in the existing "openssh users" group (create it if the
+          # image lacks it) so it is permitted WITHOUT any drop-in — letting the
+          # login reach the cert/CA check regardless of whether sshd_config.d
+          # Includes are honoured. ciuser stays NON-admin (an admin would use
+          # administrators_authorized_keys and bypass the AuthorizedPrincipalsFile
+          # check this test validates). No base-config edit, so this survives the
+          # diagnostic experiment below; group membership is read at login time.
+          & net localgroup "openssh users" ciuser /add 2>$null
+          if ($LASTEXITCODE -ne 0) {
+              & net localgroup "openssh users" /add 2>$null | Out-Null
+              & net localgroup "openssh users" ciuser /add
+              if ($LASTEXITCODE -ne 0) { throw "could not add ciuser to 'openssh users': exit $LASTEXITCODE" }
+          }
+          Write-Host "ciuser added to 'openssh users' (an existing AllowGroups member)"
+
+      - name: product:negative-pregrant-denied
+        id: neg1
+        # NEGATIVE CONTROL #1 — before any ACL grant: (a) no stale principal
+        # file may exist for the throwaway user, and (b) a cert request MUST be
+        # denied at the issuance gate (403). With no cert issued there is
+        # nothing to log in with, so login is impossible — the 403 IS the veto.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pf = 'C:\ProgramData\ssh\auth_principals\ciuser'
+          $callerId = (Get-Content C:\ssh-ci\caller.id -Raw).Trim()
+          if (Test-Path $pf) {
+              $c = Get-Content $pf -Raw -ErrorAction SilentlyContinue
+              if ($c -match [regex]::Escape($callerId)) {
+                  throw "SECURITY: stale principal for ciuser present BEFORE any grant"
+              }
+          }
+          $callerTok = (Get-Content C:\ssh-ci\caller.token -Raw).Trim()
+          $pub = (Get-Content C:\ssh-ci\id.pub -Raw).Trim()
+          $body = @{ agent = 'ci-agent'; username = 'ciuser'; pubkey = $pub; ttl_seconds = 900 } | ConvertTo-Json
+          $denied = $false
+          try {
+              $null = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:17777/v1/certs `
+                  -Headers @{ Authorization = "Bearer $callerTok" } -ContentType 'application/json' -Body $body
+          } catch {
+              $code = 0; if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+              if ($code -eq 403) { $denied = $true } else { throw "expected 403 from /v1/certs pre-grant, got $code" }
+          }
+          if (-not $denied) { throw "SECURITY: /v1/certs issued a cert with NO ACL row (expected 403)" }
+          Write-Host "pre-grant cert issuance correctly denied (403)"
+
+      - name: product:acl-grant
+        id: aclgrant
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $boot = (Get-Content C:\caller-token -Raw).Trim()
+          $callerId = (Get-Content C:\ssh-ci\caller.id -Raw).Trim()
+          $body = @{ caller = $callerId; agent = 'ci-agent'; username = 'ciuser' } | ConvertTo-Json
+          $acl = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:17777/v1/acl `
+              -Headers @{ Authorization = "Bearer $boot" } -ContentType 'application/json' -Body $body
+          if (-not $acl.id) { throw "grant returned no acl id" }
+          Set-Content -Path C:\ssh-ci\acl.id -Value $acl.id -NoNewline -Encoding ASCII
+          Write-Host "granted acl id=$($acl.id)"
+
+      - name: product:wait-principal-present
+        id: waitpresent
+        # Deterministic policy-apply wait (no sleep-and-hope). On Windows the
+        # apply is an async round-trip to the LocalSystem PrincipalsWriter:
+        # heartbeat (<=10s) + writer apply (<=30s). 60s matches the proven
+        # deprovision-marker budget for the same writer round-trip.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pf = 'C:\ProgramData\ssh\auth_principals\ciuser'
+          $callerId = (Get-Content C:\ssh-ci\caller.id -Raw).Trim()
+          $deadline = (Get-Date).AddSeconds(60)
+          $ok = $false
+          while ((Get-Date) -lt $deadline) {
+              if (Test-Path $pf) {
+                  $c = Get-Content $pf -Raw -ErrorAction SilentlyContinue
+                  if ($c -match [regex]::Escape($callerId)) { $ok = $true; break }
+              }
+              Start-Sleep -Seconds 1
+          }
+          if (-not $ok) {
+              Write-Host "principal $callerId never appeared in $pf"
+              if (Test-Path $pf) { Get-Content $pf }
+              throw "policy apply did not land (principal absent after 45s)"
+          }
+          Write-Host "principal present — policy applied"
+
+      - name: product:cert-login-whoami
+        id: loginpos
+        # First per-PR proof that Win32-OpenSSH ACCEPTS a SYSTEM-owned
+        # principals file written by the PrincipalsWriter: request a cert
+        # (ttl 900 so it survives to the post-revoke veto check), then SSH to
+        # localhost as the throwaway user and assert whoami.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $callerTok = (Get-Content C:\ssh-ci\caller.token -Raw).Trim()
+          $pub = (Get-Content C:\ssh-ci\id.pub -Raw).Trim()
+          $body = @{ agent = 'ci-agent'; username = 'ciuser'; pubkey = $pub; ttl_seconds = 900 } | ConvertTo-Json
+          $resp = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:17777/v1/certs `
+              -Headers @{ Authorization = "Bearer $callerTok" } -ContentType 'application/json' -Body $body
+          if (-not $resp.certificate) { throw "cert response missing 'certificate'" }
+          Set-Content -Path C:\ssh-ci\id-cert.pub -Value $resp.certificate -NoNewline -Encoding ASCII
+          $out = & ssh -i C:\ssh-ci\id -o CertificateFile=C:\ssh-ci\id-cert.pub `
+              -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new `
+              -o "UserKnownHostsFile=C:\ssh-ci\known_hosts" -o BatchMode=yes `
+              -o ConnectTimeout=10 ciuser@127.0.0.1 whoami 2>&1
+          $code = $LASTEXITCODE
+          Write-Host "positive cert-login exit=$code output=$out"
+          if ($code -ne 0) { throw "cert login failed (exit $code): $out" }
+          # whoami on Windows renders <host>\ciuser; match the trailing user.
+          if ("$out" -notmatch 'ciuser\s*$') { throw "whoami did not return ciuser: $out" }
+          Write-Host "cert login succeeded as ciuser"
+
+      - name: product:acl-revoke
+        id: aclrevoke
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $boot = (Get-Content C:\caller-token -Raw).Trim()
+          $aclId = (Get-Content C:\ssh-ci\acl.id -Raw).Trim()
+          Invoke-RestMethod -Method Delete -Uri "http://127.0.0.1:17777/v1/acl/$aclId" `
+              -Headers @{ Authorization = "Bearer $boot" } | Out-Null
+          Write-Host "revoked acl id=$aclId"
+
+      - name: product:wait-principal-absent
+        id: waitabsent
+        # Deterministic revoke-apply wait: the principal must leave the file
+        # (empty caller set -> file deleted). Same 60s budget as the grant.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pf = 'C:\ProgramData\ssh\auth_principals\ciuser'
+          $callerId = (Get-Content C:\ssh-ci\caller.id -Raw).Trim()
+          $deadline = (Get-Date).AddSeconds(60)
+          $gone = $false
+          while ((Get-Date) -lt $deadline) {
+              if (-not (Test-Path $pf)) { $gone = $true; break }
+              $c = Get-Content $pf -Raw -ErrorAction SilentlyContinue
+              if ($c -notmatch [regex]::Escape($callerId)) { $gone = $true; break }
+              Start-Sleep -Seconds 1
+          }
+          if (-not $gone) { throw "revoke did not apply (principal still present after 45s)" }
+          Write-Host "principal removed — revoke applied"
+
+      - name: product:negative-postrevoke-denied
+        id: neg2
+        # NEGATIVE CONTROL #2 — after revoke + policy apply:
+        #  (a) the still-TTL-valid positive cert MUST now be rejected at login,
+        #      because sshd reads AuthorizedPrincipalsFile per-auth and the
+        #      principal is gone — this is the ADR-0007 "principals file is the
+        #      local veto" property proven against a cryptographically-valid
+        #      cert, the strongest per-PR proof of the whole role split; and
+        #  (b) a freshly-minted cert request MUST be denied (403).
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # (a) reuse the old, still-valid cert — login must fail on the veto.
+          $out = & ssh -i C:\ssh-ci\id -o CertificateFile=C:\ssh-ci\id-cert.pub `
+              -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new `
+              -o "UserKnownHostsFile=C:\ssh-ci\known_hosts" -o BatchMode=yes `
+              -o ConnectTimeout=10 ciuser@127.0.0.1 whoami 2>&1
+          $code = $LASTEXITCODE
+          Write-Host "post-revoke old-cert login exit=$code output=$out"
+          if ($code -eq 0) { throw "SECURITY: valid cert still logged in after revoke + principal removal: $out" }
+          # (b) fresh issuance must be denied now.
+          $callerTok = (Get-Content C:\ssh-ci\caller.token -Raw).Trim()
+          $pub = (Get-Content C:\ssh-ci\id.pub -Raw).Trim()
+          $body = @{ agent = 'ci-agent'; username = 'ciuser'; pubkey = $pub; ttl_seconds = 900 } | ConvertTo-Json
+          $denied = $false
+          try {
+              $null = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:17777/v1/certs `
+                  -Headers @{ Authorization = "Bearer $callerTok" } -ContentType 'application/json' -Body $body
+          } catch {
+              $c2 = 0; if ($_.Exception.Response) { $c2 = [int]$_.Exception.Response.StatusCode }
+              if ($c2 -eq 403) { $denied = $true } else { throw "expected 403 post-revoke, got $c2" }
+          }
+          if (-not $denied) { throw "SECURITY: /v1/certs issued a cert after revoke (expected 403)" }
+          Write-Host "post-revoke: login rejected AND fresh issuance denied"
+          # The last native command was the intentionally-failing old-cert ssh
+          # (exit 255). GitHub's pwsh wrapper exits the step with $LASTEXITCODE,
+          # so reset it — the assertions above already passed.
+          exit 0
+
       - name: product:deprovision-and-marker
         id: deprov
         run: |
@@ -654,6 +877,42 @@ jobs:
               throw "principals not wiped"
           }
 
+      - name: advisory:writer-gone-probe
+        id: writerprobe
+        if: always()
+        # ADVISORY discovery per #166 — NEVER gates (always exits 0; not passed
+        # to classify-step.sh). The #146 cleanup hook uninstalls
+        # UnclusterPrincipalsWriter best-effort; the low-priv agent may hit
+        # access-denied (deprovision_cleanup_windows.go), leaving the writer
+        # behind. This probe records whether the writer survived so PR #159's
+        # open caveat gets real per-run data. If it SURVIVED a SUCCESSFUL
+        # deprovision, the runner files a follow-up proposing spool-mediated
+        # self-removal (agent writes a deprovision desired-state; the
+        # LocalSystem writer removes its own service — mirrors the #127
+        # validate-then-privileged-execute split). The probe is not softened;
+        # it is promoted to a gate in a later PR once green over several runs.
+        run: |
+          New-Item -ItemType Directory -Force -Path t2-windows-artifacts | Out-Null
+          $probe = 't2-windows-artifacts\writer-gone-probe.txt'
+          $svc = Get-Service -Name UnclusterPrincipalsWriter -ErrorAction SilentlyContinue
+          $deprov = '${{ steps.deprov.outcome }}'
+          if ($null -eq $svc) {
+              $msg = "writer-gone-probe: UnclusterPrincipalsWriter ABSENT after deprovision (clean removal). deprov=$deprov"
+              $msg | Tee-Object -FilePath $probe
+              Write-Host "::notice::T2-windows $msg"
+          } elseif ($deprov -ne 'success') {
+              $msg = "writer-gone-probe: UnclusterPrincipalsWriter still present but deprovision did not succeed (deprov=$deprov) — INCONCLUSIVE, not the access-denied signal."
+              $msg | Tee-Object -FilePath $probe
+              & sc.exe qc UnclusterPrincipalsWriter 2>&1 | Out-File -Append $probe
+              Write-Host "::notice::T2-windows $msg"
+          } else {
+              $msg = "writer-gone-probe: UnclusterPrincipalsWriter SURVIVED a SUCCESSFUL deprovision (status=$($svc.Status)). Best-effort cleanup likely hit access-denied (#146/#159). Follow-up: propose spool-mediated self-removal."
+              $msg | Tee-Object -FilePath $probe
+              & sc.exe qc UnclusterPrincipalsWriter 2>&1 | Out-File -Append $probe
+              Write-Host "::warning::T2-windows $msg"
+          }
+          exit 0
+
       - name: collect:artifacts
         if: always()
         # Best-effort scrape. Robust against missing files (any step may
@@ -680,6 +939,32 @@ jobs:
           Get-ChildItem -Force 'C:\ProgramData\ssh\auth_principals' -ErrorAction SilentlyContinue |
               Format-Table -AutoSize | Out-File t2-windows-artifacts\principals-listing.txt
           sc.exe qc UnclusterAgent | Out-File t2-windows-artifacts\sc-qc.txt 2>$null
+          # #166: sshd auth logs live in the OpenSSH operational event channel
+          # (not Application) — capture them so a cert-login failure is
+          # diagnosable. Also snapshot the writer service + the throwaway
+          # user's principals file mid-flow.
+          try {
+              Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 300 -ErrorAction SilentlyContinue |
+                  Format-List | Out-File t2-windows-artifacts\sshd-operational.txt
+          } catch { }
+          sc.exe qc UnclusterPrincipalsWriter | Out-File t2-windows-artifacts\sc-qc-writer.txt 2>$null
+          Get-Content 'C:\ProgramData\ssh\auth_principals\ciuser' -ErrorAction SilentlyContinue |
+              Out-File t2-windows-artifacts\principals-ciuser.txt
+          # Effective sshd config (AllowGroups/AllowUsers/etc.) — the hosted
+          # runner gates non-admin logins, so capture the resolved policy to
+          # diagnose any login-authorization failure (#166).
+          & "$env:SystemRoot\System32\OpenSSH\sshd.exe" -T 2>&1 | Out-File t2-windows-artifacts\sshd-T.txt
+          Get-ChildItem 'C:\ProgramData\ssh\sshd_config.d' -ErrorAction SilentlyContinue |
+              ForEach-Object { "==== $($_.Name) ===="; Get-Content $_.FullName } |
+              Out-File t2-windows-artifacts\sshd-config.d.txt
+          # Base sshd_config — shows WHERE the install's drop-in Include landed
+          # relative to any Match block (#177 diagnosis).
+          Get-Content 'C:\ProgramData\ssh\sshd_config' -ErrorAction SilentlyContinue |
+              Out-File t2-windows-artifacts\base-sshd_config.txt
+          # sshd version — Include is only honoured on Win32-OpenSSH 8.1+.
+          & "$env:SystemRoot\System32\OpenSSH\sshd.exe" -V 2>&1 | Out-File t2-windows-artifacts\sshd-version.txt
+          (Get-WindowsCapability -Online -Name 'OpenSSH.Server*' 2>&1 | Out-String) |
+              Out-File -Append t2-windows-artifacts\sshd-version.txt
           # Get-Service writes a non-terminating error if the service does
           # not exist. Use -ErrorAction Stop to convert it to terminating
           # so try/catch actually catches; default non-terminating errors
@@ -730,6 +1015,14 @@ jobs:
               "product:assert-doctor=${{ steps.assert-doctor.outcome }}" \
               "product:assert-sshd-drop-in=${{ steps.assert-drop-in.outcome }}" \
               "product:assert-principals-acl=${{ steps.assert-acl.outcome }}" \
+              "product:ssh-fixture-setup=${{ steps.fixture.outcome }}" \
+              "product:negative-pregrant-denied=${{ steps.neg1.outcome }}" \
+              "product:acl-grant=${{ steps.aclgrant.outcome }}" \
+              "product:wait-principal-present=${{ steps.waitpresent.outcome }}" \
+              "product:cert-login-whoami=${{ steps.loginpos.outcome }}" \
+              "product:acl-revoke=${{ steps.aclrevoke.outcome }}" \
+              "product:wait-principal-absent=${{ steps.waitabsent.outcome }}" \
+              "product:negative-postrevoke-denied=${{ steps.neg2.outcome }}" \
               "product:deprovision-and-marker=${{ steps.deprov.outcome }}" \
               > /tmp/classify.out
           cat /tmp/classify.out
