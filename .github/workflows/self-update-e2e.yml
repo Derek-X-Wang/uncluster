@@ -1,0 +1,424 @@
+# Self-update E2E — Agent binary self-update MECHANISM, hosted-runner (#169).
+#
+# ADR-0006 self-update flow: `server update set` → heartbeat `check_update` →
+# GET /v1/agent/update-plan → download → SHA256 verify → atomic swap →
+# service restart → next heartbeat reports the new version. Before this job the
+# flow had UNIT coverage only; nothing exercised it end-to-end on a real host.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SCOPE: this validates the self-update MECHANISM ONLY, NOT the privilege model.
+# ─────────────────────────────────────────────────────────────────────────────
+# The Agent is deliberately run AS ROOT here (via a systemd override, below) so
+# it can write its own binary and restart its own service. That isolates the
+# download/verify/swap/restart/heartbeat mechanism from the ORTHOGONAL low-priv
+# privilege question.
+#
+# Through a faithful low-priv install (the T2-linux pattern: service runs as the
+# unprivileged `uncluster` account) self-update is currently BROKEN — the account
+# cannot write the root-owned binary (`<bin>.new` in /usr/local/bin → EACCES) nor
+# restart the system unit (`systemctl restart` needs root). That is tracked as a
+# design fork in **#187** (the Linux/macOS analog of the #185/#127 privilege-model
+# gap). When #187's fix lands, THIS workflow flips from the agent-as-root override
+# to the real low-priv install and becomes that fix's regression witness — the
+# same pattern PR #184 follows for #185. Until then, agent-as-root keeps the
+# self-update MECHANISM under continuous test rather than leaving it uncovered.
+#
+# OUT OF SCOPE — failed-start rollback (the supervisor revert to `<bin>.prev`
+# after a bad binary fails to start within 30s, ADR-0006). That is a disruptive,
+# two-phase resumable check (a bad binary must actually crash the service and the
+# supervisor must revert), which belongs to T4 / local-agent validation per
+# ADR-0009, NOT hosted CI. This job proves the forward path + the verify GATE
+# (corrupt checksum ⇒ no swap); it does not prove recovery from a swapped-but-bad
+# binary. Do not add a rollback assertion here.
+#
+# CADENCE — schedule (nightly) + workflow_dispatch, NOT per-PR (counsel: stabilize
+# before promoting). PROMOTION PATH TO PER-PR: after this job is empirically green
+# for N consecutive nightly/dispatch runs (operator's call, suggest N=20), move
+# the trigger to `pull_request`, add the job to ci.yml's `all-tests-pass` needs
+# list, and drop the agent-as-root override in favor of the real low-priv install
+# once #187 lands. File a one-line follow-up issue when ready.
+#
+# FAILURE TAXONOMY (ADR-0008) — step names carry bootstrap:/rendezvous:/product:
+# prefixes; scripts/ci/classify-step.sh computes the gate class deliberately so an
+# agent can tell test-scaffold failures (advisory) from real self-update product
+# regressions (required). Wired into the quarantine watchdog (quarantine.yml).
+
+name: self-update-e2e
+
+on:
+  schedule:
+    - cron: "41 4 * * *"  # nightly, offset to avoid top-of-hour contention
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  self-update-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: bootstrap:build-old-binary
+        id: build-old
+        # The "installed" binary: version v0.0.1. Placed on a system path so
+        # `sudo uncluster agent install` finds it and the service ExecStart points
+        # at it. The compiled-in version is what the Agent reports on heartbeat.
+        run: |
+          set -euo pipefail
+          go build -trimpath \
+              -ldflags "-s -w -X github.com/derek-x-wang/uncluster/internal/version.Version=v0.0.1" \
+              -o /tmp/uncluster-old ./cmd/uncluster
+          sudo install -m 0755 /tmp/uncluster-old /usr/local/bin/uncluster
+          test "$(uncluster --version)" = "uncluster version v0.0.1"
+
+      - name: bootstrap:build-update-assets
+        id: build-assets
+        # The bytes GitHub Releases would serve — modelled on the real asset
+        # layout (`/{version}/uncluster_{os}_{arch}` + a PER-ASSET .sha256 sibling,
+        # the GoReleaser checksum.split shape the verifier expects: it reads the
+        # FIRST token of the fetched checksum file).
+        #   v0.0.2 → valid checksum   (happy path: should swap)
+        #   v0.0.3 → CORRUPT checksum (negative: must NOT swap)
+        run: |
+          set -euo pipefail
+          for v in v0.0.2 v0.0.3; do
+              mkdir -p "/tmp/assets/${v}"
+              go build -trimpath \
+                  -ldflags "-s -w -X github.com/derek-x-wang/uncluster/internal/version.Version=${v}" \
+                  -o "/tmp/assets/${v}/uncluster_linux_amd64" ./cmd/uncluster
+          done
+          # v0.0.2: correct checksum.
+          ( cd /tmp/assets/v0.0.2 && sha256sum uncluster_linux_amd64 > uncluster_linux_amd64.sha256 )
+          # v0.0.3: DELIBERATELY corrupt checksum (64 zeros) so verification fails
+          # even though the binary itself is a valid build. This exercises the
+          # verify gate, not a truncated download.
+          printf '%s  uncluster_linux_amd64\n' \
+              "0000000000000000000000000000000000000000000000000000000000000000" \
+              > /tmp/assets/v0.0.3/uncluster_linux_amd64.sha256
+          echo "assets laid down:"; find /tmp/assets -type f | sort
+
+      - name: bootstrap:install-sshd
+        id: sshd
+        # `agent install` runs gatekeeper.Install which requires sshd present +
+        # running (checkSSHD). Keep the apt step idempotent in case the image drops
+        # the pre-installed openssh-server.
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null; then
+              sudo apt-get update -y
+              sudo apt-get install -y --no-install-recommends openssh-server
+          fi
+          sudo systemctl enable --now ssh
+          sudo systemctl is-active --quiet ssh
+
+      - name: bootstrap:cp-bootstrap
+        id: cp-bs
+        run: |
+          set -euo pipefail
+          export XDG_DATA_HOME=/tmp/uncluster-ci/data
+          mkdir -p "${XDG_DATA_HOME}"
+          uncluster server bootstrap --label ci-bootstrap > /tmp/bs.out
+          cat /tmp/bs.out
+          awk '/caller token \(shown ONCE/{getline; gsub(/^[[:space:]]+/,""); print; exit}' \
+              /tmp/bs.out > /tmp/caller-token
+          test -s /tmp/caller-token
+
+      - name: bootstrap:cp-start
+        id: cp-start
+        run: |
+          set -euo pipefail
+          export XDG_DATA_HOME=/tmp/uncluster-ci/data
+          nohup uncluster server start --addr 127.0.0.1:17777 \
+              > /tmp/cp.log 2>&1 &
+          echo $! > /tmp/cp.pid
+          for _ in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:17777/healthz >/dev/null 2>&1; then
+                  echo "cp up"
+                  exit 0
+              fi
+              sleep 1
+          done
+          echo "cp never became healthy"
+          tail -50 /tmp/cp.log || true
+          exit 1
+
+      - name: bootstrap:asset-server
+        id: asset-srv
+        # Serve the "release" assets over loopback. Stands in for GitHub Releases;
+        # 127.0.0.1 is added to the Agent's update-host allowlist below (the
+        # default allowlist is github.com only — #39/ADR-0006 last-mile defence).
+        run: |
+          set -euo pipefail
+          nohup python3 -m http.server 18080 --directory /tmp/assets \
+              > /tmp/asset-server.log 2>&1 &
+          echo $! > /tmp/asset-server.pid
+          for _ in $(seq 1 20); do
+              if curl -fsS http://127.0.0.1:18080/v0.0.2/uncluster_linux_amd64.sha256 >/dev/null 2>&1; then
+                  echo "asset server up"
+                  exit 0
+              fi
+              sleep 1
+          done
+          echo "asset server never came up"
+          tail -50 /tmp/asset-server.log || true
+          exit 1
+
+      - name: rendezvous:mint-join-token
+        id: mint-join
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          resp="$(curl -fsS -X POST http://127.0.0.1:17777/v1/tokens \
+              -H "Authorization: Bearer ${CALLER_TOK}" \
+              -H "Content-Type: application/json" \
+              -d '{"kind":"join","label":"ci-join"}')"
+          echo "${resp}" | jq -r '.token' > /tmp/join-token
+          test -s /tmp/join-token
+
+      - name: product:agent-join
+        id: agent-join
+        run: |
+          set -euo pipefail
+          sudo env UNCLUSTER_TOKEN="$(cat /tmp/join-token)" \
+              uncluster agent join \
+                  --server http://127.0.0.1:17777 \
+                  --name ci-agent
+
+      - name: product:agent-install
+        id: agent-install
+        run: |
+          set -euo pipefail
+          sudo uncluster agent install
+
+      - name: bootstrap:pin-update-host
+        id: pin-host
+        # Add 127.0.0.1 to the install-time-pinned update-host allowlist so the
+        # Agent will fetch from the loopback asset server (default = github.com
+        # only). `update_host_allowlist` is a GLOBAL toml key and MUST sit before
+        # the `[expected_paths]` table, so prepend it at line 1 rather than append.
+        # (No `agent join --update-host` flag exists yet — see agent_cmd.go.)
+        run: |
+          set -euo pipefail
+          sudo sed -i '1i update_host_allowlist = ["127.0.0.1"]' /etc/uncluster/agent.toml
+          echo "system agent.toml after pin:"; sudo head -3 /etc/uncluster/agent.toml
+
+      - name: bootstrap:agent-as-root
+        id: as-root
+        # Isolate the self-update MECHANISM from the low-priv privilege model
+        # (#187): a systemd override runs the service as root so it can write the
+        # root-owned binary and restart its own unit. This is test scaffolding,
+        # NOT the product path — the real low-priv path is broken pending #187 and
+        # this override is removed once that fix lands (see the header). The
+        # restart also reloads agent.toml with the update-host pin above.
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/systemd/system/com.uncluster.agent.service.d
+          printf '[Service]\nUser=root\nGroup=root\n' | \
+              sudo tee /etc/systemd/system/com.uncluster.agent.service.d/override.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart com.uncluster.agent
+          # Confirm it actually came back as root.
+          for _ in $(seq 1 15); do
+              if [[ "$(systemctl show -p User --value com.uncluster.agent)" == "root" ]] \
+                 && systemctl is-active --quiet com.uncluster.agent; then
+                  echo "service running as root"
+                  exit 0
+              fi
+              sleep 1
+          done
+          echo "service did not come up as root"
+          sudo systemctl status com.uncluster.agent --no-pager || true
+          exit 1
+
+      - name: product:assert-baseline-v001
+        id: assert-old
+        # The running Agent must be online and reporting the OLD version before we
+        # trigger an update — otherwise a later "sees v0.0.2" assertion could pass
+        # vacuously. Reads agent_version from GET /v1/agents (AgentDetail).
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          for _ in $(seq 1 40); do
+              ver="$(curl -fsS http://127.0.0.1:17777/v1/agents \
+                  -H "Authorization: Bearer ${CALLER_TOK}" \
+                  | jq -r '.[] | select(.name=="ci-agent") | .agent_version // empty')"
+              if [[ "${ver}" == "v0.0.1" ]]; then
+                  echo "baseline: agent online reporting v0.0.1"
+                  exit 0
+              fi
+              sleep 1
+          done
+          echo "agent never reported baseline v0.0.1 (got: '${ver:-none}')"
+          exit 1
+
+      - name: product:trigger-update-happy
+        id: trigger-happy
+        # Operator publishes v0.0.2. On the next heartbeat the Agent (v0.0.1) gets
+        # a check_update, fetches the plan, downloads + verifies + swaps + restarts.
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          curl -fsS -X POST http://127.0.0.1:17777/v1/server/update \
+              -H "Authorization: Bearer ${CALLER_TOK}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                    "expected_version": "v0.0.2",
+                    "asset_url_template": "http://127.0.0.1:18080/{version}/uncluster_{os}_{arch}{ext}",
+                    "sha256_url_template": "http://127.0.0.1:18080/{version}/uncluster_{os}_{arch}{ext}.sha256"
+                  }'
+
+      - name: product:assert-updated-v002
+        id: assert-updated
+        # The core proof: after the update the Agent heartbeats the NEW version.
+        # This transitively proves download → verify → atomic swap → service
+        # restart → new-version heartbeat all succeeded. Budget 120s: heartbeat
+        # interval (<=10s) + loopback download + service restart, with margin.
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          for _ in $(seq 1 120); do
+              ver="$(curl -fsS http://127.0.0.1:17777/v1/agents \
+                  -H "Authorization: Bearer ${CALLER_TOK}" \
+                  | jq -r '.[] | select(.name=="ci-agent") | .agent_version // empty')"
+              if [[ "${ver}" == "v0.0.2" ]]; then
+                  echo "agent self-updated to v0.0.2"
+                  exit 0
+              fi
+              sleep 1
+          done
+          echo "agent never reported v0.0.2 (got: '${ver:-none}')"
+          sudo journalctl -u com.uncluster.agent --no-pager | tail -60 || true
+          exit 1
+
+      - name: product:assert-binary-swapped
+        id: assert-swap
+        # On-disk corroboration of the swap: the live binary now reports v0.0.2 and
+        # the previous binary was preserved at <bin>.prev (Unix suffix) for the
+        # rollback path that lives outside this job's scope.
+        run: |
+          set -euo pipefail
+          test "$(sudo /usr/local/bin/uncluster --version)" = "uncluster version v0.0.2"
+          sudo test -f /usr/local/bin/uncluster.prev
+          test "$(sudo /usr/local/bin/uncluster.prev --version)" = "uncluster version v0.0.1"
+          echo "binary swapped on disk; v0.0.1 preserved at uncluster.prev"
+
+      - name: product:trigger-update-corrupt
+        id: trigger-corrupt
+        # Negative path: publish v0.0.3 whose checksum file is corrupt. The Agent
+        # must download, FAIL verification, and NOT swap.
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          curl -fsS -X POST http://127.0.0.1:17777/v1/server/update \
+              -H "Authorization: Bearer ${CALLER_TOK}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                    "expected_version": "v0.0.3",
+                    "asset_url_template": "http://127.0.0.1:18080/{version}/uncluster_{os}_{arch}{ext}",
+                    "sha256_url_template": "http://127.0.0.1:18080/{version}/uncluster_{os}_{arch}{ext}.sha256"
+                  }'
+
+      - name: product:assert-no-swap-on-corrupt
+        id: assert-no-swap
+        # Prove the negative is NON-VACUOUS: (1) the Agent actually ATTEMPTED the
+        # update and rejected it on checksum mismatch (journal evidence), and
+        # (2) it kept running + heartbeating the OLD-good v0.0.2 across several
+        # heartbeats — the swap did not happen. Wait for the attempt first (up to
+        # ~40s = >=3 heartbeats), then confirm the version held.
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          attempted=false
+          for _ in $(seq 1 40); do
+              if sudo journalctl -u com.uncluster.agent --no-pager \
+                     | grep -qi 'checksum mismatch'; then
+                  attempted=true
+                  break
+              fi
+              sleep 1
+          done
+          if [[ "${attempted}" != "true" ]]; then
+              echo "agent never attempted/rejected the corrupt update — negative is vacuous"
+              sudo journalctl -u com.uncluster.agent --no-pager | tail -60 || true
+              exit 1
+          fi
+          echo "agent attempted the corrupt update and rejected it on checksum mismatch"
+          # Hold window: version must stay v0.0.2 and the agent stay online.
+          for _ in $(seq 1 15); do
+              ver="$(curl -fsS http://127.0.0.1:17777/v1/agents \
+                  -H "Authorization: Bearer ${CALLER_TOK}" \
+                  | jq -r '.[] | select(.name=="ci-agent") | .agent_version // empty')"
+              if [[ "${ver}" != "v0.0.2" ]]; then
+                  echo "version changed to '${ver}' after corrupt update — swap should NOT have happened"
+                  exit 1
+              fi
+              sleep 1
+          done
+          # On-disk: still v0.0.2, and no v0.0.3 leaked into place.
+          test "$(sudo /usr/local/bin/uncluster --version)" = "uncluster version v0.0.2"
+          echo "corrupt update correctly rejected: old-good v0.0.2 still running + heartbeating"
+
+      - name: collect:artifacts
+        if: always()
+        run: |
+          set +e
+          mkdir -p self-update-artifacts
+          # `sudo cmd | tee` (not `sudo cmd > file`): the redirect target lives in
+          # the runner-owned artifacts dir, so tee writes it fine while sudo covers
+          # only the command's read access — and it keeps shellcheck SC2024 quiet.
+          sudo journalctl -u com.uncluster.agent --no-pager 2>&1 | tee self-update-artifacts/agent-journal.txt >/dev/null
+          cp /tmp/cp.log self-update-artifacts/cp.log 2>/dev/null || true
+          cp /tmp/asset-server.log self-update-artifacts/asset-server.log 2>/dev/null || true
+          sudo systemctl status com.uncluster.agent --no-pager 2>&1 | tee self-update-artifacts/svc-status.txt >/dev/null
+          sudo cat /etc/systemd/system/com.uncluster.agent.service.d/override.conf 2>&1 | tee self-update-artifacts/svc-override.conf >/dev/null
+          sudo cat /etc/uncluster/agent.toml 2>&1 | tee self-update-artifacts/agent-toml.txt >/dev/null
+          sudo ls -la /usr/local/bin/uncluster* 2>&1 | tee self-update-artifacts/binary-listing.txt >/dev/null
+          find /tmp/assets -type f 2>&1 | tee self-update-artifacts/asset-listing.txt >/dev/null
+          ls -la self-update-artifacts
+        continue-on-error: true
+
+      - name: collect:upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: self-update-${{ github.run_id }}
+          path: self-update-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: enforce-taxonomy
+        if: always()
+        run: |
+          ./scripts/ci/classify-step.sh \
+              "bootstrap:build-old-binary=${{ steps.build-old.outcome }}" \
+              "bootstrap:build-update-assets=${{ steps.build-assets.outcome }}" \
+              "bootstrap:install-sshd=${{ steps.sshd.outcome }}" \
+              "bootstrap:cp-bootstrap=${{ steps.cp-bs.outcome }}" \
+              "bootstrap:cp-start=${{ steps.cp-start.outcome }}" \
+              "bootstrap:asset-server=${{ steps.asset-srv.outcome }}" \
+              "rendezvous:mint-join-token=${{ steps.mint-join.outcome }}" \
+              "product:agent-join=${{ steps.agent-join.outcome }}" \
+              "product:agent-install=${{ steps.agent-install.outcome }}" \
+              "bootstrap:pin-update-host=${{ steps.pin-host.outcome }}" \
+              "bootstrap:agent-as-root=${{ steps.as-root.outcome }}" \
+              "product:assert-baseline-v001=${{ steps.assert-old.outcome }}" \
+              "product:trigger-update-happy=${{ steps.trigger-happy.outcome }}" \
+              "product:assert-updated-v002=${{ steps.assert-updated.outcome }}" \
+              "product:assert-binary-swapped=${{ steps.assert-swap.outcome }}" \
+              "product:trigger-update-corrupt=${{ steps.trigger-corrupt.outcome }}" \
+              "product:assert-no-swap-on-corrupt=${{ steps.assert-no-swap.outcome }}" \
+              > /tmp/classify.out
+          cat /tmp/classify.out
+          class="$(grep -E '^class=' /tmp/classify.out | cut -d= -f2)"
+          case "${class}" in
+              success)  exit 0 ;;
+              advisory) echo "::warning::self-update-e2e advisory failure (bootstrap/rendezvous/scaffold); see artifacts"; exit 0 ;;
+              required) echo "::error::self-update-e2e REQUIRED failure (self-update product mechanism)."; exit 1 ;;
+              *)        echo "::error::self-update-e2e unknown class=${class}"; exit 1 ;;
+          esac

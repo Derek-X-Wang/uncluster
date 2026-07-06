@@ -41,3 +41,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ./scripts/ci/quarantine-rule.sh --workflow e2e-cross-machine.yml --threshold 3
+
+  watch-self-update-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: run quarantine rule for self-update-e2e (#169)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Nightly/dispatch self-update mechanism E2E. A required-class failure
+          # here is a real self-update product regression; 3 consecutive escalate.
+          ./scripts/ci/quarantine-rule.sh --workflow self-update-e2e.yml --threshold 3
