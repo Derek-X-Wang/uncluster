@@ -8,13 +8,16 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
 	"github.com/derek-x-wang/uncluster/internal/api"
 	"github.com/derek-x-wang/uncluster/internal/gatekeeper"
+	"github.com/derek-x-wang/uncluster/internal/version"
 )
 
 // RunAgent executes one full lifecycle of the agent run loop: loads the
@@ -82,6 +85,18 @@ func RunAgent(ctx context.Context, stderrW io.Writer) error {
 				return results.HealthChecks(), nil
 			},
 		)
+	// #187: when supervised by the launcher (`agent launch`), commit health by
+	// writing the launcher's marker on the first successful heartbeat. The
+	// launcher waits for this to consider a freshly-started payload version good;
+	// without it a good version would be rolled back on every start. Unset env
+	// (a bare `agent run`, or Windows) makes the hook inert.
+	if markerPath := agent.HealthMarkerPathFromEnv(); markerPath != "" {
+		a = a.WithOnFirstHealthy(func() {
+			if err := agent.WriteHealthMarker(markerPath, version.Version); err != nil {
+				slog.Warn("agent: health marker write failed", "path", markerPath, "err", err)
+			}
+		})
+	}
 	// Refuse to start if a .deprovisioned marker exists next to
 	// agent.toml. The supervisor would otherwise flap-restart us
 	// against a revoked token, which the operator has to manually
@@ -131,6 +146,7 @@ func newAgentCmd() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(run)
+	cmd.AddCommand(newAgentLaunchCmd())
 
 	install := newAgentInstallCmd()
 	cmd.AddCommand(install)
@@ -143,6 +159,37 @@ func newAgentCmd() *cobra.Command {
 	cmd.AddCommand(newAgentPrincipalsCmd())
 
 	return cmd
+}
+
+// newAgentLaunchCmd builds the `agent launch` command: the service ExecStart
+// target on Linux/macOS under the #187 hybrid-launcher model. The root-owned
+// launcher binary (this process, running as the low-priv service account)
+// supervises the self-updatable payload from the managed store — starting it,
+// requiring a health commit, rolling back a bad version, and restarting onto a
+// staged update. A SIGINT/SIGTERM from the service manager cancels the context,
+// which drives a graceful shutdown: the payload child is SIGTERM'd (then
+// SIGKILL'd after grace) and reaped before the launcher exits.
+func newAgentLaunchCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "launch",
+		Short: "Supervise the self-updatable agent payload (service entrypoint on Linux/macOS)",
+		Long: `Runs the resident launcher that supervises the agent payload binary.
+
+This is the systemd/launchd ExecStart target installed by ` + "`uncluster agent install`" + `
+on Linux/macOS. The launcher is root-owned at a stable path but runs with no
+root runtime power; it starts the payload from the service-account-writable
+managed store, requires each version to commit health within a deadline, rolls
+back and quarantines a bad version, and restarts onto a self-update the payload
+stages. Windows runs the agent directly via ` + "`agent run`" + ` (see #139).`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Own signal context so a service-manager stop (SIGTERM) or Ctrl-C
+			// (SIGINT) cancels ctx → the launcher stops + reaps its child
+			// gracefully rather than being killed mid-supervision.
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			return agent.RunLauncher(ctx, nil)
+		},
+	}
 }
 
 // newAgentPrincipalsCmd returns `uncluster agent principals <username>` — the
