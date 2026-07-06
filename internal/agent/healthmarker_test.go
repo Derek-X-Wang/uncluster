@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,17 +11,54 @@ import (
 
 func TestWriteHealthMarker_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "sub", "health") // note: dir must be created
+	path := filepath.Join(dir, "sub", "health") // parent dir created by WriteHealthMarker
 
 	if err := WriteHealthMarker(path, "v1.2.3"); err != nil {
 		t.Fatalf("WriteHealthMarker: %v", err)
 	}
+	got, ok, err := readMarker(path)
+	if err != nil || !ok {
+		t.Fatalf("readMarker ok=%v err=%v", ok, err)
+	}
+	if got != "v1.2.3" {
+		t.Errorf("marker version = %q, want v1.2.3", got)
+	}
+}
+
+// The on-disk body is schema-versioned JSON (forward-compat), not bare text.
+func TestWriteHealthMarker_BodyIsSchemaVersionedJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health")
+	if err := WriteHealthMarker(path, "v9"); err != nil {
+		t.Fatal(err)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read marker: %v", err)
+		t.Fatal(err)
 	}
-	if string(b) != "v1.2.3" {
-		t.Errorf("marker content = %q, want v1.2.3", b)
+	var body markerBody
+	if err := json.Unmarshal(b, &body); err != nil {
+		t.Fatalf("marker is not JSON: %v (%s)", err, b)
+	}
+	if body.SchemaVersion != markerSchemaVersion {
+		t.Errorf("schema_version = %d, want %d", body.SchemaVersion, markerSchemaVersion)
+	}
+	if body.Version != "v9" {
+		t.Errorf("version = %q, want v9", body.Version)
+	}
+}
+
+// A marker written under an unknown (future) schema version reads as absent.
+func TestReadMarker_UnknownSchemaIsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health")
+	future := markerBody{SchemaVersion: markerSchemaVersion + 99, Version: "vX"}
+	data, _ := json.Marshal(future)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := readMarker(path); ok || err != nil {
+		t.Errorf("unknown schema should read as absent; ok=%v err=%v", ok, err)
 	}
 }
 
@@ -36,7 +74,6 @@ func TestMarkerHealthWaiter_SucceedsWhenVersionMatches(t *testing.T) {
 	w := newMarkerHealthWaiter(path)
 	w.interval = 5 * time.Millisecond
 
-	// Write the matching marker shortly after starting the wait.
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		_ = WriteHealthMarker(path, "v2")
@@ -77,7 +114,6 @@ func TestMarkerHealthWaiter_ClearRemovesStale(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("clear did not remove the marker")
 	}
-	// After clear, a wait for the old version must time out (not match a stale file).
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 	w.interval = 5 * time.Millisecond
@@ -87,7 +123,7 @@ func TestMarkerHealthWaiter_ClearRemovesStale(t *testing.T) {
 }
 
 func TestHealthMarkerPathFromEnv(t *testing.T) {
-	t.Setenv(healthMarkerEnv, "/tmp/x/health")
+	t.Setenv(HealthMarkerEnv, "/tmp/x/health")
 	if got := HealthMarkerPathFromEnv(); got != "/tmp/x/health" {
 		t.Errorf("HealthMarkerPathFromEnv = %q, want /tmp/x/health", got)
 	}

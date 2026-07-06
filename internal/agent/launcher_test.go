@@ -250,6 +250,60 @@ func TestLauncher_PendingUpdateRestartsOntoNewVersion(t *testing.T) {
 	}
 }
 
+// A stop request (e.g. .deprovisioned marker) present before the first start
+// makes the launcher exit cleanly without starting any payload.
+func TestLauncher_StopRequestedBeforeStartExitsClean(t *testing.T) {
+	s := newTestStore(t)
+	mustStageActivate(t, s, "v1", "V1")
+	r := &fakeRunner{store: s}
+	h := &fakeHealth{healthy: map[string]bool{"v1": true}}
+	l := NewLauncher(LauncherConfig{
+		Store: s, Runner: r, Health: h, Logger: testLogger(t),
+		HealthDeadline: 150 * time.Millisecond, PollInterval: 10 * time.Millisecond,
+		ShouldStop: func() bool { return true },
+	})
+	if err := l.Run(context.Background()); err != nil {
+		t.Errorf("Run with stop-requested should return nil, got %v", err)
+	}
+	if got := r.startedVersions(); len(got) != 0 {
+		t.Errorf("no payload should start when stop is requested; started %v", got)
+	}
+}
+
+// A payload that exits before health while a stop is requested (deprovision) is
+// NOT quarantined/rolled back — the launcher exits cleanly.
+func TestLauncher_DeprovisionExitIsNotQuarantined(t *testing.T) {
+	s := newTestStore(t)
+	mustStageActivate(t, s, "v1", "V1")
+	r := &fakeRunner{store: s}
+	r.onStart = func(_ string, p *fakeProcess) {
+		go func() { time.Sleep(20 * time.Millisecond); p.die(nil) }() // clean exit 0
+	}
+	h := &fakeHealth{healthy: map[string]bool{}} // never reports healthy
+	deprovisioned := false
+	l := NewLauncher(LauncherConfig{
+		Store: s, Runner: r, Health: h, Logger: testLogger(t),
+		HealthDeadline: 2 * time.Second, PollInterval: 10 * time.Millisecond,
+		ShouldStop: func() bool { return deprovisioned },
+	})
+	// Flip deprovisioned true so the exit is read as a clean stop, not a bad version.
+	deprovisioned = true
+
+	done := make(chan error, 1)
+	go func() { done <- l.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run after deprovision exit should return nil, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after deprovision exit")
+	}
+	if s.IsQuarantined("v1") {
+		t.Error("v1 must not be quarantined on a deprovision exit")
+	}
+}
+
 // No current version is an unrecoverable start error.
 func TestLauncher_NoCurrentIsError(t *testing.T) {
 	s := newTestStore(t)

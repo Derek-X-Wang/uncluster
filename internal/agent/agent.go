@@ -61,6 +61,13 @@ type Agent struct {
 	fcaMu              sync.Mutex
 	failClosedAfterSec *int64    // nil = disabled; updated from heartbeat response
 	lastHeartbeatOK    time.Time // last time a heartbeat succeeded
+
+	// onFirstHealthy, if set, is invoked exactly once — on the FIRST successful
+	// heartbeat (config loaded + Control plane reachable), which is the "health
+	// commit" the #187 launcher waits for. The CLI wires this to write the
+	// health marker so the supervisor knows a freshly-started payload version is
+	// good. Nil (unsupervised / Windows) makes it inert. Invoked outside fcaMu.
+	onFirstHealthy func()
 }
 
 func New(cfg Config, logger *slog.Logger) *Agent {
@@ -102,6 +109,14 @@ func (a *Agent) WithDeprovisionCleanup(fn func(ctx context.Context) error) *Agen
 // next to agent.toml — supervisor + re-run flows couldn't see it.
 func (a *Agent) WithConfigPath(path string) *Agent {
 	a.configPath = path
+	return a
+}
+
+// WithOnFirstHealthy attaches a hook fired once on the first successful
+// heartbeat — the health commit the #187 launcher waits for. The CLI uses it to
+// write the launcher's health marker. A nil hook is a no-op.
+func (a *Agent) WithOnFirstHealthy(fn func()) *Agent {
+	a.onFirstHealthy = fn
 	return a
 }
 
@@ -392,9 +407,17 @@ func (a *Agent) heartbeatOnceV2(ctx context.Context) error {
 
 	// Track successful heartbeat time and update fail-closed-after from response.
 	a.fcaMu.Lock()
+	firstOK := a.lastHeartbeatOK.IsZero()
 	a.lastHeartbeatOK = time.Now()
 	a.failClosedAfterSec = resp.FailClosedAfter
 	a.fcaMu.Unlock()
+
+	// First successful heartbeat is the health commit: signal the launcher
+	// (once) that this payload version is good. Done after the fcaMu section so
+	// the hook (a marker write) never holds the lock.
+	if firstOK && a.onFirstHealthy != nil {
+		a.onFirstHealthy()
+	}
 
 	// If the server sent a policy snapshot, dispatch it for application.
 	if resp.Policy != nil && a.applyCh != nil {

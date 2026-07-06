@@ -48,6 +48,15 @@ type Launcher struct {
 	// pollInterval is how often the steady-state supervisor checks for the
 	// pending-update marker.
 	pollInterval time.Duration
+
+	// shouldStop, when set and returning true, tells the launcher the current
+	// situation is a CLEAN termination (the Agent was deprovisioned by the
+	// Control plane — the payload wiped its principals, wrote a .deprovisioned
+	// marker, and exited 0) rather than a crash. Without it, a deprovisioned
+	// payload's clean exit would look like either a healthy-exit-to-restart
+	// (flap) or an exit-before-health (spurious quarantine + rollback). Checked
+	// before starting a payload and whenever the payload exits.
+	shouldStop func() bool
 }
 
 // PayloadRunner starts a payload binary and returns a running handle. Injected
@@ -78,6 +87,8 @@ type LauncherConfig struct {
 	HealthDeadline    time.Duration
 	PendingUpdatePath string
 	PollInterval      time.Duration
+	// ShouldStop is an optional predicate; see Launcher.shouldStop.
+	ShouldStop func() bool
 }
 
 // DefaultHealthDeadline is the default health-commit budget for a freshly
@@ -107,7 +118,14 @@ func NewLauncher(cfg LauncherConfig) *Launcher {
 		healthDeadline:    cfg.HealthDeadline,
 		pendingUpdatePath: cfg.PendingUpdatePath,
 		pollInterval:      cfg.PollInterval,
+		shouldStop:        cfg.ShouldStop,
 	}
+}
+
+// stopRequested reports whether an external condition (e.g. a .deprovisioned
+// marker) asks the launcher to terminate cleanly. Nil predicate ⇒ never stop.
+func (l *Launcher) stopRequested() bool {
+	return l.shouldStop != nil && l.shouldStop()
 }
 
 // Run supervises the payload until ctx is cancelled (service stop) or an
@@ -115,6 +133,13 @@ func NewLauncher(cfg LauncherConfig) *Launcher {
 // last-known-good to roll back to). It returns ctx.Err() on a clean shutdown.
 func (l *Launcher) Run(ctx context.Context) error {
 	for {
+		// A deprovisioned Agent must not be (re)started: exit cleanly so the
+		// supervisor's restart policy is the only thing that could bring it
+		// back, and the payload's own .deprovisioned guard stops it again.
+		if l.stopRequested() {
+			l.logger.Info("launcher: stop requested (agent deprovisioned); exiting without starting payload")
+			return nil
+		}
 		curBin, curVer, err := l.store.Current()
 		if err != nil {
 			return fmt.Errorf("launcher: resolve current payload: %w", err)
@@ -186,8 +211,14 @@ func (l *Launcher) superviseUntilHealthy(ctx context.Context, proc PayloadProces
 		<-exitCh
 		return superviseShutdown, nil
 	case exitErr := <-exitCh:
-		// Exited before health committed → bad version.
+		// Exited before health committed → bad version, UNLESS the exit was a
+		// clean deprovision (payload wiped principals + wrote its marker + exited
+		// 0). Rolling back / quarantining a deprovisioned agent would be wrong.
 		if ctx.Err() != nil {
+			return superviseShutdown, nil
+		}
+		if l.stopRequested() {
+			l.logger.Info("launcher: payload exited and stop requested (deprovisioned); not treating as a bad version", "version", version)
 			return superviseShutdown, nil
 		}
 		l.logger.Warn("launcher: payload exited before health commit", "version", version, "err", exitErr)
@@ -228,6 +259,11 @@ func (l *Launcher) superviseSteadyState(ctx context.Context, proc PayloadProcess
 			return superviseShutdown, nil
 		case exitErr := <-exitCh:
 			if ctx.Err() != nil {
+				return superviseShutdown, nil
+			}
+			// A clean deprovision exit must terminate the launcher, not flap-restart.
+			if l.stopRequested() {
+				l.logger.Info("launcher: healthy payload exited and stop requested (deprovisioned); exiting", "version", version)
 				return superviseShutdown, nil
 			}
 			l.logger.Warn("launcher: healthy payload exited; restarting", "version", version, "err", exitErr)
