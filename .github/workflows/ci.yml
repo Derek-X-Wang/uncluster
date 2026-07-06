@@ -880,33 +880,49 @@ jobs:
       - name: advisory:writer-gone-probe
         id: writerprobe
         if: always()
-        # ADVISORY discovery per #166 — NEVER gates (always exits 0; not passed
-        # to classify-step.sh). The #146 cleanup hook uninstalls
-        # UnclusterPrincipalsWriter best-effort; the low-priv agent may hit
-        # access-denied (deprovision_cleanup_windows.go), leaving the writer
-        # behind. This probe records whether the writer survived so PR #159's
-        # open caveat gets real per-run data. If it SURVIVED a SUCCESSFUL
-        # deprovision, the runner files a follow-up proposing spool-mediated
-        # self-removal (agent writes a deprovision desired-state; the
-        # LocalSystem writer removes its own service — mirrors the #127
-        # validate-then-privileged-execute split). The probe is not softened;
-        # it is promoted to a gate in a later PR once green over several runs.
+        # ADVISORY discovery (#166) — never gates (always exits 0; not passed to
+        # classify-step.sh). #182 landed spool-mediated writer self-removal, so this
+        # probe should now observe UnclusterPrincipalsWriter ABSENT after a successful
+        # deprovision (the agent submits a deprovision desired-state; the LocalSystem
+        # writer, which holds the DELETE the low-priv agent lacks per #146/#159, removes
+        # its OWN service).
+        #
+        # Kept ADVISORY for THIS PR on purpose: this is the first real-Windows execution
+        # of the self-removal path, and standing up a brand-new REQUIRED gate on a first
+        # run risks bricking every PR on a false negative — the issue's "promote once
+        # green over several runs" guidance. A tiny follow-up PR flips advisory→required
+        # once ABSENT is witnessed over a couple of runs.
+        #
+        # The absence check is already async-aware so the future required flip inherits
+        # a robust probe: self-removal is asynchronous (Delete() marks the service for
+        # deletion; SCM finalizes it once the writer stops), so we POLL up to 90s for
+        # absence before concluding SURVIVED — a StopPending/marked-for-deletion service
+        # right after deprovision is NOT a regression (mirrors the d611086 marker-wait
+        # widening for the async Windows wipe). A non-success deprovision is inconclusive
+        # here — the deprovision product step already gates that failure.
         run: |
           New-Item -ItemType Directory -Force -Path t2-windows-artifacts | Out-Null
           $probe = 't2-windows-artifacts\writer-gone-probe.txt'
-          $svc = Get-Service -Name UnclusterPrincipalsWriter -ErrorAction SilentlyContinue
           $deprov = '${{ steps.deprov.outcome }}'
-          if ($null -eq $svc) {
-              $msg = "writer-gone-probe: UnclusterPrincipalsWriter ABSENT after deprovision (clean removal). deprov=$deprov"
+          if ($deprov -ne 'success') {
+              $msg = "writer-gone-probe: deprovision did not succeed (deprov=$deprov) — INCONCLUSIVE; the deprovision product step already gates that failure."
               $msg | Tee-Object -FilePath $probe
               Write-Host "::notice::T2-windows $msg"
-          } elseif ($deprov -ne 'success') {
-              $msg = "writer-gone-probe: UnclusterPrincipalsWriter still present but deprovision did not succeed (deprov=$deprov) — INCONCLUSIVE, not the access-denied signal."
+              exit 0
+          }
+          # Bounded wait for the async self-removal to finalize.
+          $deadline = (Get-Date).AddSeconds(90)
+          $svc = Get-Service -Name UnclusterPrincipalsWriter -ErrorAction SilentlyContinue
+          while ($null -ne $svc -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 3
+              $svc = Get-Service -Name UnclusterPrincipalsWriter -ErrorAction SilentlyContinue
+          }
+          if ($null -eq $svc) {
+              $msg = "writer-gone-probe: UnclusterPrincipalsWriter ABSENT after deprovision (spool-mediated self-removal, #182)."
               $msg | Tee-Object -FilePath $probe
-              & sc.exe qc UnclusterPrincipalsWriter 2>&1 | Out-File -Append $probe
               Write-Host "::notice::T2-windows $msg"
           } else {
-              $msg = "writer-gone-probe: UnclusterPrincipalsWriter SURVIVED a SUCCESSFUL deprovision (status=$($svc.Status)). Best-effort cleanup likely hit access-denied (#146/#159). Follow-up: propose spool-mediated self-removal."
+              $msg = "writer-gone-probe: UnclusterPrincipalsWriter SURVIVED a SUCCESSFUL deprovision (status=$($svc.Status)) after a 90s wait — self-removal regression (#182). ADVISORY this PR; promoted to a required gate in a follow-up."
               $msg | Tee-Object -FilePath $probe
               & sc.exe qc UnclusterPrincipalsWriter 2>&1 | Out-File -Append $probe
               Write-Host "::warning::T2-windows $msg"
