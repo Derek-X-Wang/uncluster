@@ -189,6 +189,17 @@ jobs:
           go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
           # Place it on a system path so `sudo uncluster agent install` finds it.
           sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+          # #185/#168: sshd's AuthorizedPrincipalsCommand safe-path check walks the
+          # ENTIRE path chain (binary + every ancestor dir) and rejects the command
+          # if any component is non-root-owned or group/world-writable. GitHub's
+          # ubuntu-latest ships a non-root-strict /usr/local + /usr/local/bin (loosened
+          # so tooling installs without sudo) — an anomaly vs a standard Linux host
+          # where these are root:root 0755. Normalize them so the runner matches a
+          # real install (where the operator's #185 assumption holds). This does NOT
+          # mask a product gap: a loose install dir is surfaced by the doctor
+          # command-path-chain check (follow-up strengthening tracked separately).
+          sudo chown root:root /usr/local /usr/local/bin
+          sudo chmod 755 /usr/local /usr/local/bin
           uncluster --help >/dev/null
 
       - name: bootstrap:install-sshd
