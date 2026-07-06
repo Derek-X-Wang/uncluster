@@ -312,19 +312,21 @@ func checkSSHDEffectiveConfig(paths agent.ExpectedPaths) CheckResult {
 			Message: fmt.Sprintf("sshd -T failed: %v", err)}
 	}
 	content := strings.ToLower(string(out))
-	wantCA := strings.ToLower(paths.CAPubkey)
-	wantPrincipals := strings.ToLower(paths.PrincipalsDir)
 	var missing []string
-	if !strings.Contains(content, wantCA) {
+	if !strings.Contains(content, strings.ToLower(paths.CAPubkey)) {
 		missing = append(missing, "TrustedUserCAKeys")
 	}
-	if !strings.Contains(content, wantPrincipals) {
-		missing = append(missing, "AuthorizedPrincipalsFile")
+	// #185: Unix/macOS serve principals via AuthorizedPrincipalsCommand, so the
+	// effective config reports `authorizedprincipalsfile none` and instead carries
+	// `authorizedprincipalscommand <bin> agent principals %u`. Assert the command
+	// is effective, not the (now-absent) file path.
+	if !strings.Contains(content, "authorizedprincipalscommand") || !strings.Contains(content, "agent principals") {
+		missing = append(missing, "AuthorizedPrincipalsCommand")
 	}
 	if len(missing) > 0 {
 		return CheckResult{Name: "sshd-effective-config", Status: CheckFail,
 			Message: fmt.Sprintf("sshd effective config missing: %s", strings.Join(missing, ", "))}
 	}
 	return CheckResult{Name: "sshd-effective-config", Status: CheckOK,
-		Message: "sshd effective config has TrustedUserCAKeys + AuthorizedPrincipalsFile"}
+		Message: "sshd effective config has TrustedUserCAKeys + AuthorizedPrincipalsCommand"}
 }
