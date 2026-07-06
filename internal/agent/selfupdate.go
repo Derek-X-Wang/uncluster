@@ -158,6 +158,34 @@ func (u *Updater) Rollback() error {
 	return nil
 }
 
+// downloadVerified downloads assetURL to a fresh temp file, verifies its SHA256
+// against sha256URL (when non-empty), and returns the temp path. The caller owns
+// the temp file (must remove it). Used by the Unix payload-store update path,
+// which stages the verified bytes into the managed store rather than swapping
+// the running binary in place. Verification happens BEFORE the caller stages, so
+// a corrupt download never reaches the versioned store.
+func (u *Updater) downloadVerified(ctx context.Context, assetURL, sha256URL string) (string, error) {
+	tmp, err := os.CreateTemp("", "uncluster-update-*")
+	if err != nil {
+		return "", fmt.Errorf("selfupdate: create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	u.Logger.Info("selfupdate: downloading", "url", assetURL)
+	if err := u.download(ctx, assetURL, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("selfupdate: download binary: %w", err)
+	}
+	if sha256URL != "" {
+		u.Logger.Info("selfupdate: verifying checksum", "url", sha256URL)
+		if err := u.verifySHA256(ctx, tmpPath, sha256URL); err != nil {
+			_ = os.Remove(tmpPath)
+			return "", err
+		}
+	}
+	return tmpPath, nil
+}
+
 // download fetches url and writes to destPath with mode 0600.
 func (u *Updater) download(ctx context.Context, url, destPath string) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -226,8 +254,17 @@ func (u *Updater) verifySHA256(ctx context.Context, filePath, sha256URL string) 
 }
 
 // HandleCheckUpdate is called by the agent loop when the server sends a
-// check_update command. Fetches the update plan, checks if update is needed,
-// and delegates download+swap to Updater.Apply, then calls restartService.
+// check_update command. It fetches the update plan, decides whether an update is
+// needed, enforces the install-time host allowlist and local pin, then delegates
+// the platform-specific apply.
+//
+// The apply differs by OS (#187):
+//   - Unix (Linux/macOS): stage+activate the verified payload in the managed,
+//     service-writable store and write a pending-update marker; the root-owned
+//     launcher restarts the child onto the new version. The low-priv Agent never
+//     writes a root-owned binary and never restarts the service itself.
+//   - Windows: the historical in-place swap + SCM restart (binary relocation is
+//     tracked separately in #139).
 func (a *Agent) HandleCheckUpdate(ctx context.Context, _ api.CheckUpdateCommand) error {
 	plan, err := a.client.GetUpdatePlan(ctx)
 	if err != nil {
@@ -242,11 +279,6 @@ func (a *Agent) HandleCheckUpdate(ctx context.Context, _ api.CheckUpdateCommand)
 	if current == plan.ExpectedVersion && !plan.Force {
 		a.logger.Info("selfupdate: already on expected version", "version", current)
 		return nil
-	}
-
-	binaryPath, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("selfupdate: resolve executable: %w", err)
 	}
 
 	assetURL := ResolveTemplate(plan.AssetURLTemplate, runtime.GOOS, runtime.GOARCH, plan.ExpectedVersion)
@@ -282,13 +314,12 @@ func (a *Agent) HandleCheckUpdate(ctx context.Context, _ api.CheckUpdateCommand)
 		}
 	}
 
-	updater := NewUpdater(binaryPath, a.cfg.PinnedVersion, a.logger)
-	if err := updater.Apply(ctx, plan.ExpectedVersion, assetURL, sha256URL); err != nil {
-		if errors.Is(err, ErrPinned) {
-			return nil
-		}
-		return err
+	// Local pin: if pinned to a different version, do not update.
+	if a.cfg.PinnedVersion != "" && a.cfg.PinnedVersion != plan.ExpectedVersion {
+		a.logger.Info("selfupdate: version pinned, skipping",
+			"pinned", a.cfg.PinnedVersion, "expected", plan.ExpectedVersion)
+		return nil
 	}
 
-	return a.restartService(ctx)
+	return a.applyUpdate(ctx, plan.ExpectedVersion, assetURL, sha256URL)
 }
