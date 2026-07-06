@@ -1,3 +1,9 @@
+//go:build !windows
+
+// The resident hybrid launcher supervises the Unix-only managed payload store
+// (#187, Linux/macOS). Windows runs the agent directly via `agent run` under the
+// SCM and keeps its in-place self-update posture (#139).
+
 package agent
 
 import (

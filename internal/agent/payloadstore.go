@@ -1,3 +1,11 @@
+//go:build !windows
+
+// The managed payload store is a Linux/macOS-only mechanism (#187): it relies on
+// atomic directory-entry rename + directory fsync for a crash-safe current-pointer
+// swap, neither of which Windows supports the same way (a directory handle cannot
+// be fsync'd). Windows keeps its in-place self-update posture; binary relocation
+// to a service-owned path is tracked separately in #139.
+
 package agent
 
 import (
