@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/derek-x-wang/uncluster/internal/agent"
 )
@@ -36,6 +38,10 @@ func Doctor(_ context.Context, cfg agent.Config) DoctorResults {
 
 	// 4. sshd drop-in.
 	results = append(results, checkSSHDropIn(paths))
+
+	// 4b. AuthorizedPrincipalsCommand binary is sshd-acceptable (#185): the
+	// StrictModes-equivalent that now gates cert login on Unix.
+	results = append(results, checkPrincipalsCommandBinary(paths))
 
 	// 5. macOS Include.
 	if runtime.GOOS == "darwin" {
@@ -121,19 +127,94 @@ func checkCAPubkey(paths agent.ExpectedPaths, wantPubkey string) CheckResult {
 		Message: fmt.Sprintf("ca pubkey ok at %s", paths.CAPubkey)}
 }
 
+// checkSSHDropIn asserts the Unix/macOS drop-in carries the #185
+// AuthorizedPrincipalsCommand directives. It checks the directives are PRESENT
+// (not a byte-exact match) so it is robust to the absolute command-binary path
+// differing between hosts: TrustedUserCAKeys <ca>, an AuthorizedPrincipalsCommand
+// invoking `... agent principals %u`, and AuthorizedPrincipalsCommandUser
+// <service account>.
 func checkSSHDropIn(paths agent.ExpectedPaths) CheckResult {
 	b, err := os.ReadFile(paths.SSHDropIn)
 	if err != nil {
 		return CheckResult{Name: "sshd-drop-in", Status: CheckFail,
 			Message: fmt.Sprintf("missing %s: %v", paths.SSHDropIn, err)}
 	}
-	want := sshdDropInContent(paths.CAPubkey, paths.PrincipalsDir+"/%u")
-	if string(b) != want {
+	content := string(b)
+	user := serviceAccountName()
+	var missing []string
+	if !strings.Contains(content, "TrustedUserCAKeys "+paths.CAPubkey) {
+		missing = append(missing, "TrustedUserCAKeys "+paths.CAPubkey)
+	}
+	if parseAuthorizedPrincipalsCommandBin(content) == "" || !strings.Contains(content, "agent principals %u") {
+		missing = append(missing, "AuthorizedPrincipalsCommand <uncluster> agent principals %u")
+	}
+	if !strings.Contains(content, "AuthorizedPrincipalsCommandUser "+user) {
+		missing = append(missing, "AuthorizedPrincipalsCommandUser "+user)
+	}
+	if len(missing) > 0 {
 		return CheckResult{Name: "sshd-drop-in", Status: CheckWarn,
-			Message: fmt.Sprintf("drop-in content mismatch at %s (run install to repair)", paths.SSHDropIn)}
+			Message: fmt.Sprintf("drop-in at %s missing/mismatched directive(s): %s (run install to repair)",
+				paths.SSHDropIn, strings.Join(missing, "; "))}
 	}
 	return CheckResult{Name: "sshd-drop-in", Status: CheckOK,
-		Message: fmt.Sprintf("drop-in ok at %s", paths.SSHDropIn)}
+		Message: fmt.Sprintf("drop-in ok at %s (AuthorizedPrincipalsCommand)", paths.SSHDropIn)}
+}
+
+// parseAuthorizedPrincipalsCommandBin extracts the command BINARY (the first
+// token after the directive keyword) from an AuthorizedPrincipalsCommand line, or
+// "" if the directive is absent. sshd checks THIS path's ownership/mode.
+func parseAuthorizedPrincipalsCommandBin(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "AuthorizedPrincipalsCommand") {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
+// checkPrincipalsCommandBinary asserts the AuthorizedPrincipalsCommand binary is
+// sshd-acceptable (#185): sshd refuses to run the command unless its binary is an
+// absolute path owned by root and not group/world-writable. This is the
+// StrictModes-equivalent that now gates cert login on Unix — the principals FILES
+// no longer are (they are the command's output, which sshd does not stat). Parses
+// the actual path from the drop-in so it verifies exactly what sshd verifies.
+func checkPrincipalsCommandBinary(paths agent.ExpectedPaths) CheckResult {
+	const name = "sshd-principals-command-binary"
+	b, err := os.ReadFile(paths.SSHDropIn)
+	if err != nil {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("cannot read drop-in %s: %v", paths.SSHDropIn, err)}
+	}
+	bin := parseAuthorizedPrincipalsCommandBin(string(b))
+	if bin == "" {
+		return CheckResult{Name: name, Status: CheckWarn,
+			Message: fmt.Sprintf("no AuthorizedPrincipalsCommand directive in %s (run install to repair)", paths.SSHDropIn)}
+	}
+	if !filepath.IsAbs(bin) {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q is not absolute (sshd requires an absolute path)", bin)}
+	}
+	info, err := os.Stat(bin)
+	if err != nil {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q not stat-able: %v", bin, err)}
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return CheckResult{Name: name, Status: CheckWarn,
+			Message: "cannot read ownership of the command binary on this platform"}
+	}
+	if st.Uid != 0 {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q owned by uid %d; sshd requires root (uid 0)", bin, st.Uid)}
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return CheckResult{Name: name, Status: CheckFail,
+			Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q is group/world-writable (mode %o); sshd rejects it", bin, perm)}
+	}
+	return CheckResult{Name: name, Status: CheckOK,
+		Message: fmt.Sprintf("AuthorizedPrincipalsCommand binary %q is root-owned and not group/world-writable", bin)}
 }
 
 func checkMacOSInclude() CheckResult {
@@ -231,19 +312,21 @@ func checkSSHDEffectiveConfig(paths agent.ExpectedPaths) CheckResult {
 			Message: fmt.Sprintf("sshd -T failed: %v", err)}
 	}
 	content := strings.ToLower(string(out))
-	wantCA := strings.ToLower(paths.CAPubkey)
-	wantPrincipals := strings.ToLower(paths.PrincipalsDir)
 	var missing []string
-	if !strings.Contains(content, wantCA) {
+	if !strings.Contains(content, strings.ToLower(paths.CAPubkey)) {
 		missing = append(missing, "TrustedUserCAKeys")
 	}
-	if !strings.Contains(content, wantPrincipals) {
-		missing = append(missing, "AuthorizedPrincipalsFile")
+	// #185: Unix/macOS serve principals via AuthorizedPrincipalsCommand, so the
+	// effective config reports `authorizedprincipalsfile none` and instead carries
+	// `authorizedprincipalscommand <bin> agent principals %u`. Assert the command
+	// is effective, not the (now-absent) file path.
+	if !strings.Contains(content, "authorizedprincipalscommand") || !strings.Contains(content, "agent principals") {
+		missing = append(missing, "AuthorizedPrincipalsCommand")
 	}
 	if len(missing) > 0 {
 		return CheckResult{Name: "sshd-effective-config", Status: CheckFail,
 			Message: fmt.Sprintf("sshd effective config missing: %s", strings.Join(missing, ", "))}
 	}
 	return CheckResult{Name: "sshd-effective-config", Status: CheckOK,
-		Message: "sshd effective config has TrustedUserCAKeys + AuthorizedPrincipalsFile"}
+		Message: "sshd effective config has TrustedUserCAKeys + AuthorizedPrincipalsCommand"}
 }

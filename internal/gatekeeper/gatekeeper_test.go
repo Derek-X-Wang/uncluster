@@ -86,8 +86,10 @@ func TestCAPubkeyFileContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write the drop-in file manually.
-	dropInContent := "TrustedUserCAKeys " + caPath + "\nAuthorizedPrincipalsFile " + principalsDir + "/%u\n"
+	// Write the drop-in file manually (#185 AuthorizedPrincipalsCommand shape).
+	dropInContent := "TrustedUserCAKeys " + caPath +
+		"\nAuthorizedPrincipalsCommand /usr/local/bin/uncluster agent principals %u" +
+		"\nAuthorizedPrincipalsCommandUser uncluster\n"
 	if err := os.WriteFile(dropInPath, []byte(dropInContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -117,8 +119,8 @@ func TestCAPubkeyFileContent(t *testing.T) {
 	if !strings.Contains(string(b2), "TrustedUserCAKeys") {
 		t.Errorf("drop-in missing TrustedUserCAKeys: %q", string(b2))
 	}
-	if !strings.Contains(string(b2), "AuthorizedPrincipalsFile") {
-		t.Errorf("drop-in missing AuthorizedPrincipalsFile: %q", string(b2))
+	if !strings.Contains(string(b2), "AuthorizedPrincipalsCommand") {
+		t.Errorf("drop-in missing AuthorizedPrincipalsCommand (#185): %q", string(b2))
 	}
 
 	// Verify principals dir.

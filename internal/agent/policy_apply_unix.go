@@ -11,10 +11,19 @@ import (
 )
 
 // doApplyPolicy on Unix rewrites the principals dir in-process. The low-priv
-// service account holds the directory grant from install (ADR-0004), and
-// sshd's StrictModes accepts a root/service-owned principals file, so the agent
-// can write the files directly with no privilege handoff. This is byte-for-byte
-// the pre-#127 behaviour; the Windows path (policy_apply_windows.go) differs.
+// service account owns the directory grant from install (ADR-0004) and writes
+// agent-owned per-user files directly.
+//
+// #185: sshd does NOT StrictModes-check these files — that assumption (the prior
+// comment claimed "sshd's StrictModes accepts a root/service-owned principals
+// file") was FALSE and broke cert login through the real low-priv install, since
+// StrictModes requires an AuthorizedPrincipalsFile to be root- or connecting-
+// user-owned and not group/other-writable, which an `uncluster`-owned file in a
+// group-writable dir is not. The fix routes principals to sshd via
+// AuthorizedPrincipalsCommand (`uncluster agent principals %u`), whose OUTPUT sshd
+// does not stat — so the agent keeps writing its low-priv files unchanged and no
+// privileged writer/root-owned file is needed on Unix. (Windows still renders
+// SYSTEM-owned files via the LocalSystem PrincipalsWriter — policy_apply_windows.go.)
 //
 // ctx is accepted for signature parity with the Windows path (which waits on the
 // LocalSystem writer and must honour shutdown, #153). The Unix render is a fast,
