@@ -189,6 +189,17 @@ jobs:
           go build -trimpath -ldflags "-s -w" -o /tmp/uncluster ./cmd/uncluster
           # Place it on a system path so `sudo uncluster agent install` finds it.
           sudo install -m 0755 /tmp/uncluster /usr/local/bin/uncluster
+          # #185/#168: sshd's AuthorizedPrincipalsCommand safe-path check walks the
+          # ENTIRE path chain (binary + every ancestor dir) and rejects the command
+          # if any component is non-root-owned or group/world-writable. GitHub's
+          # ubuntu-latest ships a non-root-strict /usr/local + /usr/local/bin (loosened
+          # so tooling installs without sudo) — an anomaly vs a standard Linux host
+          # where these are root:root 0755. Normalize them so the runner matches a
+          # real install (where the operator's #185 assumption holds). This does NOT
+          # mask a product gap: a loose install dir is surfaced by the doctor
+          # command-path-chain check (follow-up strengthening tracked separately).
+          sudo chown root:root /usr/local /usr/local/bin
+          sudo chmod 755 /usr/local /usr/local/bin
           uncluster --help >/dev/null
 
       - name: bootstrap:install-sshd
@@ -332,6 +343,161 @@ jobs:
           set -euo pipefail
           scripts/ci/assert-doctor-json.sh --ok principals/dir_writable < /tmp/doctor.json
 
+      # ---- #168: real SSH cert login through the INSTALLED sshd ----
+      # T2 stopped at doctor + deprovision; this exercises an actual cert login
+      # through the installed service path (T1 compose tests the flow in
+      # containers, not the real install). Throwaway NON-root user; negative
+      # controls on both sides; deterministic policy-apply waits (poll the
+      # principals file for the caller token id), never sleep-and-hope. Mirrors
+      # the Windows slice (#166).
+      - name: product:ssh-fixture-setup
+        id: fixture
+        run: |
+          set -euo pipefail
+          sudo useradd -m -s /bin/bash ciuser
+          # Set a password so PAM's account phase never treats the locked
+          # (`!`) shadow entry as a reason to deny (cert auth skips the auth
+          # phase, but this removes any ambiguity). Cert login uses no password.
+          echo 'ciuser:Ci-User-pw1' | sudo chpasswd
+          mkdir -p /tmp/ssh-ci
+          ssh-keygen -q -t ed25519 -N '' -C ci-cert-login -f /tmp/ssh-ci/id
+          chmod 600 /tmp/ssh-ci/id
+          # Mint a throwaway Caller (fresh caller with no ACL rows keeps the
+          # pre-grant negative clean). Response carries {id, token}.
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          resp="$(curl -fsS -X POST http://127.0.0.1:17777/v1/tokens \
+              -H "Authorization: Bearer ${CALLER_TOK}" -H 'Content-Type: application/json' \
+              -d '{"kind":"caller","label":"ci-ssh"}')"
+          echo "${resp}" | jq -r '.id'    > /tmp/ssh-ci/caller.id
+          echo "${resp}" | jq -r '.token' > /tmp/ssh-ci/caller.token
+          test -s /tmp/ssh-ci/caller.id && test -s /tmp/ssh-ci/caller.token
+          echo "throwaway caller id=$(cat /tmp/ssh-ci/caller.id)"
+
+      - name: product:negative-pregrant-denied
+        id: neg1
+        # NEGATIVE #1: no stale principal for ciuser, and cert issuance denied
+        # (403) with no ACL row — no cert issued => login impossible.
+        run: |
+          set -euo pipefail
+          CALLER_ID="$(cat /tmp/ssh-ci/caller.id)"
+          if sudo test -f /etc/ssh/auth_principals/ciuser && \
+             sudo grep -q "${CALLER_ID}" /etc/ssh/auth_principals/ciuser; then
+              echo "SECURITY: stale principal for ciuser present before grant"; exit 1
+          fi
+          CALLER_TOK="$(cat /tmp/ssh-ci/caller.token)"
+          PUB="$(cat /tmp/ssh-ci/id.pub)"
+          body="$(jq -nc --arg a ci-agent --arg u ciuser --arg p "${PUB}" \
+              '{agent:$a,username:$u,pubkey:$p,ttl_seconds:900}')"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:17777/v1/certs \
+              -H "Authorization: Bearer ${CALLER_TOK}" -H 'Content-Type: application/json' -d "${body}")"
+          if [[ "${code}" != "403" ]]; then echo "expected 403 pre-grant, got ${code}"; exit 1; fi
+          echo "pre-grant cert issuance correctly denied (403)"
+
+      - name: product:acl-grant
+        id: aclgrant
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          CALLER_ID="$(cat /tmp/ssh-ci/caller.id)"
+          body="$(jq -nc --arg c "${CALLER_ID}" --arg a ci-agent --arg u ciuser \
+              '{caller:$c,agent:$a,username:$u}')"
+          curl -fsS -X POST http://127.0.0.1:17777/v1/acl \
+              -H "Authorization: Bearer ${CALLER_TOK}" -H 'Content-Type: application/json' -d "${body}" \
+              | jq -r '.id' > /tmp/ssh-ci/acl.id
+          test -s /tmp/ssh-ci/acl.id
+          echo "granted acl id=$(cat /tmp/ssh-ci/acl.id)"
+
+      - name: product:wait-principal-present
+        id: waitpresent
+        # Deterministic policy-apply wait: the Unix apply is an in-process write
+        # after the next heartbeat (interval <=10s). 30s clears that tail.
+        run: |
+          set -euo pipefail
+          CALLER_ID="$(cat /tmp/ssh-ci/caller.id)"
+          for _ in $(seq 1 30); do
+              if sudo test -f /etc/ssh/auth_principals/ciuser && \
+                 sudo grep -q "${CALLER_ID}" /etc/ssh/auth_principals/ciuser; then
+                  echo "principal present — policy applied"; exit 0
+              fi
+              sleep 1
+          done
+          echo "principal ${CALLER_ID} never appeared in /etc/ssh/auth_principals/ciuser"
+          sudo cat /etc/ssh/auth_principals/ciuser 2>/dev/null || true
+          exit 1
+
+      - name: product:cert-login-whoami
+        id: loginpos
+        # First per-PR proof of a cert login through the INSTALLED sshd: request
+        # a cert (ttl 900 so it survives to the post-revoke veto), ssh as the
+        # throwaway user, assert whoami.
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/ssh-ci/caller.token)"
+          PUB="$(cat /tmp/ssh-ci/id.pub)"
+          body="$(jq -nc --arg a ci-agent --arg u ciuser --arg p "${PUB}" \
+              '{agent:$a,username:$u,pubkey:$p,ttl_seconds:900}')"
+          cert="$(curl -fsS -X POST http://127.0.0.1:17777/v1/certs \
+              -H "Authorization: Bearer ${CALLER_TOK}" -H 'Content-Type: application/json' -d "${body}" \
+              | jq -r '.certificate')"
+          test -n "${cert}"
+          printf '%s' "${cert}" > /tmp/ssh-ci/id-cert.pub
+          out="$(ssh -i /tmp/ssh-ci/id -o CertificateFile=/tmp/ssh-ci/id-cert.pub \
+              -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile=/tmp/ssh-ci/known_hosts -o BatchMode=yes \
+              -o ConnectTimeout=10 ciuser@127.0.0.1 whoami 2>&1)" || { echo "cert login failed: ${out}"; exit 1; }
+          echo "cert-login output: ${out}"
+          if [[ "${out}" != *ciuser* ]]; then echo "whoami did not return ciuser: ${out}"; exit 1; fi
+          echo "cert login succeeded as ciuser"
+
+      - name: product:acl-revoke
+        id: aclrevoke
+        run: |
+          set -euo pipefail
+          CALLER_TOK="$(cat /tmp/caller-token)"
+          ACL_ID="$(cat /tmp/ssh-ci/acl.id)"
+          curl -fsS -X DELETE "http://127.0.0.1:17777/v1/acl/${ACL_ID}" \
+              -H "Authorization: Bearer ${CALLER_TOK}"
+          echo "revoked acl id=${ACL_ID}"
+
+      - name: product:wait-principal-absent
+        id: waitabsent
+        run: |
+          set -euo pipefail
+          CALLER_ID="$(cat /tmp/ssh-ci/caller.id)"
+          for _ in $(seq 1 30); do
+              if ! sudo test -f /etc/ssh/auth_principals/ciuser || \
+                 ! sudo grep -q "${CALLER_ID}" /etc/ssh/auth_principals/ciuser; then
+                  echo "principal removed — revoke applied"; exit 0
+              fi
+              sleep 1
+          done
+          echo "revoke did not apply (principal still present after 30s)"; exit 1
+
+      - name: product:negative-postrevoke-denied
+        id: neg2
+        # NEGATIVE #2: (a) the still-TTL-valid positive cert MUST now be rejected
+        # at login (sshd reads AuthorizedPrincipalsFile per-auth; principal gone —
+        # the ADR-0007 local-veto against a cryptographically-valid cert), AND
+        # (b) a fresh cert request MUST be denied (403).
+        run: |
+          set -euo pipefail
+          out="$(ssh -i /tmp/ssh-ci/id -o CertificateFile=/tmp/ssh-ci/id-cert.pub \
+              -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile=/tmp/ssh-ci/known_hosts -o BatchMode=yes \
+              -o ConnectTimeout=10 ciuser@127.0.0.1 whoami 2>&1)" && rc=0 || rc=$?
+          echo "post-revoke old-cert login rc=${rc} output=${out}"
+          if [[ "${rc}" -eq 0 ]]; then
+              echo "SECURITY: valid cert still logged in after revoke + principal removal"; exit 1
+          fi
+          CALLER_TOK="$(cat /tmp/ssh-ci/caller.token)"
+          PUB="$(cat /tmp/ssh-ci/id.pub)"
+          body="$(jq -nc --arg a ci-agent --arg u ciuser --arg p "${PUB}" \
+              '{agent:$a,username:$u,pubkey:$p,ttl_seconds:900}')"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:17777/v1/certs \
+              -H "Authorization: Bearer ${CALLER_TOK}" -H 'Content-Type: application/json' -d "${body}")"
+          if [[ "${code}" != "403" ]]; then echo "expected 403 post-revoke, got ${code}"; exit 1; fi
+          echo "post-revoke: login rejected AND fresh issuance denied"
+
       - name: product:deprovision-and-marker
         id: deprov
         run: |
@@ -417,6 +583,14 @@ jobs:
               "product:assert-doctor=${{ steps.assert-doctor.outcome }}" \
               "product:assert-sshd-drop-in=${{ steps.assert-drop-in.outcome }}" \
               "product:assert-principals-dir-perms=${{ steps.assert-perms.outcome }}" \
+              "product:ssh-fixture-setup=${{ steps.fixture.outcome }}" \
+              "product:negative-pregrant-denied=${{ steps.neg1.outcome }}" \
+              "product:acl-grant=${{ steps.aclgrant.outcome }}" \
+              "product:wait-principal-present=${{ steps.waitpresent.outcome }}" \
+              "product:cert-login-whoami=${{ steps.loginpos.outcome }}" \
+              "product:acl-revoke=${{ steps.aclrevoke.outcome }}" \
+              "product:wait-principal-absent=${{ steps.waitabsent.outcome }}" \
+              "product:negative-postrevoke-denied=${{ steps.neg2.outcome }}" \
               "product:deprovision-and-marker=${{ steps.deprov.outcome }}" \
               > /tmp/classify.out
           cat /tmp/classify.out
@@ -1432,6 +1606,67 @@ jobs:
           echo "${reason}" | tee -a t2-mac-artifacts/preflight.txt
           echo "free_uid=${{ steps.preflight.outputs.has_free_uid }} free_gid=${{ steps.preflight.outputs.has_free_gid }} (need both true for the account tail)" \
               | tee -a t2-mac-artifacts/preflight.txt
+
+      - name: product:mac-cert-login-advisory
+        id: mac-cert-login
+        # macOS advisory equivalent of the t2-linux cert-login flow (#168).
+        # Gated on the launchd daemon actually being up (agent_started) — on
+        # hosted macos-latest that is usually false (launchd weather, #101), so
+        # this normally SKIPS; it runs the full flow only when a cooperating
+        # runner keeps the daemon alive. The whole t2-mac job is
+        # continue-on-error (advisory per ADR-0008), so any failure here is a
+        # warning, never a gate. Consolidated into one step (vs the linux
+        # per-step breakdown) because it is advisory and rarely executes; split
+        # it when t2-mac is promoted to required.
+        if: steps.remote-login.outputs.spike_blocked != 'true' && steps.preflight.outputs.has_free_id_space == 'true' && steps.assert-svc.outputs.agent_started == 'true'
+        run: |
+          set -euo pipefail
+          CP=http://127.0.0.1:17777
+          BOOT="$(cat /tmp/caller-token)"
+          # Throwaway NON-admin local user (macOS: sysadminctl).
+          sudo sysadminctl -addUser ciuser -password 'Ci-User-pw1' >/dev/null 2>&1 || true
+          if ! dscl . -read /Users/ciuser >/dev/null 2>&1; then
+              echo "::warning::t2-mac: could not create throwaway user ciuser"; exit 0
+          fi
+          mkdir -p /tmp/ssh-ci
+          ssh-keygen -q -t ed25519 -N '' -C ci-cert-login -f /tmp/ssh-ci/id
+          chmod 600 /tmp/ssh-ci/id
+          resp="$(curl -fsS -X POST "$CP/v1/tokens" -H "Authorization: Bearer ${BOOT}" \
+              -H 'Content-Type: application/json' -d '{"kind":"caller","label":"ci-ssh"}')"
+          CID="$(echo "$resp" | jq -r .id)"; CTOK="$(echo "$resp" | jq -r .token)"
+          PUB="$(cat /tmp/ssh-ci/id.pub)"
+          certbody() { jq -nc --arg a ci-agent --arg u ciuser --arg p "$PUB" \
+              '{agent:$a,username:$u,pubkey:$p,ttl_seconds:900}'; }
+          # NEGATIVE #1 — pre-grant issuance denied.
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$CP/v1/certs" \
+              -H "Authorization: Bearer ${CTOK}" -H 'Content-Type: application/json' -d "$(certbody)")"
+          [[ "$code" == "403" ]] || { echo "expected 403 pre-grant, got $code"; exit 1; }
+          # GRANT + deterministic wait.
+          AID="$(curl -fsS -X POST "$CP/v1/acl" -H "Authorization: Bearer ${BOOT}" \
+              -H 'Content-Type: application/json' \
+              -d "$(jq -nc --arg c "$CID" --arg a ci-agent --arg u ciuser '{caller:$c,agent:$a,username:$u}')" \
+              | jq -r .id)"
+          for _ in $(seq 1 30); do sudo grep -q "$CID" /etc/ssh/auth_principals/ciuser 2>/dev/null && break; sleep 1; done
+          sudo grep -q "$CID" /etc/ssh/auth_principals/ciuser || { echo "principal never applied"; exit 1; }
+          # POSITIVE cert login.
+          curl -fsS -X POST "$CP/v1/certs" -H "Authorization: Bearer ${CTOK}" \
+              -H 'Content-Type: application/json' -d "$(certbody)" | jq -r .certificate > /tmp/ssh-ci/id-cert.pub
+          out="$(ssh -i /tmp/ssh-ci/id -o CertificateFile=/tmp/ssh-ci/id-cert.pub -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/ssh-ci/known_hosts \
+              -o BatchMode=yes -o ConnectTimeout=10 ciuser@127.0.0.1 whoami 2>&1)" \
+              || { echo "cert login failed: $out"; exit 1; }
+          [[ "$out" == *ciuser* ]] || { echo "whoami != ciuser: $out"; exit 1; }
+          # REVOKE + wait + NEGATIVE #2 (old cert rejected AND fresh issuance 403).
+          curl -fsS -X DELETE "$CP/v1/acl/${AID}" -H "Authorization: Bearer ${BOOT}"
+          for _ in $(seq 1 30); do sudo grep -q "$CID" /etc/ssh/auth_principals/ciuser 2>/dev/null || break; sleep 1; done
+          out="$(ssh -i /tmp/ssh-ci/id -o CertificateFile=/tmp/ssh-ci/id-cert.pub -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/ssh-ci/known_hosts \
+              -o BatchMode=yes -o ConnectTimeout=10 ciuser@127.0.0.1 whoami 2>&1)" && rc=0 || rc=$?
+          [[ "$rc" -ne 0 ]] || { echo "SECURITY: valid cert still logged in after revoke"; exit 1; }
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$CP/v1/certs" \
+              -H "Authorization: Bearer ${CTOK}" -H 'Content-Type: application/json' -d "$(certbody)")"
+          [[ "$code" == "403" ]] || { echo "expected 403 post-revoke, got $code"; exit 1; }
+          echo "t2-mac cert-login flow passed (advisory)"
 
       - name: collect:artifacts
         if: always()
