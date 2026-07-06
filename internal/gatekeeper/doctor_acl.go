@@ -87,10 +87,13 @@ func writerServiceResult(installed, running bool) CheckResult {
 		Message: "UnclusterPrincipalsWriter (LocalSystem) installed and running"}
 }
 
-// spoolACLResult maps the resolved spool-dir ACL state to a CheckResult (#127).
-// Healthy: the spool dir exists and grants the agent account write (so it can
-// submit desired-state). spoolExists=false → fail (install not run). Pure
-// mapping; the DACL read lives in the windows-tagged probe.
+// spoolACLResult maps the resolved spool-dir ACL state to a CheckResult (#127,
+// #175). Healthy: the spool dir exists and grants the agent account write AND
+// rename (DELETE) — enough to complete the atomic tmp→rename submit of
+// desired-state. spoolExists=false → fail (install not run). agentCanWrite here
+// means "can write AND rename": a plain-write-only grant (the pre-#175 bug)
+// reports false so the silent policy-apply outage surfaces. Pure mapping; the
+// DACL read lives in the windows-tagged probe.
 func spoolACLResult(dir string, spoolExists, agentCanWrite bool) CheckResult {
 	if !spoolExists {
 		return CheckResult{Name: "spool-dir", Status: CheckFail,
@@ -98,10 +101,10 @@ func spoolACLResult(dir string, spoolExists, agentCanWrite bool) CheckResult {
 	}
 	if !agentCanWrite {
 		return CheckResult{Name: "spool-dir", Status: CheckFail,
-			Message: fmt.Sprintf("%s: NT SERVICE\\UnclusterAgent cannot write the spool — it cannot submit desired-state to the writer (run `uncluster agent install`). (#127)", dir)}
+			Message: fmt.Sprintf("%s: NT SERVICE\\UnclusterAgent cannot write+rename the spool (needs DELETE for the atomic tmp→rename) — it cannot submit desired-state to the writer, so no Policy applies (run `uncluster agent install`). (#175)", dir)}
 	}
 	return CheckResult{Name: "spool-dir", Status: CheckOK,
-		Message: fmt.Sprintf("spool dir ok at %s (agent can submit desired-state; SYSTEM owns it)", dir)}
+		Message: fmt.Sprintf("spool dir ok at %s (agent can write+rename to submit desired-state; SYSTEM owns it)", dir)}
 }
 
 // configACLProbe is the resolved DACL state for the Windows system config file.

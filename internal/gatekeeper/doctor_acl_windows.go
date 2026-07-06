@@ -210,15 +210,31 @@ func checkWriterServiceWindows() CheckResult {
 	return writerServiceResult(true, containsState(out, "RUNNING"))
 }
 
+// spoolApplyMask is the FULL set of rights the agent's spool apply path needs,
+// mirroring the installer's grant (agentSpoolAccessMask) so ANY future
+// right-regression surfaces in doctor — not just the #175 DELETE case:
+//   - FILE_GENERIC_READ  — poll applied.json for the writer's status;
+//   - FILE_GENERIC_WRITE — create policy.json.tmp;
+//   - DELETE             — atomic tmp→rename onto policy.json (NTFS rename needs
+//     DELETE on the source; GENERIC_WRITE alone does NOT include it, #175).
+// Asserting the whole set — not merely "some write bit" — is what makes the
+// outage visible to `doctor --json`; the pre-#175 check required only
+// FILE_GENERIC_WRITE and stayed green while every policy apply silently failed.
+const spoolApplyMask = windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE | windows.DELETE
+
 // checkSpoolACLWindows reports whether the agent↔writer spool dir exists and the
-// agent account can write it (so it can submit desired-state). Non-mutating:
-// stat + DACL read (#127).
+// agent account holds the full read+write+DELETE the apply path needs (so its
+// atomic tmp→rename submit of desired-state can complete, #175). Non-mutating:
+// stat + DACL read. A write-probe would be useless here — doctor runs elevated
+// (admin/SYSTEM), which always holds DELETE, so only reading the agent SID's ACE
+// reveals whether the LOW-PRIV agent can actually rename (#127, #175, ADR-0009
+// inspect).
 func checkSpoolACLWindows(dir string) CheckResult {
 	fi, err := os.Stat(dir)
 	if err != nil || !fi.IsDir() {
 		return spoolACLResult(dir, false, false)
 	}
-	sidResolved, grants := serviceAccountHasAccess(dir, windows.FILE_GENERIC_WRITE)
+	sidResolved, grants := serviceAccountHasAccess(dir, spoolApplyMask)
 	// If the SID does not resolve, the agent service is not registered — treat
 	// as "cannot write" (fail) so doctor surfaces the broken install.
 	return spoolACLResult(dir, true, sidResolved && grants)
@@ -257,23 +273,37 @@ func serviceAccountHasAccess(path string, wantMask windows.ACCESS_MASK) (sidReso
 	if err != nil || sid == nil {
 		return false, false
 	}
+	return true, sidHasAccess(path, sid, wantMask)
+}
 
+// sidHasAccess reads path's DACL (non-mutating) and reports whether `sid` is
+// granted every bit in wantMask (an ALLOW ACE carries them all AND no DENY ACE
+// on that SID strips any). Split out of serviceAccountHasAccess so the DACL
+// evaluation can be exercised against an arbitrary (resolvable) SID in tests —
+// the #175 regression escaped precisely because nothing verified the agent's
+// spool grant included the DELETE needed for the atomic tmp→rename.
+//
+// The icacls `M` (Modify) grant install applies maps to FILE_GENERIC_WRITE's
+// bits; a `(OI)(CI)` inherited grant lands as an explicit ACE on the child dir,
+// so enumerating the dir's own DACL suffices. DENY ACEs are honored because
+// Windows evaluates DENY before ALLOW.
+func sidHasAccess(path string, sid *windows.SID, wantMask windows.ACCESS_MASK) bool {
 	sd, err := windows.GetNamedSecurityInfo(
 		path,
 		windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION,
 	)
 	if err != nil {
-		// SID resolved but DACL unreadable — cannot confirm the grant; treat as
-		// not-granted so doctor fails legibly rather than silently passing.
-		return true, false
+		// DACL unreadable — cannot confirm the grant; treat as not-granted so
+		// doctor fails legibly rather than silently passing.
+		return false
 	}
 	dacl, _, err := sd.DACL()
 	if err != nil || dacl == nil {
 		// No DACL present means no explicit grant (a null DACL would grant
 		// everyone, but install always writes a protected DACL with explicit
 		// ACEs — a missing one is a regression).
-		return true, false
+		return false
 	}
 
 	var allowBits, denyBits windows.ACCESS_MASK
@@ -295,5 +325,5 @@ func serviceAccountHasAccess(path string, wantMask windows.ACCESS_MASK) (sidReso
 	}
 	// Granted only if every wanted bit is allowed and none is denied.
 	effective := allowBits &^ denyBits
-	return true, effective&wantMask == wantMask
+	return effective&wantMask == wantMask
 }
