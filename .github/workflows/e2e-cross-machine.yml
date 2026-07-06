@@ -9,9 +9,24 @@
 #     agent join + install against the tailnet CP.
 #   * caller: needs all four agents healthy. Mints ACL grants, runs
 #     uncluster ssh <agent> -- hostname, asserts the right hostname comes
-#     back. Then exercises the revoke flow.
+#     back. Then exercises the revoke flow. Per ADR-0009 decision 5, each
+#     `uncluster ssh` is preceded by a plain-SSH transport CONTROL (see
+#     "Dogfood plain-SSH control" below).
 #   * teardown: best-effort uncluster agents rm + caller token revoke +
 #     ephemeral tailnet node cleanup. if: always().
+#
+# Dogfood plain-SSH control (ADR-0009 decision 5): before every per-Agent
+# `uncluster ssh` product step, a `rendezvous:ssh-reachable-<os>` control
+# proves the Agent's Endpoint sshd is reachable independent of Uncluster's
+# cert flow (an SSH-2.0 banner handshake to :22 over the tailnet). The product
+# `uncluster ssh` step is GATED on its control passing, so:
+#   * control fails                       → transport/rendezvous class (advisory);
+#                                           the product step is skipped, so a
+#                                           tailnet hiccup can NOT masquerade as a
+#                                           cert-flow (product) regression.
+#   * control passes + `uncluster ssh` fails → product class (required).
+# Without the control a tailnet hiccup and a real product regression produce the
+# identical red, which is uninterpretable (ADR-0009 d.5).
 #
 # Triggers: `schedule` (nightly) + `workflow_dispatch`. **Never** runs on
 # `pull_request` — Tailscale auth + cross-machine orchestration is too
@@ -668,12 +683,11 @@ jobs:
   # ----------------------------------------------------------------------
   # agent-windows: same as agent-linux but on windows-latest.
   #
-  # NB: t2-windows (#70 / current main) hits the SCM service-control-
-  # protocol gap tracked in #88 — install returns exit 2 even though
-  # the agent process runs. Until #88 lands, this role is expected to
-  # fail at product:agent-install. The failure-taxonomy buckets it
-  # correctly (product class → required), but the workflow as a whole
-  # is advisory-via-quarantine until empirically green.
+  # NB: the Windows SCM service-control-protocol gap (#88) has SHIPPED, so
+  # product:agent-install is a genuine required product gate here — a failure
+  # is a real regression, not an "expected pre-#88" state. The failure-taxonomy
+  # buckets it as product class → required; the quarantine watchdog escalates
+  # 3 consecutive advisory (bootstrap/rendezvous) failures separately.
   # ----------------------------------------------------------------------
   agent-windows:
     name: role-agent-windows
@@ -781,11 +795,9 @@ jobs:
 
       - name: product:agent-install
         id: agent-install
-        # NB: this is the step expected to fail on main pre-#88 fix.
-        # Failure here is a product-class failure (= required), so it
-        # will cause the workflow to go red until #88 ships. The
-        # quarantine watchdog will eventually escalate this to a
-        # needs-triage issue if it persists.
+        # Real required product gate (the #88 Windows SCM gap has shipped).
+        # A failure here is a genuine install regression; the quarantine
+        # watchdog escalates persistent failures to a needs-triage issue.
         run: |
           & C:\uncluster\uncluster.exe agent install
 
@@ -944,8 +956,31 @@ jobs:
               fi
           done
 
+      - name: rendezvous:ssh-reachable-linux
+        id: reach-linux
+        continue-on-error: true
+        # ADR-0009 d.5 plain-SSH transport control: prove the Linux Agent's
+        # Endpoint sshd is reachable independent of Uncluster's cert flow
+        # (SSH-2.0 banner handshake to :22 over the tailnet) BEFORE the product
+        # `uncluster ssh`. A control failure is transport/rendezvous class
+        # (advisory) and skips the product step below, so a tailnet hiccup can
+        # not masquerade as a cert-flow regression.
+        run: |
+          set -uo pipefail
+          host="agent-linux-ci-${{ github.run_id }}"
+          ip="$(tailscale ip -4 "${host}" 2>/dev/null | head -1)"
+          if [[ -z "${ip}" ]]; then echo "no tailnet IP for ${host}"; exit 1; fi
+          banner="$(timeout 10 bash -c "exec 3<>/dev/tcp/${ip}/22 && head -1 <&3" 2>/dev/null || true)"
+          echo "banner from ${host}:22 -> ${banner}"
+          echo "${banner}" | grep -q '^SSH-' || { echo "no SSH banner from ${host}:22 (transport unreachable)"; exit 1; }
+
       - name: product:ssh-agent-linux
         id: ssh-linux
+        # Gated on the plain-SSH control (ADR-0009 d.5): only runs when transport
+        # is proven reachable, so a failure here is an unambiguous cert-flow
+        # (product) regression. `always() &&` decouples it from sibling ssh
+        # steps so each Agent is independently interpretable.
+        if: ${{ always() && steps.reach-linux.outcome == 'success' }}
         # The load-bearing assertion from #72: caller can SSH to the
         # Linux agent and get the right hostname back. Cert is minted
         # by `uncluster ssh`; ACL is granted just before.
@@ -981,10 +1016,29 @@ jobs:
               exit 1
           fi
 
+      - name: rendezvous:ssh-reachable-macos
+        id: reach-macos
+        continue-on-error: true
+        # ADR-0009 d.5 plain-SSH transport control for the macOS Agent. If the
+        # macOS Agent was Remote-Login blocked upstream, this control fails
+        # (advisory) and the product step below is skipped — so an upstream
+        # transport blocker is classified as transport, not a caller/cert-flow
+        # (product) regression.
+        run: |
+          set -uo pipefail
+          host="agent-macos-ci-${{ github.run_id }}"
+          ip="$(tailscale ip -4 "${host}" 2>/dev/null | head -1)"
+          if [[ -z "${ip}" ]]; then echo "no tailnet IP for ${host}"; exit 1; fi
+          banner="$(timeout 10 bash -c "exec 3<>/dev/tcp/${ip}/22 && head -1 <&3" 2>/dev/null || true)"
+          echo "banner from ${host}:22 -> ${banner}"
+          echo "${banner}" | grep -q '^SSH-' || { echo "no SSH banner from ${host}:22 (transport unreachable)"; exit 1; }
+
       - name: product:ssh-agent-macos
         id: ssh-macos
-        # Same shape as linux. May fail if agent-macos was remote-login
-        # blocked — that's an upstream-role failure, not a caller bug.
+        # Gated on the plain-SSH control (ADR-0009 d.5): a macOS transport/
+        # Remote-Login blocker skips this step (advisory); only a control-passed
+        # failure here is a product (cert-flow) regression.
+        if: ${{ always() && steps.reach-macos.outcome == 'success' }}
         run: |
           set -euo pipefail
           set +e
@@ -993,13 +1047,35 @@ jobs:
           set -e
           echo "rc=${rc} out=${out}"
           if [[ "${rc}" -ne 0 ]]; then
-              echo "ssh-mac failed (likely upstream agent-macos blocker)"
+              echo "uncluster ssh ci-agent-macos failed (control passed → product-class regression)"
               exit 1
           fi
 
+      - name: rendezvous:ssh-reachable-windows
+        id: reach-windows
+        continue-on-error: true
+        # ADR-0009 d.5 plain-SSH transport control for the Windows Agent. If the
+        # Windows Agent's sshd is unreachable (a rendezvous/bootstrap issue), this
+        # control fails (advisory) and the product step below is skipped.
+        run: |
+          set -uo pipefail
+          host="agent-windows-ci-${{ github.run_id }}"
+          ip="$(tailscale ip -4 "${host}" 2>/dev/null | head -1)"
+          if [[ -z "${ip}" ]]; then echo "no tailnet IP for ${host}"; exit 1; fi
+          banner="$(timeout 10 bash -c "exec 3<>/dev/tcp/${ip}/22 && head -1 <&3" 2>/dev/null || true)"
+          echo "banner from ${host}:22 -> ${banner}"
+          echo "${banner}" | grep -q '^SSH-' || { echo "no SSH banner from ${host}:22 (transport unreachable)"; exit 1; }
+
       - name: product:ssh-agent-windows
         id: ssh-windows
-        # Expected to fail until #88 (Windows SCM gap) ships.
+        # Real product gate now that #88 (Windows SCM service-control gap) has
+        # shipped. Gated on the plain-SSH control (reach-windows) per ADR-0009
+        # d.5: a Windows transport/rendezvous hiccup skips this step (advisory),
+        # so only a genuine cert-flow regression — control passed, `uncluster
+        # ssh` failed — makes it required. (The prior "expected to fail pre-#88"
+        # framing was a stale escape hatch that let a real Windows red be
+        # dismissed as known; removed.)
+        if: ${{ always() && steps.reach-windows.outcome == 'success' }}
         run: |
           set -euo pipefail
           set +e
@@ -1008,7 +1084,7 @@ jobs:
           set -e
           echo "rc=${rc} out=${out}"
           if [[ "${rc}" -ne 0 ]]; then
-              echo "ssh-windows failed (likely upstream #88 SCM gap; expected pre-#88-fix)"
+              echo "uncluster ssh ci-agent-windows failed (control passed → product-class regression)"
               exit 1
           fi
 
@@ -1049,8 +1125,11 @@ jobs:
               "bootstrap:caller-cli-config=${{ steps.cli-config.outcome }}" \
               "rendezvous:wait-for-cp-and-agents=${{ steps.rdv-wait.outcome }}" \
               "product:list-agents=${{ steps.list-agents.outcome }}" \
+              "rendezvous:ssh-reachable-linux=${{ steps.reach-linux.outcome }}" \
               "product:ssh-agent-linux=${{ steps.ssh-linux.outcome }}" \
+              "rendezvous:ssh-reachable-macos=${{ steps.reach-macos.outcome }}" \
               "product:ssh-agent-macos=${{ steps.ssh-macos.outcome }}" \
+              "rendezvous:ssh-reachable-windows=${{ steps.reach-windows.outcome }}" \
               "product:ssh-agent-windows=${{ steps.ssh-windows.outcome }}" \
               "product:assert-audit-certs=${{ steps.audit-certs.outcome }}" \
               >> "$GITHUB_OUTPUT"
