@@ -28,7 +28,7 @@
 # Without the control a tailnet hiccup and a real product regression produce the
 # identical red, which is uninterpretable (ADR-0009 d.5).
 #
-# Triggers: `schedule` (nightly) + `workflow_dispatch`. **Never** runs on
+# Triggers: `schedule` (weekly) + `workflow_dispatch`. **Never** runs on
 # `pull_request` — Tailscale auth + cross-machine orchestration is too
 # privileged for untrusted PR code (matches the T4 reasoning in
 # ADR-0008's "T4 is HITL by nature" note).
@@ -73,7 +73,12 @@ name: e2e-cross-machine
 
 on:
   schedule:
-    - cron: "23 7 * * *"   # nightly 07:23 UTC
+    - cron: "23 7 * * 1"   # weekly, Monday 07:23 UTC — Tailscale v4 pricing: Personal plan
+                           # includes 1,000 ephemeral resource-minutes/mo; a run costs
+                           # ~75-125 (5 tagged ephemeral nodes x 15-25 min), so nightly
+                           # (~2,300-3,800/mo) would exceed the free tier while weekly
+                           # (~300-500/mo) fits comfortably. workflow_dispatch remains
+                           # for on-demand runs after risky changes.
   workflow_dispatch:
     inputs:
       reason:
